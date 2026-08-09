@@ -20,3 +20,4 @@ htmlcov/
 .idea/
 Thumbs.db
 desktop.ini
+tmp/

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QApplication
 
 from anp.core.paths import AppPaths
@@ -28,11 +29,21 @@ def test_ensure_directories_creates_them(tmp_path: Path) -> None:
     assert paths.log_dir.is_dir()
 
 
-def test_from_standard_paths_appends_app_name_once(qapp: QApplication) -> None:
-    """OS標準の位置にアプリ名が一度だけ付く（`anp/anp` にならない）。"""
+def test_from_standard_paths_uses_generic_data_location(qapp: QApplication) -> None:
+    """ローミングしない位置に、アプリ名が一度だけ付いた場所を使う。
+
+    Windows では `GenericDataLocation` が `AppData\\Local`、`AppDataLocation` が
+    ローミング側。さらに後者は organizationName と applicationName の両方を足す
+    ため `anp\\anp` と二重になる。どちらの間違いも検出する。
+    """
+    expected = (
+        Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation))
+        / "anp"
+    )
+
     paths = AppPaths.from_standard_paths("anp")
 
-    assert paths.data_dir.name == "anp"
+    assert paths.data_dir == expected
     assert paths.data_dir.parent.name != "anp"
 
 

@@ -34,7 +34,6 @@ def _connect(
     """接続を開き、終了時に確実に閉じる。"""
     with closing(database.connect(path, migrations=migrations)) as connection:
         yield connection
-        connection.commit()
 
 
 def test_connect_creates_file_and_parent_directory(tmp_path: Path) -> None:
@@ -99,6 +98,63 @@ def test_newer_schema_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="新しい"):
         database.connect(db_path, migrations=[])
+
+
+def _create_partial_then_fail(connection: sqlite3.Connection) -> None:
+    """テスト用マイグレーション: DDL を実行した後で失敗する。"""
+    connection.execute("CREATE TABLE partial (id INTEGER PRIMARY KEY)")
+    msg = "migration failed on purpose"
+    raise RuntimeError(msg)
+
+
+def test_failed_migration_leaves_database_untouched(tmp_path: Path) -> None:
+    """マイグレーションが途中で失敗したら、スキーマも版も元に戻る。
+
+    DDL が中途半端にコミットされると、版が進まないまま次回の実行で
+    「table already exists」になり、DB が開けなくなる。
+    """
+    db_path = tmp_path / "anp.sqlite3"
+
+    with pytest.raises(RuntimeError, match="on purpose"):
+        database.connect(db_path, migrations=[_create_notes, _create_partial_then_fail])
+
+    with _connect(db_path) as connection:
+        assert database.schema_version(connection) == 0
+        tables = [
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        ]
+    # 直前に成功した _create_notes ごと巻き戻る（全部か無かのどちらか）。
+    assert tables == []
+
+
+def test_migration_can_be_retried_after_failure(tmp_path: Path) -> None:
+    """失敗したマイグレーションを直せば、次回そのまま適用できる。"""
+    db_path = tmp_path / "anp.sqlite3"
+
+    with pytest.raises(RuntimeError, match="on purpose"):
+        database.connect(db_path, migrations=[_create_partial_then_fail])
+
+    def _create_partial(connection: sqlite3.Connection) -> None:
+        connection.execute("CREATE TABLE partial (id INTEGER PRIMARY KEY)")
+
+    with _connect(db_path, [_create_partial]) as connection:
+        assert database.schema_version(connection) == 1
+
+
+def test_existing_data_survives_failed_migration(tmp_path: Path) -> None:
+    """後から足したマイグレーションが失敗しても、既存データは残る。"""
+    db_path = tmp_path / "anp.sqlite3"
+
+    with _connect(db_path, [_create_notes]) as connection:
+        connection.execute("INSERT INTO notes (body) VALUES ('残す')")
+
+    with pytest.raises(RuntimeError, match="on purpose"):
+        database.connect(db_path, migrations=[_create_notes, _create_partial_then_fail])
+
+    with _connect(db_path, [_create_notes]) as connection:
+        assert database.schema_version(connection) == 1
+        assert connection.execute("SELECT COUNT(*) FROM notes").fetchone()[0] == 1
 
 
 def test_foreign_keys_are_enabled(tmp_path: Path) -> None:
