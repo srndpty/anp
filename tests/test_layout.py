@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Sequence
 
 import pytest
 from PySide6.QtCore import QPointF, QRectF, QSizeF
@@ -124,6 +124,24 @@ def test_visible_pages_inside_gap_is_empty() -> None:
     assert layout.visible_pages(QRectF(0, 222.0, 140, 5.0), 1.0) == range(1, 1)
 
 
+def test_viewport_starting_exactly_at_a_page_bottom_excludes_it() -> None:
+    """下端とちょうど一致するページは、重なりが 0 なので含めない。"""
+    layout = make_layout(3)
+
+    # 1ページ目の下端はちょうど 220。
+    assert layout.page_rect(0, 1.0).bottom() == pytest.approx(220.0)
+    assert layout.visible_pages(QRectF(0, 220.0, 140, 100), 1.0) == range(1, 2)
+
+
+def test_viewport_ending_exactly_at_a_page_top_excludes_it() -> None:
+    """上端とちょうど一致するページも含めない（境界の扱いを揃える）。"""
+    layout = make_layout(3)
+
+    # 2ページ目の上端はちょうど 230。
+    assert layout.page_rect(1, 1.0).top() == pytest.approx(230.0)
+    assert layout.visible_pages(QRectF(0, 100.0, 140, 130.0), 1.0) == range(0, 1)
+
+
 def test_visible_pages_above_content_is_empty() -> None:
     """コンテンツより上の領域には可視ページが無い。"""
     layout = make_layout(3)
@@ -147,32 +165,64 @@ def test_visible_pages_covers_everything_when_zoomed_out() -> None:
     assert visible == range(0, 5)
 
 
-def test_visible_pages_does_not_scan_all_pages() -> None:
-    """ページ数が多くても走査量は可視ページ数に比例する。
+class CountingLayout(PageLayout):
+    """内部の作業量を数えられるレイアウト。
 
-    `paintEvent` から呼ばれるため、全ページ走査になっていないことを
-    アクセス回数で確かめる。
+    `PageLayout` はページ寸法を自前のリストに複製するため、渡した
+    シーケンスへのアクセスを数えても計測にならない。内部メソッドの
+    呼び出し回数を数える。
+    """
+
+    def __init__(self, page_sizes: Sequence[QSizeF], metrics: LayoutMetrics) -> None:
+        self.tops_rebuilds = 0
+        self.page_bottom_calls = 0
+        super().__init__(page_sizes, metrics)
+
+    def _tops(self, zoom: float) -> list[float]:
+        rebuilt = self._cached_zoom != zoom
+        result = super()._tops(zoom)
+        if rebuilt:
+            self.tops_rebuilds += 1
+        return result
+
+    def _page_bottom(self, index: int, zoom: float) -> float:
+        self.page_bottom_calls += 1
+        return super()._page_bottom(index, zoom)
+
+
+def test_visible_pages_does_not_scan_all_pages() -> None:
+    """ページ数が多くても、1回の呼び出しの作業量は可視ページ数に比例する。
+
+    `paintEvent` から毎回呼ばれるため、全ページ走査に退行していないことを
+    内部メソッドの呼び出し回数で確かめる。
     """
     count = 2000
-    sizes = [QSizeF(PAGE) for _ in range(count)]
-    accesses = 0
+    layout = CountingLayout([QSizeF(PAGE) for _ in range(count)], METRICS)
 
-    class CountingList(list[QSizeF]):
-        """要素アクセスの回数を数えるリスト。"""
-
-        def __getitem__(self, index: Any) -> Any:
-            nonlocal accesses
-            accesses += 1
-            return super().__getitem__(index)
-
-    layout = PageLayout(CountingList(sizes), METRICS)
-    layout.page_rect(0, 1.0)  # ここまでの分は数えない
-    accesses = 0
+    # 上端座標の組み立ては倍率ごとに一度だけ。ここでは計測対象外。
+    layout.visible_pages(QRectF(0, 100_000, 140, 300), 1.0)
+    layout.tops_rebuilds = 0
+    layout.page_bottom_calls = 0
 
     visible = layout.visible_pages(QRectF(0, 100_000, 140, 300), 1.0)
 
     assert len(visible) <= 3
-    assert accesses < 20, f"ページ数 {count} に対して {accesses} 回の走査が発生している"
+    assert layout.tops_rebuilds == 0, "同じ倍率なのに上端座標を作り直している"
+    assert layout.page_bottom_calls <= 2, (
+        f"ページ数 {count} に対して {layout.page_bottom_calls} 回のページ走査が発生している"
+    )
+
+
+def test_tops_are_rebuilt_once_per_zoom() -> None:
+    """上端座標の組み立ては倍率が変わったときだけ行う。"""
+    layout = CountingLayout([QSizeF(PAGE) for _ in range(100)], METRICS)
+
+    for _ in range(5):
+        layout.visible_pages(QRectF(0, 0, 140, 300), 1.0)
+    assert layout.tops_rebuilds == 1
+
+    layout.visible_pages(QRectF(0, 0, 140, 300), 2.0)
+    assert layout.tops_rebuilds == 2
 
 
 # ------------------------------------------------------------------ 現在ページ

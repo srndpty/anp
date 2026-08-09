@@ -10,9 +10,16 @@
 「後で結果を捨てる」ではなく「積む前に抑える」ことが設計の中心になる。
 
 1. 要求できるページを、呼び出し側が渡した範囲（可視ページ ± 1）に限る
-2. 処理中の要求と同じ条件は再要求しない
-3. 表示倍率が変わっている間はデバウンスし、落ち着いてから要求する
-4. 1枚あたりの要求サイズに上限を設ける
+2. **同時に処理中の要求数に上限を設ける**。範囲を限っても、スクロールで
+   要求先が次々変わればキャンセル不能な要求は溜まり続ける
+3. 処理中の要求と同じ条件は再要求しない
+4. 表示倍率が変わっている間はデバウンスし、落ち着いてから要求する
+5. 1枚あたりの要求サイズに上限を設ける
+
+また **同じパラメータの要求が処理中だと、Qt は同じ request ID を返す**
+（実機確認済み）。そのため未処理の要求の台帳は `reset()` でも消さない。
+消してしまうと、再利用された ID の古い結果を新しい世代のものとして
+受け入れてしまう。
 """
 
 from __future__ import annotations
@@ -40,6 +47,10 @@ DEFAULT_MAX_RENDER_BYTES = 32 * 1024 * 1024
 
 # 表示倍率が変わってから要求を出すまでの待ち時間（ミリ秒）。
 DEFAULT_DEBOUNCE_MS = 100
+
+# 同時に処理中にできる要求の数。可視ページ ± 1 の2画面分を目安にする。
+# 取り消せない以上、これがスクロール中の待ち行列の長さの上限になる。
+DEFAULT_MAX_INFLIGHT = 6
 
 
 def clamp_render_size(size: QSize, max_bytes: int = DEFAULT_MAX_RENDER_BYTES) -> QSize:
@@ -86,12 +97,15 @@ class PageRenderService(QObject):
         cache: RenderCache,
         *,
         max_render_bytes: int = DEFAULT_MAX_RENDER_BYTES,
+        max_inflight: int = DEFAULT_MAX_INFLIGHT,
         debounce_ms: int = DEFAULT_DEBOUNCE_MS,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._cache = cache
-        self._max_render_bytes = max_render_bytes
+        # キャッシュに入らない大きさを要求しても捨てるしかないので、上限を揃える。
+        self._max_render_bytes = min(max_render_bytes, cache.max_bytes)
+        self._max_inflight = max_inflight
         self._debounce_ms = debounce_ms
 
         self._renderer = QPdfPageRenderer(self)
@@ -101,8 +115,12 @@ class PageRenderService(QObject):
 
         # ドキュメントを開き直すたびに増える。古いドキュメントの結果を捨てるために使う。
         self._generation = 0
-        self._inflight: set[RenderKey] = set()
-        self._requests: dict[int, _RequestMeta] = {}
+
+        # Qt がまだ結果を返していない要求の台帳。取り消せないので reset() でも消さない。
+        # 同じパラメータの要求には同じ ID が返るため、1つの ID に複数の
+        # RenderKey（DPR 違いなど）が対応しうる。
+        self._outstanding: dict[int, list[_RequestMeta]] = {}
+        self._outstanding_keys: set[RenderKey] = set()
         self._desired: dict[int, RenderKey] = {}
 
         self._dispatch_timer = QTimer(self)
@@ -120,14 +138,16 @@ class PageRenderService(QObject):
         self.reset()
 
     def reset(self) -> None:
-        """処理中の要求とキャッシュを破棄し、世代を進める。
+        """キャッシュを破棄し、世代を進める。
 
-        PDF を開き直したり閉じたりしたときに呼ぶ。取り消せない要求が
-        処理中のままでも、以降に届く古い結果は世代が合わず捨てられる。
+        PDF を開き直したり閉じたりしたときに呼ぶ。
+
+        **未処理の要求の台帳は消さない。** Qt の待ち行列は取り消せないので、
+        台帳を消すと、同じパラメータで再利用された request ID の古い結果を
+        新しい世代のものとして受け入れてしまう。古い結果は届いた時点で
+        世代が合わず捨てられ、そこで空いた枠に現在必要な分が入る。
         """
         self._generation += 1
-        self._inflight.clear()
-        self._requests.clear()
         self._desired.clear()
         self._dispatch_timer.stop()
         self._cache.clear()
@@ -169,25 +189,39 @@ class PageRenderService(QObject):
         self._schedule(scale_changed=scale_changed)
 
     def flush(self) -> None:
-        """待たずに、いま必要な分の要求を発行する。"""
+        """待たずに、いま必要な分の要求を発行する。
+
+        処理中の要求数が上限に達している間は発行しない。結果が返って枠が
+        空くたびに続きが発行される。要求は `request_pages()` に渡された順に
+        処理するので、呼び出し側は優先度の高いページを先に並べること。
+        """
         self._dispatch_timer.stop()
 
         for page_index, key in self._desired.items():
-            if key in self._cache or key in self._inflight:
+            if len(self._outstanding) >= self._max_inflight:
+                break
+            if key in self._cache or key in self._outstanding_keys:
                 continue
+
             request_id = self._renderer.requestPage(
                 page_index,
                 QSize(key.width_px, key.height_px),
                 self._options,
             )
-            self._inflight.add(key)
-            self._requests[request_id] = _RequestMeta(self._generation, key)
+            # 同じ画素を返す要求に Qt が同じ ID を割り当てた場合は相乗りする。
+            self._outstanding.setdefault(request_id, []).append(_RequestMeta(self._generation, key))
+            self._outstanding_keys.add(key)
 
     # -------------------------------------------------- 検査用
     @property
-    def inflight_keys(self) -> frozenset[RenderKey]:
-        """処理中の要求。"""
-        return frozenset(self._inflight)
+    def outstanding_keys(self) -> frozenset[RenderKey]:
+        """Qt がまだ結果を返していない要求の条件。"""
+        return frozenset(self._outstanding_keys)
+
+    @property
+    def outstanding_count(self) -> int:
+        """Qt がまだ結果を返していない要求の数。"""
+        return len(self._outstanding)
 
     @property
     def generation(self) -> int:
@@ -220,18 +254,24 @@ class PageRenderService(QObject):
         request_id: int,
     ) -> None:
         """レンダリング結果を受け取る（GUI スレッドで呼ばれる）。"""
-        meta = self._requests.pop(request_id, None)
-        if meta is None:
-            # 世代交代で捨てられた要求、または身に覚えのない結果。
+        metas = self._outstanding.pop(request_id, None)
+        if metas is None:
+            # 身に覚えのない結果。
             return
 
-        self._inflight.discard(meta.key)
+        for meta in metas:
+            self._outstanding_keys.discard(meta.key)
 
-        if meta.generation != self._generation:
-            logger.debug("discarding stale render for page %d", meta.key.page_index)
-            return
+            if meta.generation != self._generation:
+                logger.debug("discarding stale render for page %d", meta.key.page_index)
+                continue
 
-        # Qt が返す画像の devicePixelRatio は常に 1.0 なので、ここで設定する。
-        image.setDevicePixelRatio(meta.key.dpr)
-        self._cache.put(meta.key, image)
-        self.page_ready.emit(meta.key.page_index)
+            # Qt が返す画像の devicePixelRatio は常に 1.0 なので、ここで設定する。
+            # 相乗りした要求と共有しないよう複製してから設定する。
+            page_image = image.copy() if len(metas) > 1 else image
+            page_image.setDevicePixelRatio(meta.key.dpr)
+            if self._cache.put(meta.key, page_image):
+                self.page_ready.emit(meta.key.page_index)
+
+        # 枠が空いたので、いま必要な分の続きを発行する。
+        self.flush()

@@ -107,7 +107,8 @@ class PageLayout:
 
         start = max(bisect_right(tops, top) - 1, 0)
         # 開始位置がページ間の隙間だった場合は次のページから。
-        if start < self.page_count and self._page_bottom(start, zoom) < top:
+        # 下端と viewport 上端がちょうど一致する場合は重なりが 0 なので含めない。
+        if start < self.page_count and self._page_bottom(start, zoom) <= top:
             start += 1
         if start >= self.page_count:
             return range(0, 0)

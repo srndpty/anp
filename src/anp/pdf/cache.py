@@ -74,14 +74,18 @@ class RenderCache:
         best = min(candidates, key=lambda key: abs(key.width_px - width_px))
         return self.get(best)
 
-    def put(self, key: RenderKey, image: QImage) -> None:
-        """画像を格納し、上限を超えた分を古いものから追い出す。"""
+    def put(self, key: RenderKey, image: QImage) -> bool:
+        """画像を格納し、上限を超えた分を古いものから追い出す。
+
+        格納できたかどうかを返す。取得できない画像を「使えるようになった」と
+        通知してしまわないよう、呼び出し側は戻り値を見ること。
+        """
         size = image.sizeInBytes()
         if size > self._max_bytes:
             # 入れると自分以外を全部追い出したうえで自分も消える。
             # 呼び出し側が要求サイズを絞る前提なので、通常ここには来ない。
             logger.warning("image too large to cache: %d bytes (page %d)", size, key.page_index)
-            return
+            return False
 
         if key in self._entries:
             self._total_bytes -= self._entries[key].sizeInBytes()
@@ -90,6 +94,7 @@ class RenderCache:
         self._entries.move_to_end(key)
         self._total_bytes += size
         self._evict()
+        return True
 
     def clear(self) -> None:
         """すべて破棄する。"""

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from anp.pdf.render import (
     DEFAULT_MAX_RENDER_BYTES,
     PageRenderService,
     PageRequest,
+    _RequestMeta,
     clamp_render_size,
 )
 
@@ -43,6 +45,14 @@ def controller(sample_pdf: Path) -> Iterator[DocumentController]:
 def service(controller: DocumentController) -> PageRenderService:
     """ドキュメントを設定済みのレンダリングサービス。"""
     service = PageRenderService(RenderCache(), debounce_ms=50)
+    service.set_document(controller.document)
+    return service
+
+
+@pytest.fixture
+def service_with_cap(controller: DocumentController) -> PageRenderService:
+    """同時要求数を2件に絞ったレンダリングサービス。"""
+    service = PageRenderService(RenderCache(), max_inflight=2, debounce_ms=50)
     service.set_document(controller.document)
     return service
 
@@ -102,7 +112,7 @@ def test_requests_are_limited_to_the_given_pages(service: PageRenderService) -> 
     service.request_pages(requests_for(range(0, 2)))
     service.flush()
 
-    pages = {key.page_index for key in service.inflight_keys}
+    pages = {key.page_index for key in service.outstanding_keys}
     assert pages == {0, 1}
 
 
@@ -110,12 +120,12 @@ def test_identical_requests_are_not_repeated(service: PageRenderService) -> None
     """同じ条件の要求は積み増さない。"""
     service.request_pages(requests_for(range(0, 3)))
     service.flush()
-    first = len(service.inflight_keys)
+    first = len(service.outstanding_keys)
 
     service.request_pages(requests_for(range(0, 3)))
     service.flush()
 
-    assert len(service.inflight_keys) == first == 3
+    assert len(service.outstanding_keys) == first == 3
 
 
 def test_cached_pages_are_not_requested_again(service: PageRenderService, qtbot: QtBot) -> None:
@@ -123,12 +133,12 @@ def test_cached_pages_are_not_requested_again(service: PageRenderService, qtbot:
     service.request_pages(requests_for(range(0, 1)))
     with qtbot.waitSignal(service.page_ready, timeout=10_000):
         service.flush()
-    assert not service.inflight_keys
+    assert not service.outstanding_keys
 
     service.request_pages(requests_for(range(0, 1)))
     service.flush()
 
-    assert not service.inflight_keys
+    assert not service.outstanding_keys
 
 
 def test_scale_change_is_debounced(service: PageRenderService) -> None:
@@ -138,13 +148,13 @@ def test_scale_change_is_debounced(service: PageRenderService) -> None:
     """
     service.request_pages(requests_for(range(0, 2), size=QSize(595, 842)))
     service.flush()
-    initial = len(service.inflight_keys)
+    initial = len(service.outstanding_keys)
 
     for zoom in (2, 3, 4, 5, 6):
         service.request_pages(requests_for(range(0, 2), size=QSize(595 * zoom, 842 * zoom)))
 
     # デバウンス中なので、途中の倍率の要求は1件も増えていない。
-    assert len(service.inflight_keys) == initial
+    assert len(service.outstanding_keys) == initial
 
 
 def test_only_the_final_scale_is_requested(service: PageRenderService) -> None:
@@ -157,7 +167,7 @@ def test_only_the_final_scale_is_requested(service: PageRenderService) -> None:
 
     service.flush()
 
-    widths = {key.width_px for key in service.inflight_keys}
+    widths = {key.width_px for key in service.outstanding_keys}
     assert widths == {595 * 4}
 
 
@@ -169,7 +179,7 @@ def test_scrolling_is_not_debounced(service: PageRenderService) -> None:
     service.request_pages(requests_for(range(1, 3)))
     service.flush()
 
-    pages = {key.page_index for key in service.inflight_keys}
+    pages = {key.page_index for key in service.outstanding_keys}
     assert 2 in pages
 
 
@@ -197,56 +207,9 @@ def test_device_pixel_ratio_is_applied(service: PageRenderService, qtbot: QtBot)
     assert image.devicePixelRatio() == pytest.approx(2.0)
 
 
-def test_reset_clears_everything(service: PageRenderService, qtbot: QtBot) -> None:
-    """リセットすると、処理中の要求もキャッシュも消えて世代が進む。"""
-    service.request_pages(requests_for(range(0, 1)))
-    with qtbot.waitSignal(service.page_ready, timeout=10_000):
-        service.flush()
-    assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
-    before = service.generation
-
-    service.reset()
-
-    assert service.inflight_keys == frozenset()
-    assert service.generation == before + 1
-    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
-
-
-def test_stale_results_are_discarded(service: PageRenderService) -> None:
-    """前のドキュメントのレンダリング結果はキャッシュを汚さない。
-
-    取り消せない要求が処理中のまま別の PDF を開くと、後から古い結果が
-    届く。世代が違うものは捨てなければならない。
-    """
-    service.request_pages(requests_for(range(0, 1)))
-    service.flush()
-    stale_id, stale_meta = next(iter(service._requests.items()))  # noqa: SLF001
-
-    # 別の PDF を開いた後で、前の要求の結果が届く状況を再現する。
-    service.reset()
-    service._on_page_rendered(  # noqa: SLF001
-        stale_meta.key.page_index,
-        QSize(stale_meta.key.width_px, stale_meta.key.height_px),
-        QImage(stale_meta.key.width_px, stale_meta.key.height_px, QImage.Format.Format_ARGB32),
-        QPdfDocumentRenderOptions(),
-        stale_id,
-    )
-
-    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
-
-
-def test_generation_mismatch_is_discarded(service: PageRenderService) -> None:
-    """要求表に残っていても、世代が違う結果はキャッシュに入れない。
-
-    `reset()` が要求表を消すので通常はここまで届かないが、世代照合は
-    取り違えに対する二重の防御として意味を持つ。その防御そのものを検証する。
-    """
-    service.request_pages(requests_for(range(0, 1)))
-    service.flush()
-    request_id, meta = next(iter(service._requests.items()))  # noqa: SLF001
-
-    # 要求表は消さずに世代だけ進める。
-    service._generation += 1  # noqa: SLF001
+def deliver(service: PageRenderService, request_id: int) -> None:
+    """指定した request ID のレンダリング結果が届いた状況を再現する。"""
+    meta = service._outstanding[request_id][0]  # noqa: SLF001
     service._on_page_rendered(  # noqa: SLF001
         meta.key.page_index,
         QSize(meta.key.width_px, meta.key.height_px),
@@ -255,9 +218,179 @@ def test_generation_mismatch_is_discarded(service: PageRenderService) -> None:
         request_id,
     )
 
+
+def test_reset_clears_the_cache_and_advances_the_generation(
+    service: PageRenderService, qtbot: QtBot
+) -> None:
+    """リセットするとキャッシュが消えて世代が進む。"""
+    service.request_pages(requests_for(range(0, 1)))
+    with qtbot.waitSignal(service.page_ready, timeout=10_000):
+        service.flush()
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
+    before = service.generation
+
+    service.reset()
+
+    assert service.generation == before + 1
     assert service.image_for(0, A4_AT_72DPI, 1.0) is None
-    # 処理中の印は外れる（同じ条件を再要求できる状態に戻る）。
-    assert meta.key not in service.inflight_keys
+
+
+def test_reset_keeps_the_outstanding_ledger(service: PageRenderService) -> None:
+    """リセットしても未処理の要求の台帳は残す。
+
+    Qt の待ち行列は取り消せないので、台帳を消すと、再利用された
+    request ID の古い結果を新しい世代のものとして受け入れてしまう。
+    """
+    service.request_pages(requests_for(range(0, 1)))
+    service.flush()
+    assert service.outstanding_count == 1
+
+    service.reset()
+
+    assert service.outstanding_count == 1
+
+
+def test_stale_results_are_discarded(service: PageRenderService) -> None:
+    """前のドキュメントのレンダリング結果はキャッシュを汚さない。"""
+    service.request_pages(requests_for(range(0, 1)))
+    service.flush()
+    stale_id = next(iter(service._outstanding))  # noqa: SLF001
+
+    # 別の PDF を開いた後で、前の要求の結果が届く状況を再現する。
+    service.reset()
+    deliver(service, stale_id)
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+
+
+def test_reused_request_id_does_not_leak_across_generations(
+    service: PageRenderService,
+) -> None:
+    """再利用された request ID の古い結果を、新しい世代として受け入れない。
+
+    Qt は同じパラメータの要求が処理中だと同じ ID を返す（実機確認済み）。
+    世代をまたいで同じページを同じ倍率で要求したとき、古い結果が新しい
+    ドキュメントの絵として表示されてはならない。
+    """
+    service.request_pages(requests_for(range(0, 1)))
+    service.flush()
+    old_id = next(iter(service._outstanding))  # noqa: SLF001
+
+    # 別の PDF を開き、同じページを同じ条件で要求する。
+    service.reset()
+    service.request_pages(requests_for(range(0, 1)))
+    service.flush()
+
+    # 古い要求が処理中なので、同じ条件を二重に積まない。
+    assert service.outstanding_count == 1
+
+    # 古い結果が届く。捨てられ、キャッシュは汚れない。
+    deliver(service, old_id)
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+
+    # 枠が空いたので、新しい世代の分が改めて要求される。
+    assert service.outstanding_count == 1
+    new_id = next(iter(service._outstanding))  # noqa: SLF001
+    assert service._outstanding[new_id][0].generation == service.generation  # noqa: SLF001
+
+
+def test_generation_mismatch_is_discarded(service: PageRenderService) -> None:
+    """台帳に残っていても、世代が違う結果はキャッシュに入れない。"""
+    service.request_pages(requests_for(range(0, 1)))
+    service.flush()
+    request_id = next(iter(service._outstanding))  # noqa: SLF001
+    key = service._outstanding[request_id][0].key  # noqa: SLF001
+
+    service._generation += 1  # noqa: SLF001
+    deliver(service, request_id)
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+    # まだ必要なページなので、新しい世代として要求し直されている。
+    assert key in service.outstanding_keys
+    for metas in service._outstanding.values():  # noqa: SLF001
+        assert all(meta.generation == service.generation for meta in metas)
+
+
+def test_shared_request_id_fills_every_key(service: PageRenderService) -> None:
+    """1つの request ID に複数の条件が相乗りしていても、全部に配る。
+
+    Qt が同じ画素を返す要求をまとめると、DPR だけが違う条件が同じ ID を
+    共有しうる。片方だけキャッシュされて片方が永久に埋まらない、という
+    状態を作らない。
+    """
+    service.request_pages(requests_for(range(0, 1)))
+    service.flush()
+    request_id = next(iter(service._outstanding))  # noqa: SLF001
+    original = service._outstanding[request_id][0]  # noqa: SLF001
+
+    # 同じ画素・別 DPR の条件が相乗りしている状態を作る。
+    alias_key = replace(original.key, dpr=2.0)
+    service._outstanding[request_id].append(  # noqa: SLF001
+        _RequestMeta(generation=service.generation, key=alias_key)
+    )
+    service._outstanding_keys.add(alias_key)  # noqa: SLF001
+
+    deliver(service, request_id)
+
+    both = [
+        service.image_for(0, A4_AT_72DPI, 1.0),
+        service.image_for(0, A4_AT_72DPI, 2.0),
+    ]
+    assert all(image is not None for image in both)
+    assert both[0].devicePixelRatio() == pytest.approx(1.0)  # type: ignore[union-attr]
+    assert both[1].devicePixelRatio() == pytest.approx(2.0)  # type: ignore[union-attr]
+
+
+def test_render_size_never_exceeds_the_cache_limit() -> None:
+    """キャッシュに入らない大きさは要求しない。
+
+    要求できてもキャッシュに入らなければ、いつまでも表示できない。
+    """
+    cache = RenderCache(max_bytes=1 * 1024 * 1024)
+    service = PageRenderService(cache, max_render_bytes=64 * 1024 * 1024)
+
+    key = service._key_for(0, QSize(4000, 5000), 1.0)  # noqa: SLF001
+
+    assert key.width_px * key.height_px * 4 <= cache.max_bytes
+
+
+# ------------------------------------------------------------------ 同時要求数の上限
+def test_outstanding_requests_are_capped(service_with_cap: PageRenderService) -> None:
+    """同時に処理中の要求数が上限を超えない。"""
+    service_with_cap.request_pages(requests_for(range(0, 3)))
+    service_with_cap.flush()
+
+    assert service_with_cap.outstanding_count == 2
+
+
+def test_fast_scrolling_does_not_accumulate_requests(
+    service_with_cap: PageRenderService,
+) -> None:
+    """高速スクロールでも取り消せない要求が溜まり続けない。
+
+    要求先が次々変わっても、結果が返るまで新しい要求は積まれない。
+    """
+    for start in range(0, 3):
+        service_with_cap.request_pages(requests_for(range(start, start + 1)))
+        service_with_cap.flush()
+
+    assert service_with_cap.outstanding_count <= 2
+
+
+def test_completing_a_request_frees_a_slot(service_with_cap: PageRenderService) -> None:
+    """結果が返ると枠が空き、いま必要な分の続きが要求される。"""
+    service_with_cap.request_pages(requests_for(range(0, 3)))
+    service_with_cap.flush()
+    requested_first = {
+        meta[0].key.page_index
+        for meta in service_with_cap._outstanding.values()  # noqa: SLF001
+    }
+    assert requested_first == {0, 1}
+
+    deliver(service_with_cap, next(iter(service_with_cap._outstanding)))  # noqa: SLF001
+
+    pages = {key.page_index for key in service_with_cap.outstanding_keys}
+    assert 2 in pages, "枠が空いても続きが要求されていない"
 
 
 def test_unknown_request_ids_are_ignored(service: PageRenderService) -> None:
