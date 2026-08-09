@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import QByteArray, QSettings
 
 from anp.core.settings import Settings
@@ -25,6 +27,22 @@ def test_values_round_trip(settings: Settings) -> None:
     assert settings.window_geometry == QByteArray(b"geometry-blob")
     assert settings.window_state == QByteArray(b"state-blob")
     assert settings.last_directory == r"C:\books"
+
+
+def test_sync_failure_is_logged_but_not_raised(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """書き出しに失敗しても例外にせず、警告を残す。"""
+    # QSettings は無い親ディレクトリを作ってしまうので、ファイルを親に見立てて塞ぐ。
+    blocker = tmp_path / "blocker"
+    blocker.write_text("", encoding="utf-8")
+    settings = Settings(QSettings(str(blocker / "settings.ini"), QSettings.Format.IniFormat))
+    settings.last_directory = r"C:\books"
+
+    with caplog.at_level(logging.WARNING):
+        settings.sync()
+
+    assert "failed to persist settings" in caplog.text
 
 
 def test_values_persist_across_instances(tmp_path: Path) -> None:

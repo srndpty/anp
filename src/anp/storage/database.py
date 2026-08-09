@@ -25,11 +25,17 @@ def connect(path: Path, *, migrations: Sequence[Migration] = _MIGRATIONS) -> sql
     """データベースに接続し、必要なマイグレーションを適用して返す。
 
     親ディレクトリが無ければ作成する。返された接続は呼び出し側が閉じる。
+
+    接続は `autocommit=True`（暗黙のトランザクションを作らない）で開く。
+    暗黙のトランザクション管理では DDL の前にトランザクションが始まらず、
+    マイグレーションの途中で失敗したときにスキーマだけが進んでしまうため、
+    トランザクションの範囲は呼び出し側が `BEGIN` で明示する。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, autocommit=True)
     try:
         connection.row_factory = sqlite3.Row
+        # PRAGMA foreign_keys はトランザクション内では無視されるため、先に設定する。
         connection.execute("PRAGMA foreign_keys = ON")
         apply_migrations(connection, migrations)
     except BaseException:
@@ -49,17 +55,29 @@ def apply_migrations(
     connection: sqlite3.Connection,
     migrations: Sequence[Migration] = _MIGRATIONS,
 ) -> int:
-    """未適用のマイグレーションを順に適用し、適用後のスキーマ版を返す。"""
-    current = schema_version(connection)
-    if current > len(migrations):
-        msg = f"データベースのスキーマ版 {current} はこのバージョンの anp より新しいです"
-        raise RuntimeError(msg)
+    """未適用のマイグレーションを順に適用し、適用後のスキーマ版を返す。
 
-    for index in range(current, len(migrations)):
-        logger.info("applying migration %d", index + 1)
-        with connection:
+    版の確認・各マイグレーション・`user_version` の更新をすべて1つの
+    トランザクションに入れる。途中で失敗した場合はスキーマも版も適用前に
+    戻るため、次回の起動で同じマイグレーションを再実行できる。
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        current = schema_version(connection)
+        if current > len(migrations):
+            msg = f"データベースのスキーマ版 {current} はこのバージョンの anp より新しいです"
+            raise RuntimeError(msg)
+
+        for index in range(current, len(migrations)):
+            logger.info("applying migration %d", index + 1)
             migrations[index](connection)
             # PRAGMA はプレースホルダを使えないため、整数であることを確かめて埋め込む。
             connection.execute(f"PRAGMA user_version = {index + 1:d}")
 
-    return schema_version(connection)
+        applied = schema_version(connection)
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
+
+    connection.execute("COMMIT")
+    return applied

@@ -1,6 +1,7 @@
 [project]
 name = "anp"
-version = "0.0.0"
+# バージョンの唯一の情報源は src/anp/__init__.py の __version__
+dynamic = ["version"]
 description = "学習向けPDFリーダー（annotator for pdf）"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,6 +14,9 @@ anp = "anp.app:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/anp/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/anp"]

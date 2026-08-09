@@ -21,14 +21,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: uv のセットアップ
-        uses: astral-sh/setup-uv@v5
+        # 供給元が差し替わらないよう、リリース v9.0.0 のコミットに固定する
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           # .python-version（3.13）が両ジョブで使われるのを防ぐため明示的に渡す
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
       - name: 依存関係の同期
-        run: uv sync --all-groups
+        # --locked: uv.lock が pyproject.toml と食い違っていれば失敗させる
+        run: uv sync --locked --all-groups
 
       - name: 実際のPythonバージョンを確認
         run: uv run python -c "import sys; print(sys.version)"
