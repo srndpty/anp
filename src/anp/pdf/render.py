@@ -76,11 +76,32 @@ class PageRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class _RequestMeta:
-    """発行済みの要求に紐づく情報。"""
+class _QtRequestKey:
+    """Qt が同一の要求と見なす条件。
+
+    `requestPage()` の引数は (ページ, サイズ, オプション) で **DPR を含まない**。
+    そのため DPR だけ違う `RenderKey` は、Qt からは同じ要求に見える。
+    オプションは現状固定なので、ページとサイズだけで足りる。
+    """
+
+    page_index: int
+    width_px: int
+    height_px: int
+
+
+@dataclass(slots=True)
+class _OutstandingRequest:
+    """Qt に出したまま結果が返っていない要求。
+
+    1つの Qt 要求に、DPR だけが違う複数の `RenderKey` が相乗りしうる。
+    ただし相乗りできるのは**同じ世代の条件だけ**。世代が違うものを
+    ぶら下げると、古いドキュメントの絵を新しい世代の絵として
+    受け入れてしまう。
+    """
 
     generation: int
-    key: RenderKey
+    qt_key: _QtRequestKey
+    render_keys: list[RenderKey]
 
 
 class PageRenderService(QObject):
@@ -117,9 +138,9 @@ class PageRenderService(QObject):
         self._generation = 0
 
         # Qt がまだ結果を返していない要求の台帳。取り消せないので reset() でも消さない。
-        # 同じパラメータの要求には同じ ID が返るため、1つの ID に複数の
-        # RenderKey（DPR 違いなど）が対応しうる。
-        self._outstanding: dict[int, list[_RequestMeta]] = {}
+        self._outstanding: dict[int, _OutstandingRequest] = {}
+        # Qt から見た要求条件 → request ID。同じ条件を二重に出さないために持つ。
+        self._outstanding_by_qt: dict[_QtRequestKey, int] = {}
         self._outstanding_keys: set[RenderKey] = set()
         self._desired: dict[int, RenderKey] = {}
 
@@ -197,10 +218,26 @@ class PageRenderService(QObject):
         """
         self._dispatch_timer.stop()
 
+        document = self._renderer.document()
+        if document is None or document.status() != QPdfDocument.Status.Ready:
+            return
+
         for page_index, key in self._desired.items():
             if len(self._outstanding) >= self._max_inflight:
                 break
             if key in self._cache or key in self._outstanding_keys:
+                continue
+
+            qt_key = _QtRequestKey(page_index, key.width_px, key.height_px)
+            existing_id = self._outstanding_by_qt.get(qt_key)
+            if existing_id is not None:
+                existing = self._outstanding[existing_id]
+                if existing.generation != self._generation:
+                    # 古い世代の同じ要求が処理中。結果が返って捨てられるまで待つ。
+                    # ここで相乗りさせると古いドキュメントの絵を受け入れてしまう。
+                    continue
+                existing.render_keys.append(key)
+                self._outstanding_keys.add(key)
                 continue
 
             request_id = self._renderer.requestPage(
@@ -208,8 +245,12 @@ class PageRenderService(QObject):
                 QSize(key.width_px, key.height_px),
                 self._options,
             )
-            # 同じ画素を返す要求に Qt が同じ ID を割り当てた場合は相乗りする。
-            self._outstanding.setdefault(request_id, []).append(_RequestMeta(self._generation, key))
+            self._outstanding[request_id] = _OutstandingRequest(
+                generation=self._generation,
+                qt_key=qt_key,
+                render_keys=[key],
+            )
+            self._outstanding_by_qt[qt_key] = request_id
             self._outstanding_keys.add(key)
 
     # -------------------------------------------------- 検査用
@@ -254,24 +295,25 @@ class PageRenderService(QObject):
         request_id: int,
     ) -> None:
         """レンダリング結果を受け取る（GUI スレッドで呼ばれる）。"""
-        metas = self._outstanding.pop(request_id, None)
-        if metas is None:
+        request = self._outstanding.pop(request_id, None)
+        if request is None:
             # 身に覚えのない結果。
             return
 
-        for meta in metas:
-            self._outstanding_keys.discard(meta.key)
+        self._outstanding_by_qt.pop(request.qt_key, None)
+        for key in request.render_keys:
+            self._outstanding_keys.discard(key)
 
-            if meta.generation != self._generation:
-                logger.debug("discarding stale render for page %d", meta.key.page_index)
-                continue
-
-            # Qt が返す画像の devicePixelRatio は常に 1.0 なので、ここで設定する。
-            # 相乗りした要求と共有しないよう複製してから設定する。
-            page_image = image.copy() if len(metas) > 1 else image
-            page_image.setDevicePixelRatio(meta.key.dpr)
-            if self._cache.put(meta.key, page_image):
-                self.page_ready.emit(meta.key.page_index)
+        if request.generation != self._generation:
+            logger.debug("discarding stale render for page %d", request.qt_key.page_index)
+        else:
+            for key in request.render_keys:
+                # Qt が返す画像の devicePixelRatio は常に 1.0 なので、ここで設定する。
+                # 相乗りした条件と共有しないよう複製してから設定する。
+                page_image = image.copy() if len(request.render_keys) > 1 else image
+                page_image.setDevicePixelRatio(key.dpr)
+                if self._cache.put(key, page_image):
+                    self.page_ready.emit(key.page_index)
 
         # 枠が空いたので、いま必要な分の続きを発行する。
         self.flush()

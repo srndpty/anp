@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -25,7 +24,6 @@ from anp.pdf.render import (
     DEFAULT_MAX_RENDER_BYTES,
     PageRenderService,
     PageRequest,
-    _RequestMeta,
     clamp_render_size,
 )
 
@@ -209,11 +207,11 @@ def test_device_pixel_ratio_is_applied(service: PageRenderService, qtbot: QtBot)
 
 def deliver(service: PageRenderService, request_id: int) -> None:
     """指定した request ID のレンダリング結果が届いた状況を再現する。"""
-    meta = service._outstanding[request_id][0]  # noqa: SLF001
+    key = service._outstanding[request_id].render_keys[0]  # noqa: SLF001
     service._on_page_rendered(  # noqa: SLF001
-        meta.key.page_index,
-        QSize(meta.key.width_px, meta.key.height_px),
-        QImage(meta.key.width_px, meta.key.height_px, QImage.Format.Format_ARGB32),
+        key.page_index,
+        QSize(key.width_px, key.height_px),
+        QImage(key.width_px, key.height_px, QImage.Format.Format_ARGB32),
         QPdfDocumentRenderOptions(),
         request_id,
     )
@@ -291,7 +289,32 @@ def test_reused_request_id_does_not_leak_across_generations(
     # 枠が空いたので、新しい世代の分が改めて要求される。
     assert service.outstanding_count == 1
     new_id = next(iter(service._outstanding))  # noqa: SLF001
-    assert service._outstanding[new_id][0].generation == service.generation  # noqa: SLF001
+    assert service._outstanding[new_id].generation == service.generation  # noqa: SLF001
+
+
+def test_cross_generation_alias_does_not_accept_stale_image(service: PageRenderService) -> None:
+    """世代を跨いで DPR だけ違う要求を、古い要求に相乗りさせない。
+
+    Qt の要求パラメータは (ページ, サイズ, オプション) で **DPR を含まない**。
+    そのため DPR だけ違う条件は `RenderKey` としては別物なのに、Qt からは
+    同じ要求として同じ ID が返る。古い世代の要求に新しい世代の条件を
+    ぶら下げると、前の PDF の絵が新しい PDF のものとして表示される。
+    """
+    service.request_pages([PageRequest(page_index=0, size_px=A4_AT_72DPI, dpr=1.0)])
+    service.flush()
+    old_id = next(iter(service._outstanding))  # noqa: SLF001
+
+    # 別の PDF を開き、同じページを同じ画素数・別 DPR で要求する。
+    service.reset()
+    service.request_pages([PageRequest(page_index=0, size_px=A4_AT_72DPI, dpr=2.0)])
+    service.flush()
+
+    # 前の PDF のレンダリング結果が届く。
+    deliver(service, old_id)
+
+    assert service.image_for(0, A4_AT_72DPI, 2.0) is None, (
+        "前のドキュメントの画像が新しい世代の絵として受け入れられている"
+    )
 
 
 def test_generation_mismatch_is_discarded(service: PageRenderService) -> None:
@@ -299,7 +322,7 @@ def test_generation_mismatch_is_discarded(service: PageRenderService) -> None:
     service.request_pages(requests_for(range(0, 1)))
     service.flush()
     request_id = next(iter(service._outstanding))  # noqa: SLF001
-    key = service._outstanding[request_id][0].key  # noqa: SLF001
+    key = service._outstanding[request_id].render_keys[0]  # noqa: SLF001
 
     service._generation += 1  # noqa: SLF001
     deliver(service, request_id)
@@ -307,38 +330,35 @@ def test_generation_mismatch_is_discarded(service: PageRenderService) -> None:
     assert service.image_for(0, A4_AT_72DPI, 1.0) is None
     # まだ必要なページなので、新しい世代として要求し直されている。
     assert key in service.outstanding_keys
-    for metas in service._outstanding.values():  # noqa: SLF001
-        assert all(meta.generation == service.generation for meta in metas)
+    for request in service._outstanding.values():  # noqa: SLF001
+        assert request.generation == service.generation
 
 
-def test_shared_request_id_fills_every_key(service: PageRenderService) -> None:
-    """1つの request ID に複数の条件が相乗りしていても、全部に配る。
+def test_same_generation_dpr_alias_shares_one_request(service: PageRenderService) -> None:
+    """同じ世代で DPR だけ違う条件は、1つの Qt 要求に相乗りさせる。
 
-    Qt が同じ画素を返す要求をまとめると、DPR だけが違う条件が同じ ID を
-    共有しうる。片方だけキャッシュされて片方が永久に埋まらない、という
+    Qt から見れば同じ要求なので、二重に積む意味がない。相乗りした条件は
+    結果が届いたときに全部埋まる。片方だけ埋まって片方が永久に待つ、という
     状態を作らない。
     """
-    service.request_pages(requests_for(range(0, 1)))
+    service.request_pages([PageRequest(page_index=0, size_px=A4_AT_72DPI, dpr=1.0)])
     service.flush()
     request_id = next(iter(service._outstanding))  # noqa: SLF001
-    original = service._outstanding[request_id][0]  # noqa: SLF001
 
-    # 同じ画素・別 DPR の条件が相乗りしている状態を作る。
-    alias_key = replace(original.key, dpr=2.0)
-    service._outstanding[request_id].append(  # noqa: SLF001
-        _RequestMeta(generation=service.generation, key=alias_key)
-    )
-    service._outstanding_keys.add(alias_key)  # noqa: SLF001
+    # 同じ画素・別 DPR を要求しても、Qt への要求は増えない。
+    service.request_pages([PageRequest(page_index=0, size_px=A4_AT_72DPI, dpr=2.0)])
+    service.flush()
+    assert service.outstanding_count == 1
+    assert len(service.outstanding_keys) == 2
 
     deliver(service, request_id)
 
-    both = [
-        service.image_for(0, A4_AT_72DPI, 1.0),
-        service.image_for(0, A4_AT_72DPI, 2.0),
-    ]
-    assert all(image is not None for image in both)
-    assert both[0].devicePixelRatio() == pytest.approx(1.0)  # type: ignore[union-attr]
-    assert both[1].devicePixelRatio() == pytest.approx(2.0)  # type: ignore[union-attr]
+    at_1x = service.image_for(0, A4_AT_72DPI, 1.0)
+    at_2x = service.image_for(0, A4_AT_72DPI, 2.0)
+    assert at_1x is not None
+    assert at_2x is not None
+    assert at_1x.devicePixelRatio() == pytest.approx(1.0)
+    assert at_2x.devicePixelRatio() == pytest.approx(2.0)
 
 
 def test_render_size_never_exceeds_the_cache_limit() -> None:
@@ -382,8 +402,8 @@ def test_completing_a_request_frees_a_slot(service_with_cap: PageRenderService) 
     service_with_cap.request_pages(requests_for(range(0, 3)))
     service_with_cap.flush()
     requested_first = {
-        meta[0].key.page_index
-        for meta in service_with_cap._outstanding.values()  # noqa: SLF001
+        request.qt_key.page_index
+        for request in service_with_cap._outstanding.values()  # noqa: SLF001
     }
     assert requested_first == {0, 1}
 
@@ -407,11 +427,32 @@ def test_unknown_request_ids_are_ignored(service: PageRenderService) -> None:
 
 
 def test_no_requests_without_a_document() -> None:
-    """ドキュメントが無ければ要求を出しても壊れない。"""
+    """ドキュメントが無ければ要求を積まない。"""
     service = PageRenderService(RenderCache())
 
     service.request_pages(requests_for(range(0, 2)))
     service.flush()
+
+    assert service.outstanding_count == 0
+    assert not service.outstanding_keys
+
+
+def test_no_requests_after_the_document_is_closed(
+    service: PageRenderService, controller: DocumentController
+) -> None:
+    """閉じた後は要求を積まない。
+
+    読み込めていないドキュメントに要求しても結果は返らず、台帳に
+    幽霊が残るだけになる。
+    """
+    controller.close()
+    service.reset()
+
+    service.request_pages(requests_for(range(0, 2)))
+    service.flush()
+
+    assert service.outstanding_count == 0
+    assert not service.outstanding_keys
 
 
 # ------------------------------------------------------------------ 仮表示
