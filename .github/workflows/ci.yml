@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # GUI テストはオフスクリーンで実行する
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  check:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: uv のセットアップ
+        uses: astral-sh/setup-uv@v5
+        with:
+          # .python-version（3.13）が両ジョブで使われるのを防ぐため明示的に渡す
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: 依存関係の同期
+        run: uv sync --all-groups
+
+      - name: 実際のPythonバージョンを確認
+        run: uv run python -c "import sys; print(sys.version)"
+
+      - name: lint
+        run: uv run ruff check .
+
+      - name: format の確認
+        run: uv run ruff format --check .
+
+      - name: 型チェック
+        run: uv run mypy
+
+      - name: テスト
+        run: uv run pytest --cov=anp --cov-report=term-missing
