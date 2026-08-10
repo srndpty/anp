@@ -1,7 +1,8 @@
 """`anp.storage.database` のテスト。
 
-マイグレーション機構そのものを検証する。実際のテーブル定義は Phase 2 で
-追加されるため、ここではテスト用のマイグレーションを注入する。
+マイグレーション機構そのものは、テスト用のマイグレーションを注入して
+検証する。実際のスキーマ（`study_marks`）は既定のマイグレーションを
+適用して検証する。
 """
 
 from __future__ import annotations
@@ -46,12 +47,78 @@ def test_connect_creates_file_and_parent_directory(tmp_path: Path) -> None:
     assert db_path.is_file()
 
 
-def test_no_tables_exist_initially(tmp_path: Path) -> None:
-    """Phase 0 ではテーブルを作らない。"""
+def test_no_tables_exist_without_migrations(tmp_path: Path) -> None:
+    """マイグレーションが空なら、テーブルは1つも作られない。"""
     with _connect(tmp_path / "anp.sqlite3") as connection:
         rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
 
     assert rows == []
+
+
+@contextmanager
+def _connect_with_default_migrations(path: Path) -> Iterator[sqlite3.Connection]:
+    """既定のマイグレーションを適用した接続を開く。"""
+    with closing(database.connect(path)) as connection:
+        yield connection
+
+
+def test_default_migrations_create_study_marks(tmp_path: Path) -> None:
+    """新規 DB に既定のマイグレーションを当てると study_marks ができる。"""
+    with _connect_with_default_migrations(tmp_path / "anp.sqlite3") as connection:
+        assert database.schema_version(connection) >= 1
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(study_marks)")}
+
+    assert columns == {
+        "id",
+        "document_key",
+        "page_index",
+        "x_norm",
+        "y_norm",
+        "mistake_count",
+        "note",
+    }
+
+
+def test_study_marks_has_document_lookup_index(tmp_path: Path) -> None:
+    """ドキュメント単位の取得を賄うインデックスがある。"""
+    with _connect_with_default_migrations(tmp_path / "anp.sqlite3") as connection:
+        indexes = [row["name"] for row in connection.execute("PRAGMA index_list(study_marks)")]
+        columns = [
+            [row["name"] for row in connection.execute(f"PRAGMA index_info({name})")]
+            for name in indexes
+        ]
+
+    # 先頭が document_key であれば「ある PDF のマークを引く」検索に効く。
+    assert any(cols[:1] == ["document_key"] for cols in columns)
+
+
+def test_default_migrations_are_idempotent(tmp_path: Path) -> None:
+    """再起動しても CREATE TABLE は走らず、スキーマ版も増えない。"""
+    db_path = tmp_path / "anp.sqlite3"
+
+    with _connect_with_default_migrations(db_path) as connection:
+        first = database.schema_version(connection)
+        connection.execute(
+            "INSERT INTO study_marks (document_key, page_index, x_norm, y_norm)"
+            " VALUES ('doc', 0, 0.5, 0.5)"
+        )
+
+    with _connect_with_default_migrations(db_path) as connection:
+        assert database.schema_version(connection) == first
+        assert connection.execute("SELECT COUNT(*) FROM study_marks").fetchone()[0] == 1
+
+
+def test_phase0_database_upgrades_to_current_schema(tmp_path: Path) -> None:
+    """マイグレーション前の DB（Phase 0）からそのまま上げられる。"""
+    db_path = tmp_path / "anp.sqlite3"
+
+    # Phase 0 の DB は「空でスキーマ版 0」だった。
+    with _connect(db_path) as connection:
+        assert database.schema_version(connection) == 0
+
+    with _connect_with_default_migrations(db_path) as connection:
+        assert database.schema_version(connection) >= 1
+        assert connection.execute("SELECT COUNT(*) FROM study_marks").fetchone()[0] == 0
 
 
 def test_migrations_are_applied_in_order(tmp_path: Path) -> None:
