@@ -11,8 +11,9 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QRect, QSizeF, Qt
+from PySide6.QtCore import QEvent, QRect, QSizeF, Qt
 from PySide6.QtGui import QColor, QImage
+from PySide6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 
 from anp.pdf.cache import RenderCache, RenderKey
@@ -242,6 +243,47 @@ def test_the_current_page_is_requested_first(
     assert pages.index(2) < pages.index(1)
 
 
+def test_a_dpr_change_requests_the_new_resolution(
+    loaded_view: PdfView, service: RecordingService
+) -> None:
+    """DPR が変わったら要求し直す。
+
+    高 DPI モニタへ移すだけではスクロールもリサイズもズームも起きないため、
+    ここで拾わないと古い DPR の画像を拡大したまま表示し続けてしまう。
+    """
+    count = len(service.requests)
+
+    QApplication.sendEvent(loaded_view, QEvent(QEvent.Type.DevicePixelRatioChange))
+
+    assert len(service.requests) == count + 1
+
+
+def test_zoom_requests_only_once(loaded_view: PdfView, service: RecordingService) -> None:
+    """ズームの途中経過でレンダリング要求を出さない。
+
+    可動域と位置を段階的に変える途中でスクロールバーに追随すると、中間状態の
+    要求とページ通知が出てしまう。
+    """
+    loaded_view.verticalScrollBar().setValue(1000)
+    count = len(service.requests)
+
+    loaded_view.set_zoom(2.0)
+
+    assert len(service.requests) == count + 1
+
+
+def test_setting_a_document_requests_only_once(
+    loaded_view: PdfView, controller: DocumentController, service: RecordingService
+) -> None:
+    """ドキュメント切り替えの途中経過でレンダリング要求を出さない。"""
+    loaded_view.verticalScrollBar().setValue(1000)
+    count = len(service.requests)
+
+    loaded_view.set_document(controller.document, controller.page_sizes())
+
+    assert len(service.requests) == count + 1
+
+
 def test_scrolling_updates_the_requested_pages(
     loaded_view: PdfView, service: RecordingService
 ) -> None:
@@ -283,7 +325,10 @@ def test_page_ready_updates_only_that_page(loaded_view: PdfView, service: Record
 
     expected = loaded_view.page_viewport_rect(0)
     assert expected is not None
-    assert spy.rects == [expected.toAlignedRect().intersected(loaded_view.viewport().rect())]
+    # 枠線のはみ出しを見込んで 1px 広げた領域。
+    assert spy.rects == [
+        expected.toAlignedRect().adjusted(-1, -1, 1, 1).intersected(loaded_view.viewport().rect())
+    ]
 
 
 def test_page_ready_outside_the_viewport_is_ignored(
@@ -353,6 +398,33 @@ def test_zoom_keeps_the_center_position(
     assert loaded_view.current_page == page
     after = layout.to_normalized(page, loaded_view.content_viewport_rect().center(), 2.0)
     assert after.y() == pytest.approx(before.y(), abs=0.02)
+
+
+def test_zoom_keeps_a_fully_visible_page_centered(view: PdfView, single_page_pdf: Path) -> None:
+    """ページ全体が見えている状態から拡大しても末尾へ飛ばない。
+
+    ビューポート中央がページの外（下の余白）にある状態。中央の位置を
+    そのままページ内の比率として扱うと 1.0 を超え、拡大した瞬間に
+    ページ末尾までスクロールしてしまう。
+    """
+    single = DocumentController()
+    single.open(single_page_pdf)
+    try:
+        view.set_document(single.document, single.page_sizes())
+        view.set_zoom(MIN_ZOOM)
+        # ページ全体がビューポートに収まっていて、中央はページより下にある。
+        page = view.page_viewport_rect(0)
+        assert page is not None
+        assert page.bottom() < view.viewport().height() / 2
+
+        view.set_zoom(1.0)
+
+        layout = PageLayout(single.page_sizes())
+        center = layout.to_normalized(0, view.content_viewport_rect().center(), 1.0)
+        assert center.y() == pytest.approx(0.5, abs=0.05)
+        assert view.verticalScrollBar().value() < view.verticalScrollBar().maximum()
+    finally:
+        single.close()
 
 
 def test_zoom_is_clamped(loaded_view: PdfView) -> None:
@@ -487,9 +559,37 @@ def test_a_document_can_be_set_after_clearing(
 
 def test_page_sizes_come_from_the_caller(view: PdfView, controller: DocumentController) -> None:
     """ページ寸法はドキュメントからではなく呼び出し側から与える。"""
-    view.set_document(controller.document, [QSizeF(100.0, 200.0), QSizeF(100.0, 200.0)])
+    sizes = [QSizeF(100.0, 200.0), *controller.page_sizes()[1:]]
 
-    assert view.page_count == 2
-    rect = view.page_viewport_rect(0)
-    assert rect is not None
-    assert rect.width() == pytest.approx(100.0)
+    view.set_document(controller.document, sizes)
+
+    assert view.page_count == 3
+    first = view.page_viewport_rect(0)
+    assert first is not None
+    assert first.width() == pytest.approx(100.0)
+    assert first.height() == pytest.approx(200.0)
+
+
+def test_page_size_count_must_match_the_document(
+    view: PdfView, controller: DocumentController
+) -> None:
+    """ページ数の合わない寸法は受け付けない。
+
+    黙って受け入れると、ドキュメントは3ページなのにレイアウトは2ページ、
+    という壊れた状態のまま表示してしまう。
+    """
+    with pytest.raises(ValueError, match="page size count"):
+        view.set_document(controller.document, controller.page_sizes()[:2])
+
+
+def test_a_rejected_document_does_not_disturb_the_current_one(
+    loaded_view: PdfView, controller: DocumentController, cache: RenderCache
+) -> None:
+    """受け付けられなかった設定は、いま表示中の状態を壊さない。"""
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+
+    with pytest.raises(ValueError, match="page size count"):
+        loaded_view.set_document(controller.document, [])
+
+    assert loaded_view.page_count == 3
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.red)

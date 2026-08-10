@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 
-from PySide6.QtCore import QPointF, QRect, QRectF, QSize, QSizeF, Signal
+from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, QSizeF, Signal
 from PySide6.QtGui import QColor, QPainter, QPaintEvent, QResizeEvent
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
@@ -51,6 +52,25 @@ _SCROLL_STEP = 30
 
 # ドキュメントが無いときの現在ページ。
 NO_PAGE = -1
+
+
+def _anchor_ratio(
+    viewport_start: float, viewport_end: float, page_start: float, page_end: float
+) -> float:
+    """ページ内のどこをビューポート中央に据えるか（0.0〜1.0）。
+
+    ページがビューポートに収まっているならページの中心。はみ出しているなら
+    ビューポート中央にあたる位置。
+
+    ビューポート中央がページの外（余白や隙間）にある場合はページの端に
+    丸める。`PageLayout.to_normalized()` はページ外の点も 1.0 を超える比率に
+    そのまま変換するため、丸めずに使うと倍率変更でページ末尾へ大きく飛ぶ。
+    """
+    length = page_end - page_start
+    if length <= 0 or (page_start >= viewport_start and page_end <= viewport_end):
+        return 0.5
+    center = (viewport_start + viewport_end) / 2
+    return min(max((center - page_start) / length, 0.0), 1.0)
 
 
 class PdfView(QAbstractScrollArea):
@@ -86,15 +106,28 @@ class PdfView(QAbstractScrollArea):
         画像が仮表示として出ることはない。表示倍率とスクロール位置も
         初期状態に戻す。
         """
-        # 先にキャッシュと世代を進める。順序を逆にすると、新しいレイアウトで
-        # 描いたページに古い PDF の画像が仮表示として乗る。
-        self._render.set_document(document)
+        if len(page_sizes) != document.pageCount():
+            msg = (
+                f"page size count {len(page_sizes)} does not match "
+                f"document page count {document.pageCount()}"
+            )
+            raise ValueError(msg)
 
-        self._layout = PageLayout(page_sizes)
+        # レイアウトを先に組み立てる。捨ててから作ると、構築に失敗したときに
+        # 古いレイアウトと新しいレンダリング状態が混ざる。
+        layout = PageLayout(page_sizes)
+
+        # キャッシュと世代はレイアウトを差し替える前に進める。順序を逆にすると、
+        # 新しいレイアウトで描いたページに古い PDF の画像が仮表示として乗る。
+        self._render.set_document(document)
+        self._layout = layout
         self._zoom = 1.0
-        self._update_scrollbars()
-        self.horizontalScrollBar().setValue(0)
-        self.verticalScrollBar().setValue(0)
+
+        with self._quiet_scrollbars():
+            self._update_scrollbars()
+            self.horizontalScrollBar().setValue(0)
+            self.verticalScrollBar().setValue(0)
+
         self.viewport().update()
         self._request_render()
         self._refresh_current_page()
@@ -103,7 +136,8 @@ class PdfView(QAbstractScrollArea):
         """表示を空にする。"""
         self._layout = None
         self._render.reset()
-        self._update_scrollbars()
+        with self._quiet_scrollbars():
+            self._update_scrollbars()
         self.viewport().update()
         self._refresh_current_page()
 
@@ -135,24 +169,34 @@ class PdfView(QAbstractScrollArea):
 
         anchor = self._center_anchor()
         self._zoom = zoom
-        self._update_scrollbars()
-        if anchor is not None:
-            self._restore_center_anchor(*anchor)
+
+        with self._quiet_scrollbars():
+            self._update_scrollbars()
+            if anchor is not None:
+                self._restore_center_anchor(*anchor)
+
         self.viewport().update()
         self._request_render()
         self._refresh_current_page()
 
     def _center_anchor(self) -> tuple[int, QPointF] | None:
-        """ビューポート中央にあるページと、そのページ内の正規化座標。
+        """ビューポート中央に据えるページと、そのページ内の正規化座標。
 
         コンテンツ座標そのものではなくページ内の正規化座標で覚える。
         隙間と余白はズームしないため、コンテンツ座標は倍率に比例しない。
+
+        比率は `_anchor_ratio()` でページの内側に収める。ページ全体が
+        見えている場合はページ中心を中央に据える。
         """
         if self._layout is None:
             return None
         viewport = self.content_viewport_rect()
         page = self._layout.current_page(viewport, self._zoom)
-        return page, self._layout.to_normalized(page, viewport.center(), self._zoom)
+        rect = self._layout.page_rect(page, self._zoom)
+        return page, QPointF(
+            _anchor_ratio(viewport.left(), viewport.right(), rect.left(), rect.right()),
+            _anchor_ratio(viewport.top(), viewport.bottom(), rect.top(), rect.bottom()),
+        )
 
     def _restore_center_anchor(self, page: int, normalized: QPointF) -> None:
         """アンカーの位置がビューポート中央に来るようスクロールする。"""
@@ -231,6 +275,22 @@ class PdfView(QAbstractScrollArea):
             bar.setPageStep(viewport_length)
             bar.setSingleStep(_SCROLL_STEP)
 
+    @contextmanager
+    def _quiet_scrollbars(self) -> Iterator[None]:
+        """可動域と位置をまとめて更新する間、`scrollContentsBy()` を止める。
+
+        更新の途中でスクロールバーが値を切り詰めるたびに追随すると、中間状態
+        での再描画・レンダリング要求・`current_page_changed` が出てしまう。
+        呼び出し側は抜けたあとに一度だけまとめて行う。
+        """
+        bars = (self.horizontalScrollBar(), self.verticalScrollBar())
+        blocked = [bar.blockSignals(True) for bar in bars]
+        try:
+            yield
+        finally:
+            for bar, previous in zip(bars, blocked, strict=True):
+                bar.blockSignals(previous)
+
     def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802 (Qt の命名規則)
         """スクロール位置が変わったときの追随。
 
@@ -245,9 +305,23 @@ class PdfView(QAbstractScrollArea):
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 (Qt の命名規則)
         """リサイズに追随する。レイアウトもキャッシュも作り直さない。"""
         super().resizeEvent(event)
-        self._update_scrollbars()
+        with self._quiet_scrollbars():
+            self._update_scrollbars()
         self._request_render()
         self._refresh_current_page()
+
+    def event(self, event: QEvent) -> bool:
+        """画面の `devicePixelRatio` が変わったらレンダリングし直す。
+
+        高 DPI モニタへ移動しただけではスクロールもリサイズもズームも
+        起きないので、ここで拾わないと古い DPR の画像を拡大したまま
+        表示し続けてしまう。ビューの DPR はビュー自身が知っているので、
+        MainWindow ではなくここで扱う。
+        """
+        if event.type() == QEvent.Type.DevicePixelRatioChange:
+            self._request_render()
+            self.viewport().update()
+        return super().event(event)
 
     # -------------------------------------------------- 描画
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 (Qt の命名規則)
@@ -295,8 +369,11 @@ class PdfView(QAbstractScrollArea):
         self.viewport().update(self._aligned(rect))
 
     def _aligned(self, rect: QRectF) -> QRect:
-        """浮動小数点の矩形を、確実に覆う整数矩形にする。"""
-        return rect.toAlignedRect().intersected(self.viewport().rect())
+        """浮動小数点の矩形を、確実に覆う整数矩形にする。
+
+        枠線のペンが矩形の境界の外側にはみ出す分を 1px 見込む。
+        """
+        return rect.toAlignedRect().adjusted(-1, -1, 1, 1).intersected(self.viewport().rect())
 
     # -------------------------------------------------- レンダリング要求
     def _render_size(self, logical_size: QSizeF) -> QSize:
