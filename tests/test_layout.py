@@ -317,3 +317,75 @@ def test_normalized_round_trip(zoom: float) -> None:
 
     assert result.x() == pytest.approx(original.x())
     assert result.y() == pytest.approx(original.y())
+
+
+# ------------------------------------------------------------------ フィット倍率
+def test_fit_width_zoom_accounts_for_the_margin() -> None:
+    """幅フィットは余白を差し引いた幅にページを合わせる。"""
+    layout = make_layout(3)
+
+    # 使える幅 = 340 - 余白 20*2 = 300。ページ幅 100 なので 3.0 倍。
+    zoom = layout.fit_width_zoom(0, 340.0)
+
+    assert zoom == pytest.approx(3.0)
+    assert layout.content_size(zoom).width() == pytest.approx(340.0)
+
+
+def test_fit_page_zoom_uses_the_stricter_side() -> None:
+    """ページフィットは縦横のうち厳しい方に合わせる。"""
+    layout = make_layout(3)
+
+    # 幅なら 3.0 倍だが、高さ 240 - 余白 40 = 200 に高さ 200 を収めるので 1.0 倍。
+    zoom = layout.fit_page_zoom(0, QSizeF(340.0, 240.0))
+
+    assert zoom == pytest.approx(1.0)
+    assert zoom == pytest.approx(min(layout.fit_width_zoom(0, 340.0), 1.0))
+
+
+def test_fit_page_zoom_fits_the_whole_page() -> None:
+    """ページフィットした倍率ならページ全体がビューポートに収まる。"""
+    layout = make_layout(3)
+    viewport = QSizeF(500.0, 300.0)
+
+    rect = layout.page_rect(0, layout.fit_page_zoom(0, viewport))
+
+    assert rect.width() <= viewport.width()
+    assert rect.height() <= viewport.height()
+
+
+def test_fit_zoom_uses_the_requested_page() -> None:
+    """基準ページごとに倍率が変わる。"""
+    layout = PageLayout([QSizeF(100.0, 200.0), QSizeF(200.0, 200.0)], METRICS)
+
+    assert layout.fit_width_zoom(0, 340.0) == pytest.approx(3.0)
+    assert layout.fit_width_zoom(1, 340.0) == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize("viewport_width", [0.0, 40.0, -100.0])
+def test_fit_width_zoom_is_zero_when_it_cannot_fit(viewport_width: float) -> None:
+    """余白すら入らない幅では 0.0 を返し、丸めは呼び出し側に任せる。"""
+    assert make_layout(1).fit_width_zoom(0, viewport_width) == 0.0
+
+
+def test_fit_page_zoom_is_zero_when_it_cannot_fit() -> None:
+    """高さが足りなければ 0.0。"""
+    assert make_layout(1).fit_page_zoom(0, QSizeF(340.0, 10.0)) == 0.0
+
+
+# ------------------------------------------------------------------ 点の属するページ
+def test_page_at_finds_the_page_under_a_point() -> None:
+    """ページ上の点からページ番号を引ける。"""
+    layout = make_layout(3)
+    rect = layout.page_rect(1, 1.0)
+
+    assert layout.page_at(rect.center(), 1.0) == 1
+
+
+def test_page_at_returns_none_in_the_gap() -> None:
+    """ページ間の隙間や左右の余白では None。"""
+    layout = make_layout(3)
+    rect = layout.page_rect(0, 1.0)
+
+    assert layout.page_at(QPointF(rect.center().x(), rect.bottom() + 5.0), 1.0) is None
+    assert layout.page_at(QPointF(rect.left() - 5.0, rect.center().y()), 1.0) is None
+    assert layout.page_at(QPointF(rect.center().x(), rect.top() - 5.0), 1.0) is None

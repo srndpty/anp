@@ -52,6 +52,12 @@ def single_page_pdf(qapp: QApplication, tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def two_page_pdf(qapp: QApplication, tmp_path: Path) -> Path:
+    """2ページの PDF。`sample_pdf` より短い PDF が要るときに使う。"""
+    return _write_pdf(tmp_path / "two.pdf", 2)
+
+
+@pytest.fixture
 def broken_pdf(tmp_path: Path) -> Path:
     """PDF として読めないファイル。"""
     path = tmp_path / "broken.pdf"

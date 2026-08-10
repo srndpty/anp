@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 _KEY_GEOMETRY = "window/geometry"
 _KEY_WINDOW_STATE = "window/state"
 _KEY_LAST_DIRECTORY = "files/last_directory"
+_KEY_ZOOM_MODE = "view/zoom_mode"
+_KEY_FREE_ZOOM = "view/free_zoom"
+
+DEFAULT_ZOOM_MODE = "free"
+DEFAULT_FREE_ZOOM = 1.0
+
+# 保存された倍率として受け付ける範囲。UI 側の上下限とは独立に、壊れた値を
+# ここで弾く。`core` は表示の都合を知らないので、緩めの健全性チェックに留める。
+_MIN_FREE_ZOOM = 0.01
+_MAX_FREE_ZOOM = 100.0
 
 
 class Settings:
@@ -53,6 +63,42 @@ class Settings:
     @last_directory.setter
     def last_directory(self, value: str) -> None:
         self._backend.setValue(_KEY_LAST_DIRECTORY, value)
+
+    # -------------------------------------------------- 表示
+    @property
+    def zoom_mode(self) -> str:
+        """保存された倍率モードの名前。未保存や不正な型なら既定値。
+
+        名前の妥当性（どのモードが存在するか）は UI 層が判断する。`core` は
+        表示の都合を知らないので、ここでは文字列であることだけを保証する。
+        """
+        value = self._backend.value(_KEY_ZOOM_MODE, DEFAULT_ZOOM_MODE)
+        return value if isinstance(value, str) and value else DEFAULT_ZOOM_MODE
+
+    @zoom_mode.setter
+    def zoom_mode(self, value: str) -> None:
+        self._backend.setValue(_KEY_ZOOM_MODE, value)
+
+    @property
+    def free_zoom(self) -> float:
+        """保存された手動指定の倍率。未保存や壊れていれば 1.0。
+
+        INI から読むと数値も文字列で返るので、数に変換できるかを確かめる。
+        """
+        value = self._backend.value(_KEY_FREE_ZOOM, DEFAULT_FREE_ZOOM)
+        try:
+            zoom = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            logger.warning("ignoring invalid free zoom setting: %r", value)
+            return DEFAULT_FREE_ZOOM
+        if not _MIN_FREE_ZOOM <= zoom <= _MAX_FREE_ZOOM:
+            logger.warning("ignoring out-of-range free zoom setting: %r", zoom)
+            return DEFAULT_FREE_ZOOM
+        return zoom
+
+    @free_zoom.setter
+    def free_zoom(self, value: float) -> None:
+        self._backend.setValue(_KEY_FREE_ZOOM, value)
 
     # -------------------------------------------------- 内部
     def sync(self) -> None:

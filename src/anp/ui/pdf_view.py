@@ -24,9 +24,11 @@ import logging
 import math
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
 
-from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, QSizeF, Signal
-from PySide6.QtGui import QColor, QPainter, QPaintEvent, QResizeEvent
+from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, QSizeF, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPaintEvent, QResizeEvent, QWheelEvent
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
@@ -38,6 +40,33 @@ logger = logging.getLogger(__name__)
 # 表示倍率の範囲。これより外は clamp する。
 MIN_ZOOM = 0.25
 MAX_ZOOM = 8.0
+
+# ズームイン/アウト1回の倍率比。加算ではなく比にするのは、低倍率でも高倍率でも
+# 体感の変化量を揃えるため。2回で2倍になる。
+ZOOM_STEP = math.sqrt(2.0)
+
+# ホイール1ノッチの角度（1/8度単位）。Qt の慣習値。
+_WHEEL_NOTCH = 120.0
+
+
+class ZoomMode(Enum):
+    """表示倍率の決め方。
+
+    「幅に合わせる」「ページ全体」を bool の組み合わせで持つと、両方 True の
+    ような表現できない状態が作れてしまうので、排他の列挙で持つ。
+
+    値は設定への保存にそのまま使う文字列。
+    """
+
+    FREE = "free"
+    """手動で指定した倍率。"""
+
+    FIT_WIDTH = "fit_width"
+    """現在ページの幅がビューポートに収まる倍率。"""
+
+    FIT_PAGE = "fit_page"
+    """現在ページ全体がビューポートに収まる倍率。"""
+
 
 # ページの下地。Phase 2 でページ色変換を入れるため、キャンバスとは分けて塗る。
 _PAGE_COLOR = QColor(0xFF, 0xFF, 0xFF)
@@ -52,6 +81,24 @@ _SCROLL_STEP = 30
 
 # ドキュメントが無いときの現在ページ。
 NO_PAGE = -1
+
+
+@dataclass(frozen=True, slots=True)
+class _ZoomAnchor:
+    """倍率を変えても動かさない点。
+
+    ページ内の正規化座標で覚える。隙間と余白はズームしないので、コンテンツ
+    座標は倍率に比例しないため。`viewport_pos` はその点を留めるビューポート
+    座標で、中央アンカーならビューポート中央、ポインタアンカーならカーソル位置。
+    """
+
+    page: int
+    normalized: QPointF
+    viewport_pos: QPointF
+
+
+def _clamp_unit(value: float) -> float:
+    return min(max(value, 0.0), 1.0)
 
 
 def _anchor_ratio(
@@ -81,6 +128,8 @@ class PdfView(QAbstractScrollArea):
     """
 
     current_page_changed = Signal(int)
+    zoom_changed = Signal()
+    """表示倍率か倍率モードが変わった。表示の更新は受け取った側で行う。"""
 
     def __init__(self, render_service: PageRenderService, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -89,6 +138,7 @@ class PdfView(QAbstractScrollArea):
 
         self._layout: PageLayout | None = None
         self._zoom = 1.0
+        self._zoom_mode = ZoomMode.FREE
         self._current_page = NO_PAGE
 
         self.viewport().setAutoFillBackground(False)
@@ -103,8 +153,11 @@ class PdfView(QAbstractScrollArea):
         問い合わせ方をビューに持ち込まないため。
 
         レンダリング状態を先に捨てるので、切り替えた瞬間に前の PDF の
-        画像が仮表示として出ることはない。表示倍率とスクロール位置も
-        初期状態に戻す。
+        画像が仮表示として出ることはない。スクロール位置は先頭に戻す。
+
+        表示倍率は現在の `ZoomMode` を新しいドキュメントに適用し直す。
+        フィット系なら1ページ目に対して計算し直し、FREE なら手動で
+        指定された倍率をそのまま引き継ぐ。
         """
         if len(page_sizes) != document.pageCount():
             msg = (
@@ -121,7 +174,9 @@ class PdfView(QAbstractScrollArea):
         # 新しいレイアウトで描いたページに古い PDF の画像が仮表示として乗る。
         self._render.set_document(document)
         self._layout = layout
-        self._zoom = 1.0
+
+        before = self._zoom
+        self._zoom = self._resolved_zoom(0)
 
         with self._quiet_scrollbars():
             self._update_scrollbars()
@@ -131,6 +186,8 @@ class PdfView(QAbstractScrollArea):
         self.viewport().update()
         self._request_render()
         self._refresh_current_page()
+        if self._zoom != before:
+            self.zoom_changed.emit()
 
     def clear_document(self) -> None:
         """表示を空にする。"""
@@ -157,33 +214,100 @@ class PdfView(QAbstractScrollArea):
         """現在の表示倍率。"""
         return self._zoom
 
-    def set_zoom(self, zoom: float) -> None:
-        """表示倍率を変える。範囲外は `MIN_ZOOM`〜`MAX_ZOOM` に収める。
+    @property
+    def zoom_mode(self) -> ZoomMode:
+        """表示倍率の決め方。"""
+        return self._zoom_mode
 
-        倍率を変えた瞬間に文書の先頭へ飛ばないよう、ビューポート中央の
-        コンテンツ位置を保つ。
+    def set_zoom(self, zoom: float) -> None:
+        """表示倍率を手動で指定する。`ZoomMode.FREE` へ移行する。
+
+        範囲外は `MIN_ZOOM`〜`MAX_ZOOM` に収める。倍率を変えた瞬間に
+        文書の先頭へ飛ばないよう、ビューポート中央のコンテンツ位置を保つ。
+        """
+        self._set_zoom_state(zoom, ZoomMode.FREE, self._center_anchor())
+
+    def zoom_by(self, factor: float) -> None:
+        """現在の倍率に比を掛ける。`ZoomMode.FREE` へ移行する。"""
+        self.set_zoom(self._zoom * factor)
+
+    def zoom_in(self) -> None:
+        """1段階拡大する。加算ではなく `ZOOM_STEP` 倍。"""
+        self.zoom_by(ZOOM_STEP)
+
+    def zoom_out(self) -> None:
+        """1段階縮小する。"""
+        self.zoom_by(1.0 / ZOOM_STEP)
+
+    def fit_width(self) -> None:
+        """現在ページの幅をビューポートに合わせる。"""
+        self._apply_fit(ZoomMode.FIT_WIDTH)
+
+    def fit_page(self) -> None:
+        """現在ページ全体をビューポートに収める。"""
+        self._apply_fit(ZoomMode.FIT_PAGE)
+
+    def _apply_fit(self, mode: ZoomMode) -> None:
+        """フィットモードへ移行し、そのときの現在ページを基準に倍率を決める。
+
+        基準にするのは **この瞬間の** 現在ページだけ。以後スクロールして
+        ページを跨いでも倍率は変えない（`current_page_changed` から
+        ここを呼ばないこと）。ページを跨ぐたびに倍率が動くと読めない。
+        """
+        self._set_zoom_state(self._fit_zoom(mode, self._anchor_page()), mode, self._center_anchor())
+
+    def _fit_zoom(self, mode: ZoomMode, page: int) -> float:
+        """フィット倍率。ドキュメントが無いか FREE なら現在の倍率のまま。
+
+        `PageLayout` は表示倍率の許容範囲を知らないので 0.0 を返しうる。
+        `_set_zoom_state()` が下限へ丸める。
+        """
+        if self._layout is None or mode is ZoomMode.FREE:
+            return self._zoom
+        size = QSizeF(self.viewport().size())
+        if mode is ZoomMode.FIT_WIDTH:
+            return self._layout.fit_width_zoom(page, size.width())
+        return self._layout.fit_page_zoom(page, size)
+
+    def _resolved_zoom(self, page: int) -> float:
+        """いまのモードで page を基準にしたときの倍率（範囲内に丸め済み）。"""
+        return min(max(self._fit_zoom(self._zoom_mode, page), MIN_ZOOM), MAX_ZOOM)
+
+    def _anchor_page(self) -> int:
+        """フィットの基準にするページ。ドキュメントが無ければ先頭。"""
+        return max(self._current_page, 0)
+
+    def _set_zoom_state(self, zoom: float, mode: ZoomMode, anchor: _ZoomAnchor | None) -> None:
+        """倍率とモードを一度に変える。ズームの唯一の入口。
+
+        中央アンカー・ポインタアンカー・フィットのすべてがここを通るので、
+        1回の倍率変更につきスクロールバー更新・再描画・レンダリング要求は
+        それぞれ1回で済む。
         """
         zoom = min(max(zoom, MIN_ZOOM), MAX_ZOOM)
-        if zoom == self._zoom:
-            return
+        changed = zoom != self._zoom or mode is not self._zoom_mode
 
-        anchor = self._center_anchor()
+        self._zoom_mode = mode
+        if zoom != self._zoom:
+            self._commit_zoom(zoom, anchor)
+        if changed:
+            self.zoom_changed.emit()
+
+    def _commit_zoom(self, zoom: float, anchor: _ZoomAnchor | None) -> None:
+        """新しい倍率を反映し、追随をまとめて1回だけ行う。"""
         self._zoom = zoom
-
         with self._quiet_scrollbars():
             self._update_scrollbars()
             if anchor is not None:
-                self._restore_center_anchor(*anchor)
+                self._restore_anchor(anchor)
 
         self.viewport().update()
         self._request_render()
         self._refresh_current_page()
 
-    def _center_anchor(self) -> tuple[int, QPointF] | None:
+    # -------------------------------------------------- アンカー
+    def _center_anchor(self) -> _ZoomAnchor | None:
         """ビューポート中央に据えるページと、そのページ内の正規化座標。
-
-        コンテンツ座標そのものではなくページ内の正規化座標で覚える。
-        隙間と余白はズームしないため、コンテンツ座標は倍率に比例しない。
 
         比率は `_anchor_ratio()` でページの内側に収める。ページ全体が
         見えている場合はページ中心を中央に据える。
@@ -193,25 +317,64 @@ class PdfView(QAbstractScrollArea):
         viewport = self.content_viewport_rect()
         page = self._layout.current_page(viewport, self._zoom)
         rect = self._layout.page_rect(page, self._zoom)
-        return page, QPointF(
-            _anchor_ratio(viewport.left(), viewport.right(), rect.left(), rect.right()),
-            _anchor_ratio(viewport.top(), viewport.bottom(), rect.top(), rect.bottom()),
+        size = self.viewport().size()
+        return _ZoomAnchor(
+            page=page,
+            normalized=QPointF(
+                _anchor_ratio(viewport.left(), viewport.right(), rect.left(), rect.right()),
+                _anchor_ratio(viewport.top(), viewport.bottom(), rect.top(), rect.bottom()),
+            ),
+            viewport_pos=QPointF(size.width() / 2, size.height() / 2),
         )
 
-    def _restore_center_anchor(self, page: int, normalized: QPointF) -> None:
-        """アンカーの位置がビューポート中央に来るようスクロールする。"""
+    def _pointer_anchor(self, position: QPointF) -> _ZoomAnchor | None:
+        """カーソル直下の点を留めるアンカー。
+
+        カーソルがページではなく余白や隙間の上にある場合は、現在ページの
+        いちばん近い縁へ丸める。ページの外を基準にすると、倍率を変えた
+        瞬間に遠くへ飛んでしまう。
+        """
+        if self._layout is None:
+            return None
+        content = position + self._scroll_offset()
+        page = self._layout.page_at(content, self._zoom)
+        if page is None:
+            page = self._layout.current_page(self.content_viewport_rect(), self._zoom)
+        normalized = self._layout.to_normalized(page, content, self._zoom)
+        return _ZoomAnchor(
+            page=page,
+            normalized=QPointF(_clamp_unit(normalized.x()), _clamp_unit(normalized.y())),
+            viewport_pos=position,
+        )
+
+    def _restore_anchor(self, anchor: _ZoomAnchor) -> None:
+        """アンカーの点が元のビューポート位置に来るようスクロールする。"""
         if self._layout is None:
             return
-        center = self._layout.from_normalized(page, normalized, self._zoom)
-        size = self.viewport().size()
-        self.horizontalScrollBar().setValue(round(center.x() - size.width() / 2))
-        self.verticalScrollBar().setValue(round(center.y() - size.height() / 2))
+        content = self._layout.from_normalized(anchor.page, anchor.normalized, self._zoom)
+        self.horizontalScrollBar().setValue(round(content.x() - anchor.viewport_pos.x()))
+        self.verticalScrollBar().setValue(round(content.y() - anchor.viewport_pos.y()))
 
     # -------------------------------------------------- 現在ページ
     @property
     def current_page(self) -> int:
         """いま読んでいるページ（0 始まり）。無ければ `NO_PAGE`。"""
         return self._current_page
+
+    def go_to_page(self, page_index: int) -> None:
+        """指定ページの上端をビューポート上端へ持ってくる（0 始まり）。
+
+        範囲外は先頭/末尾に丸める。最終ページなど可動域の都合で上端まで
+        寄せきれない場合は、行けるところまでで止まる。
+
+        スクロールバー経由で動かすので、現在ページ・レンダリング要求・
+        再描画は通常のスクロールと同じ経路で更新される。
+        """
+        if self._layout is None:
+            return
+        index = min(max(page_index, 0), self._layout.page_count - 1)
+        top = self._layout.page_rect(index, self._zoom).top() - self._layout.metrics.margin
+        self.verticalScrollBar().setValue(round(top))
 
     def _refresh_current_page(self) -> None:
         """現在ページを取り直し、変わっていれば通知する。"""
@@ -303,12 +466,36 @@ class PdfView(QAbstractScrollArea):
         self._refresh_current_page()
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802 (Qt の命名規則)
-        """リサイズに追随する。レイアウトもキャッシュも作り直さない。"""
+        """リサイズに追随する。レイアウトもキャッシュも作り直さない。
+
+        フィットモードなら倍率を計算し直す。FREE なら倍率は動かさない。
+        どちらの場合も `_commit_zoom()` に通し、リサイズ由来の追随と
+        倍率変更由来の追随でレンダリング要求が二重に出ないようにする。
+        """
         super().resizeEvent(event)
-        with self._quiet_scrollbars():
-            self._update_scrollbars()
-        self._request_render()
-        self._refresh_current_page()
+        zoom = self._resolved_zoom(self._anchor_page())
+        changed = zoom != self._zoom
+        self._commit_zoom(zoom, self._center_anchor() if changed else None)
+        if changed:
+            self.zoom_changed.emit()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 (Qt の命名規則)
+        """Ctrl + ホイールでズーム。修飾なしのホイールは通常のスクロール。
+
+        カーソル直下の PDF 上の点が動かないようにする。倍率の更新経路は
+        メニューからのズームと同じ `_set_zoom_state()`。
+        """
+        delta = event.angleDelta().y()
+        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier) or delta == 0:
+            super().wheelEvent(event)
+            return
+
+        self._set_zoom_state(
+            self._zoom * ZOOM_STEP ** (delta / _WHEEL_NOTCH),
+            ZoomMode.FREE,
+            self._pointer_anchor(event.position()),
+        )
+        event.accept()
 
     def event(self, event: QEvent) -> bool:
         """画面の `devicePixelRatio` が変わったらレンダリングし直す。
