@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.pdf_view import PdfView
 
@@ -44,14 +45,23 @@ class StudyMarkController:
         ドキュメントの差し替えで学習マークを捨てるので、先に呼ぶと
         読み込んだマークがその場で消える。
 
-        読み取りの前にビューを空にするので、途中で失敗しても
+        読み取りの前に表示対象もビューも解除するので、途中で失敗しても
         「新しい PDF ＋古い PDF のマーク」という組み合わせにはならない。
         `set_document()` も同じことをするが、対応の正しさはこの class の
         責任なので、呼び出し順に頼らずここでも空にする。
+
+        **表示対象を確定するのは読み取りに成功した後だけ**（fail-closed）。
+        読めなかった PDF を表示対象のまま残すと、以後の追加・更新が
+        「中身を読めていない PDF」に対して行われることになる。失敗した
+        場合は表示対象なしの状態で例外を送出する。
         """
-        self._active_path = Path(path)
+        self._active_path = None
         self._view.set_study_marks(())
-        self.refresh()
+
+        marks = self._load(Path(path))
+
+        self._active_path = Path(path)
+        self._view.set_study_marks(marks)
 
     def clear_document(self) -> None:
         """表示対象を解除し、ビューの学習マークを空にする。"""
@@ -68,16 +78,19 @@ class StudyMarkController:
 
         読み取りに失敗した場合は例外をそのまま送出する。「マークが0件」
         として黙って続けると、保存されているはずのものが消えたように
-        見えてしまう。
+        見えてしまう。表示対象は変えない（同じ PDF の読み直しなので、
+        別の PDF のマークが残ることはない）。
         """
         if self._active_path is None:
             self._view.set_study_marks(())
             return
 
-        try:
-            marks = self._repository.list_for_document(self._active_path)
-        except Exception:
-            logger.exception("failed to load study marks for %s", self._active_path)
-            raise
+        self._view.set_study_marks(self._load(self._active_path))
 
-        self._view.set_study_marks(marks)
+    def _load(self, path: Path) -> list[StudyMark]:
+        """1つの PDF のマークを読み出す。失敗はログに残してから送出する。"""
+        try:
+            return self._repository.list_for_document(path)
+        except Exception:
+            logger.exception("failed to load study marks for %s", path)
+            raise

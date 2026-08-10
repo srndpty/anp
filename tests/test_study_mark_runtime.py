@@ -46,15 +46,23 @@ class RecordingRepository(StudyMarkRepository):
 
 
 class FailingRepository(StudyMarkRepository):
-    """読み取りが必ず失敗するリポジトリ。
+    """読み取りが失敗するリポジトリ。
 
     DB が壊れている状況を決定的に作るために使う。`sqlite3` の例外を使うのは、
-    実際の失敗と同じ型で伝わることを確かめるため。
+    実際の失敗と同じ型で伝わることを確かめるため。`failing` を指定すると、
+    その PDF の読み取りだけが失敗する（「PDF は開けたが DB だけ読めない」
+    状況を作るため）。
     """
 
-    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:  # noqa: ARG002
-        msg = "no such table: study_marks"
-        raise sqlite3.OperationalError(msg)
+    def __init__(self, connection: sqlite3.Connection, failing: Path | None = None) -> None:
+        super().__init__(connection)
+        self._failing = failing
+
+    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
+        if self._failing is None or Path(document_path) == self._failing:
+            msg = "no such table: study_marks"
+            raise sqlite3.OperationalError(msg)
+        return super().list_for_document(document_path)
 
 
 @pytest.fixture
@@ -262,8 +270,7 @@ def test_marks_outside_the_page_range_are_still_handed_over(
     assert view.study_marks == (stale,)
 
 
-def test_a_read_failure_does_not_leave_the_previous_marks(
-    study_mark_controller: StudyMarkController,
+def test_a_read_failure_leaves_no_active_document(
     study_marks: StudyMarkRepository,
     study_mark_connection: sqlite3.Connection,
     view: PdfView,
@@ -271,22 +278,29 @@ def test_a_read_failure_does_not_leave_the_previous_marks(
     sample_pdf: Path,
     two_page_pdf: Path,
 ) -> None:
-    """読み取りに失敗しても、前の PDF のマークを新しい PDF へ出さない。
+    """読み取りに失敗したら、その PDF を表示対象として確定しない。
 
-    失敗を「マーク0件」として黙って飲み込まないことも同時に確かめる。
+    前の PDF のマークを新しい PDF へ出さないことに加えて、読めなかった
+    PDF が表示対象のまま残らないことを固定する（fail-closed）。P3-3B の
+    追加・更新は表示対象に対して行うので、「読めていない PDF が表示対象」
+    という状態を作らせない。失敗を「マーク0件」として黙って飲み込まない
+    ことも同時に確かめる。
     """
     a_mark = study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    controller = StudyMarkController(
+        FailingRepository(study_mark_connection, failing=two_page_pdf), view
+    )
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    controller.activate_document(sample_pdf)
     assert view.study_marks == (a_mark,)
 
-    broken = StudyMarkController(FailingRepository(study_mark_connection), view)
     show(view, doc, two_page_pdf)
     with pytest.raises(sqlite3.OperationalError):
-        broken.activate_document(two_page_pdf)
+        controller.activate_document(two_page_pdf)
 
-    assert len(view.study_marks) == 0
+    assert list(view.study_marks) == []
+    assert controller.active_document_path is None
 
 
 def test_a_read_failure_on_a_closed_connection_propagates(
@@ -304,6 +318,7 @@ def test_a_read_failure_on_a_closed_connection_propagates(
         study_mark_controller.activate_document(sample_pdf)
 
     assert view.study_marks == ()
+    assert study_mark_controller.active_document_path is None
 
 
 def test_loading_marks_does_not_touch_the_rendering(
@@ -501,23 +516,38 @@ def test_closing_the_window_releases_the_active_document(
     assert window.view.study_marks == ()
 
 
-def test_a_repository_failure_is_not_swallowed_by_the_window(
+def test_a_repository_failure_leaves_no_document_open(
     qtbot: QtBot,
     settings: Settings,
     study_mark_connection: sqlite3.Connection,
     sample_pdf: Path,
+    two_page_pdf: Path,
 ) -> None:
-    """DB の読み取りに失敗したら、マーク無しとして続行せずに例外が出る。
+    """PDF は開けても学習マークを読めなければ、その PDF も開いた状態にしない。
 
     「保存されているはずのものが消えたように見える」状態で読み進めさせない。
+    後始末は PDF を開くのに失敗したときと同じ「PDF なし」の状態で、
+    学習マークだけ別の失敗の仕方をしない。
     """
-    window = MainWindow(settings, FailingRepository(study_mark_connection))
+    repository = FailingRepository(study_mark_connection, failing=two_page_pdf)
+    a_mark = repository.create(sample_pdf, 0, 0.1, 0.1)
+    window = MainWindow(settings, repository)
     qtbot.addWidget(window)
 
-    with pytest.raises(sqlite3.OperationalError):
-        window.open_path(sample_pdf)
+    window.open_path(sample_pdf)
+    assert window.view.study_marks == (a_mark,)
 
-    assert window.view.study_marks == ()
+    with pytest.raises(sqlite3.OperationalError):
+        window.open_path(two_page_pdf)
+
+    assert window.study_marks.active_document_path is None
+    assert list(window.view.study_marks) == []
+    assert not window.view.has_document
+    assert window.view.page_count == 0
+    assert window.windowTitle() == "anp"
+    assert window.statusBar().currentMessage() == "PDF が開かれていません"
+    assert not window.reader_actions.next_page.isEnabled()
+    assert not window.reader_actions.zoom_in.isEnabled()
     window.close()
 
 

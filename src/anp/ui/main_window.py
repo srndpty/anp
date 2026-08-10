@@ -270,22 +270,43 @@ class MainWindow(QMainWindow):
         学習マークを読み込むのは **表示が新しい PDF に確定した後**。
         `set_document()` より前に読み込むと、ドキュメントの差し替えで
         そのまま捨てられる。
+
+        学習マークを読み込めなかった場合は、その PDF を開いた状態にも
+        しない（fail-closed）。読み込めていないまま読み進められると、
+        利用者からは「マークが消えた」ようにしか見えず、そのうえ
+        P3-3B 以降の追加・更新が実体の分からない PDF に対して行われる。
+        後始末は開くのに失敗したときと同じ「PDF なし」の状態まで戻し、
+        原因は握り潰さずに送出する。
         """
         try:
             self._controller.open(path)
         except DocumentError as error:
-            self._view.clear_document()
-            self._study_marks.clear_document()
-            self._sync_document_ui()
+            self._clear_document()
             QMessageBox.warning(self, "PDF を開けません", f"{path.name}\n\n{error.message}")
             return
 
         self._settings.last_directory = str(path.parent)
         self._view.set_document(self._controller.document, self._controller.page_sizes())
-        self._study_marks.activate_document(path)
+        try:
+            self._study_marks.activate_document(path)
+        except Exception:
+            self._clear_document()
+            self._controller.close()
+            raise
+
         self.setWindowTitle(f"{path.name} - anp")
         self._sync_document_ui()
         self.statusBar().showMessage(str(path))
+
+    def _clear_document(self) -> None:
+        """表示を「PDF なし」の状態へ戻す。
+
+        開くのに失敗したときと、学習マークを読み込めなかったときの後始末は
+        同じ。学習マークだけ別の後始末を作らない。
+        """
+        self._view.clear_document()
+        self._study_marks.clear_document()
+        self._sync_document_ui()
 
     # -------------------------------------------------- 表示の同期
     def _sync_document_ui(self) -> None:
