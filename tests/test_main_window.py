@@ -6,7 +6,7 @@ GUI のタイミングに依存しないよう、待ち合わせではなく状�
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -16,6 +16,8 @@ from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
 from anp.pdf.color import PageColorMode
+from anp.pdf.render import PageRenderService, PageRequest
+from anp.ui.appearance import CanvasTheme, UiTheme
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import ZOOM_STEP, ZoomMode
 
@@ -780,3 +782,225 @@ def test_an_unknown_zoom_mode_falls_back_to_free(qapp: QApplication, tmp_path: P
         assert window.view.zoom_mode is ZoomMode.FREE
     finally:
         window.deleteLater()
+
+
+# ------------------------------------------------------------------ キャンバスと UI テーマ
+def test_the_canvas_menu_exists(window: MainWindow) -> None:
+    """表示メニューの中に「キャンバス」がある。"""
+    submenu = menu_titled(window, "キャンバス(&N)")
+
+    assert [action.text() for action in submenu.actions()] == [
+        "黒(&B)",
+        "ダークグレー(&G)",
+        "白(&W)",
+    ]
+    assert submenu.menuAction() in menu_titled(window, "表示(&V)").actions()
+
+
+def test_the_ui_theme_menu_exists(window: MainWindow) -> None:
+    """表示メニューの中に「UI テーマ」がある。"""
+    submenu = menu_titled(window, "UI テーマ(&U)")
+
+    assert [action.text() for action in submenu.actions()] == [
+        "システム(&S)",
+        "ライト(&L)",
+        "ダーク(&D)",
+    ]
+    assert submenu.menuAction() in menu_titled(window, "表示(&V)").actions()
+
+
+def test_the_appearance_defaults_are_checked_at_startup(window: MainWindow) -> None:
+    """既定はダークグレーのキャンバスとシステムの UI テーマ。"""
+    actions = window.reader_actions
+
+    assert window.view.canvas_theme is CanvasTheme.DARK_GRAY
+    assert actions.canvas_dark_gray.isChecked()
+    assert window.ui_theme is UiTheme.SYSTEM
+    assert actions.ui_theme_system.isChecked()
+
+
+def test_the_menu_switches_the_canvas(opened: MainWindow) -> None:
+    """メニューからキャンバスの色を選べる。"""
+    opened.reader_actions.canvas_black.trigger()
+
+    assert opened.view.canvas_theme is CanvasTheme.BLACK
+
+
+def test_the_canvas_choices_are_exclusive(opened: MainWindow) -> None:
+    """キャンバスのチェックは常に1つだけ。"""
+    actions = opened.reader_actions
+
+    actions.canvas_white.trigger()
+    assert actions.canvas_white.isChecked()
+    assert not actions.canvas_black.isChecked()
+    assert not actions.canvas_dark_gray.isChecked()
+
+    actions.canvas_black.trigger()
+    assert actions.canvas_black.isChecked()
+    assert not actions.canvas_white.isChecked()
+
+
+def test_the_menu_switches_the_ui_theme(opened: MainWindow) -> None:
+    """メニューから UI テーマを選べる。"""
+    opened.reader_actions.ui_theme_dark.trigger()
+
+    assert opened.ui_theme is UiTheme.DARK
+
+
+def test_the_ui_theme_choices_are_exclusive(opened: MainWindow) -> None:
+    """UI テーマのチェックは常に1つだけ。"""
+    actions = opened.reader_actions
+
+    actions.ui_theme_dark.trigger()
+    assert actions.ui_theme_dark.isChecked()
+    assert not actions.ui_theme_system.isChecked()
+    assert not actions.ui_theme_light.isChecked()
+
+    actions.ui_theme_light.trigger()
+    assert actions.ui_theme_light.isChecked()
+    assert not actions.ui_theme_dark.isChecked()
+
+
+def test_the_ui_theme_can_go_back_to_system(opened: MainWindow) -> None:
+    """ダークにしてからシステムへ戻せる。"""
+    opened.reader_actions.ui_theme_dark.trigger()
+
+    opened.reader_actions.ui_theme_system.trigger()
+
+    assert opened.ui_theme is UiTheme.SYSTEM
+    assert opened.reader_actions.ui_theme_system.isChecked()
+
+
+def test_the_three_appearance_groups_are_separate(opened: MainWindow) -> None:
+    """3つの軸は別々のグループ。どれを変えても他の選択は外れない。"""
+    actions = opened.reader_actions
+
+    actions.page_color_invert.trigger()
+    actions.canvas_black.trigger()
+    actions.ui_theme_dark.trigger()
+
+    assert actions.page_color_invert.isChecked()
+    assert actions.canvas_black.isChecked()
+    assert actions.ui_theme_dark.isChecked()
+    assert opened.view.page_color_mode is PageColorMode.INVERT
+    assert opened.view.canvas_theme is CanvasTheme.BLACK
+    assert opened.ui_theme is UiTheme.DARK
+
+
+def test_the_ui_theme_does_not_touch_the_pdf_state(opened: MainWindow) -> None:
+    """UI テーマを変えても、ページの色・キャンバス・倍率・ページは動かない。"""
+    opened.reader_actions.page_color_invert.trigger()
+    opened.reader_actions.canvas_white.trigger()
+    opened.view.set_zoom(2.0)
+    page = opened.view.current_page
+
+    for theme in (UiTheme.DARK, UiTheme.LIGHT, UiTheme.SYSTEM):
+        opened.set_ui_theme(theme)
+
+    assert opened.view.page_color_mode is PageColorMode.INVERT
+    assert opened.view.canvas_theme is CanvasTheme.WHITE
+    assert opened.view.zoom == pytest.approx(2.0)
+    assert opened.view.current_page == page
+
+
+def test_the_appearance_can_be_chosen_without_a_document(window: MainWindow) -> None:
+    """PDF を開いていなくても外観を選べる。"""
+    assert window.reader_actions.canvas_black.isEnabled()
+    assert window.reader_actions.ui_theme_dark.isEnabled()
+
+    window.reader_actions.canvas_black.trigger()
+    window.reader_actions.ui_theme_dark.trigger()
+
+    assert window.view.canvas_theme is CanvasTheme.BLACK
+    assert window.ui_theme is UiTheme.DARK
+
+
+def test_the_appearance_survives_opening_another_pdf(
+    window: MainWindow, sample_pdf: Path, two_page_pdf: Path
+) -> None:
+    """PDF を切り替えても外観は維持される（PDF ごとの設定ではない）。"""
+    window.open_path(sample_pdf)
+    window.reader_actions.canvas_black.trigger()
+    window.reader_actions.ui_theme_dark.trigger()
+    window.reader_actions.page_color_invert.trigger()
+
+    window.open_path(two_page_pdf)
+
+    assert window.view.canvas_theme is CanvasTheme.BLACK
+    assert window.view.page_color_mode is PageColorMode.INVERT
+    assert window.ui_theme is UiTheme.DARK
+    assert window.reader_actions.canvas_black.isChecked()
+    assert window.reader_actions.ui_theme_dark.isChecked()
+
+
+def test_the_appearance_round_trips(qapp: QApplication, tmp_path: Path) -> None:
+    """外観の3つの軸が次回起動時に復元される。"""
+    ini = str(tmp_path / "settings.ini")
+
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first.reader_actions.canvas_white.trigger()
+    first.reader_actions.ui_theme_dark.trigger()
+    first.reader_actions.page_color_invert.trigger()
+    first.close()
+    first.deleteLater()
+
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    try:
+        assert second.view.canvas_theme is CanvasTheme.WHITE
+        assert second.view.page_color_mode is PageColorMode.INVERT
+        assert second.ui_theme is UiTheme.DARK
+        assert second.reader_actions.canvas_white.isChecked()
+        assert second.reader_actions.ui_theme_dark.isChecked()
+    finally:
+        second.deleteLater()
+
+
+def test_an_unknown_canvas_theme_falls_back_to_dark_gray(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """知らないキャンバスの色が保存されていたらダークグレーで起動する。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("view/canvas_theme", "sepia")
+
+    window = MainWindow(Settings(backend))
+    try:
+        assert window.view.canvas_theme is CanvasTheme.DARK_GRAY
+        assert window.reader_actions.canvas_dark_gray.isChecked()
+    finally:
+        window.deleteLater()
+
+
+def test_an_unknown_ui_theme_falls_back_to_system(qapp: QApplication, tmp_path: Path) -> None:
+    """知らない UI テーマが保存されていたらシステムで起動する。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("ui/theme", "solarized")
+
+    window = MainWindow(Settings(backend))
+    try:
+        assert window.ui_theme is UiTheme.SYSTEM
+        assert window.reader_actions.ui_theme_system.isChecked()
+    finally:
+        window.deleteLater()
+
+
+def test_changing_the_appearance_does_not_request_a_render(
+    opened: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """キャンバスと UI テーマを変えても、PDF のレンダリング要求は起きない。
+
+    P2-2 の最重要回帰条件をウィンドウ側からも確かめる。
+    """
+    calls: list[Sequence[PageRequest]] = []
+    original = PageRenderService.request_pages
+
+    def recording(service: PageRenderService, requests: Sequence[PageRequest]) -> None:
+        calls.append(requests)
+        original(service, requests)
+
+    monkeypatch.setattr(PageRenderService, "request_pages", recording)
+
+    opened.reader_actions.canvas_black.trigger()
+    opened.reader_actions.ui_theme_dark.trigger()
+    opened.reader_actions.ui_theme_system.trigger()
+
+    assert calls == []

@@ -32,9 +32,10 @@ from PySide6.QtGui import QColor, QPainter, QPaintEvent, QResizeEvent, QWheelEve
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
-from anp.pdf.color import PageColorMode
+from anp.pdf.color import PageColorMode, page_background_color
 from anp.pdf.layout import PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
+from anp.ui.appearance import CanvasTheme, canvas_color
 
 logger = logging.getLogger(__name__)
 
@@ -69,18 +70,7 @@ class ZoomMode(Enum):
     """現在ページ全体がビューポートに収まる倍率。"""
 
 
-# ページの下地。画像がまだ無い間と、画像が矩形を覆い切らない端で見える色。
-# ページ色変換に合わせて選ぶ。Invert 中に白で塗ると、読み込み中だけ
-# 画面が白く光る。キャンバスとは独立に塗る。
-_PAGE_COLORS = {
-    PageColorMode.ORIGINAL: QColor(0xFF, 0xFF, 0xFF),
-    PageColorMode.INVERT: QColor(0x00, 0x00, 0x00),
-}
 _PAGE_BORDER_COLOR = QColor(0x9A, 0x9A, 0x9A)
-
-# キャンバス（ページの外側）。**ページ色変換の影響を受けない。**
-# 反転するのはページの中身だけで、ページ外の領域は常にこの色。
-_CANVAS_COLOR = QColor(0x52, 0x56, 0x59)
 
 # スクロールの最小単位（論理ピクセル）。ホイール1ノッチではこれが
 # システムの「1度に送る行数」倍だけ動く。
@@ -157,6 +147,9 @@ class PdfView(QAbstractScrollArea):
     page_color_mode_changed = Signal()
     """ページ色変換が変わった。メニューの選択表示はこれを見て合わせる。"""
 
+    canvas_theme_changed = Signal()
+    """キャンバスの色が変わった。メニューの選択表示はこれを見て合わせる。"""
+
     def __init__(self, render_service: PageRenderService, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._render = render_service
@@ -167,6 +160,7 @@ class PdfView(QAbstractScrollArea):
         self._zoom_mode = ZoomMode.FREE
         self._last_free_zoom = 1.0
         self._current_page = NO_PAGE
+        self._canvas_theme = CanvasTheme.DARK_GRAY
 
         # 可動域と位置をまとめて更新している間だけ立てる。`_quiet_scrollbars()` を参照。
         self._scroll_updates_suppressed = False
@@ -263,6 +257,29 @@ class PdfView(QAbstractScrollArea):
         self._render.set_color_mode(mode)
         self.viewport().update()
         self.page_color_mode_changed.emit()
+
+    # -------------------------------------------------- キャンバスの色
+    @property
+    def canvas_theme(self) -> CanvasTheme:
+        """ページの外側を塗る色。"""
+        return self._canvas_theme
+
+    def set_canvas_theme(self, theme: CanvasTheme) -> None:
+        """キャンバスの色を切り替える。
+
+        **`PageColorMode` とは完全に独立。** ここから
+        `set_page_color_mode()` を呼ばない。白いキャンバスと反転ページの
+        ような組み合わせも、選ばれたとおりに描く。
+
+        必要なのはビューポートの塗り直しだけ。PDF のレンダリングも
+        表示用画像の作り直しも起きない。倍率・現在ページ・スクロール位置も
+        触らない。
+        """
+        if theme is self._canvas_theme:
+            return
+        self._canvas_theme = theme
+        self.viewport().update()
+        self.canvas_theme_changed.emit()
 
     # -------------------------------------------------- 表示倍率
     @property
@@ -612,7 +629,7 @@ class PdfView(QAbstractScrollArea):
         """見えているページだけを描く。"""
         painter = QPainter(self.viewport())
         try:
-            painter.fillRect(event.rect(), _CANVAS_COLOR)
+            painter.fillRect(event.rect(), canvas_color(self._canvas_theme))
             if self._layout is None:
                 return
 
@@ -631,7 +648,9 @@ class PdfView(QAbstractScrollArea):
         if rect is None:
             return
 
-        painter.fillRect(rect, _PAGE_COLORS[self._render.color_mode])
+        # ページ矩形の下地は `PageColorMode` 由来。キャンバスの色は
+        # ページの内側には入れない。
+        painter.fillRect(rect, page_background_color(self._render.color_mode))
 
         size_px = self._render_size(rect.size())
         image = self._render.image_for(index, size_px, self.devicePixelRatioF())

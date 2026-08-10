@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from hashlib import md5
 from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QSettings
-from PySide6.QtGui import QPageSize, QPainter, QPdfWriter
+from PySide6.QtGui import QGuiApplication, QPageSize, QPainter, QPdfWriter
 from PySide6.QtWidgets import QApplication
 
 from anp.core.settings import Settings
@@ -17,6 +18,21 @@ from anp.core.settings import Settings
 # PySide6 の import 自体はプラットフォームプラグインを読み込まないため、
 # import の後に設定しても間に合う。
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+@pytest.fixture(autouse=True)
+def reset_color_scheme() -> Iterator[None]:
+    """テストごとに UI テーマの指定を外す。
+
+    UI テーマは `QStyleHints`、つまり `QApplication` 全体の状態を変える。
+    戻さないと、Dark にしたテストの影響が後続のテストへ漏れる。
+
+    `QGuiApplication.instance()` を確かめるのは、`QApplication` を作らない
+    純粋ロジックのテストでも autouse で走るため。
+    """
+    yield
+    if QGuiApplication.instance() is not None:
+        QGuiApplication.styleHints().unsetColorScheme()
 
 
 def _write_pdf(path: Path, pages: int) -> Path:

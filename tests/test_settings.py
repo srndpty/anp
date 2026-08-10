@@ -97,6 +97,52 @@ def test_a_broken_page_color_mode_falls_back(tmp_path: Path) -> None:
     assert Settings(backend).page_color_mode == "original"
 
 
+def test_unset_canvas_theme_returns_the_default(settings: Settings) -> None:
+    """キャンバスの設定が無ければダークグレー。"""
+    assert settings.canvas_theme == "dark_gray"
+
+
+def test_the_canvas_theme_round_trips(tmp_path: Path) -> None:
+    """キャンバスの色を読み戻せる。"""
+    ini = str(tmp_path / "settings.ini")
+    first = Settings(QSettings(ini, QSettings.Format.IniFormat))
+    first.canvas_theme = "black"
+    first.sync()
+
+    assert Settings(QSettings(ini, QSettings.Format.IniFormat)).canvas_theme == "black"
+
+
+def test_a_broken_canvas_theme_falls_back(tmp_path: Path) -> None:
+    """文字列でないキャンバスの色は既定値へ落とす。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("view/canvas_theme", QByteArray(b"\x00\x01"))
+
+    assert Settings(backend).canvas_theme == "dark_gray"
+
+
+def test_unset_ui_theme_returns_the_default(settings: Settings) -> None:
+    """UI テーマの設定が無ければシステム。"""
+    assert settings.ui_theme == "system"
+
+
+def test_the_ui_theme_round_trips(tmp_path: Path) -> None:
+    """UI テーマを読み戻せる。"""
+    ini = str(tmp_path / "settings.ini")
+    first = Settings(QSettings(ini, QSettings.Format.IniFormat))
+    first.ui_theme = "dark"
+    first.sync()
+
+    assert Settings(QSettings(ini, QSettings.Format.IniFormat)).ui_theme == "dark"
+
+
+def test_a_broken_ui_theme_falls_back(tmp_path: Path) -> None:
+    """文字列でない UI テーマは既定値へ落とす。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("ui/theme", QByteArray(b"\x00\x01"))
+
+    assert Settings(backend).ui_theme == "system"
+
+
 def test_sync_failure_is_logged_but_not_raised(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

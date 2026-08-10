@@ -19,10 +19,14 @@ _KEY_LAST_DIRECTORY = "files/last_directory"
 _KEY_ZOOM_MODE = "view/zoom_mode"
 _KEY_FREE_ZOOM = "view/free_zoom"
 _KEY_PAGE_COLOR_MODE = "view/page_color_mode"
+_KEY_CANVAS_THEME = "view/canvas_theme"
+_KEY_UI_THEME = "ui/theme"
 
 DEFAULT_ZOOM_MODE = "free"
 DEFAULT_FREE_ZOOM = 1.0
 DEFAULT_PAGE_COLOR_MODE = "original"
+DEFAULT_CANVAS_THEME = "dark_gray"
+DEFAULT_UI_THEME = "system"
 
 # 保存された倍率として受け付ける範囲。UI 側の上下限とは独立に、壊れた値を
 # ここで弾く。`core` は表示の都合を知らないので、緩めの健全性チェックに留める。
@@ -74,8 +78,7 @@ class Settings:
         名前の妥当性（どのモードが存在するか）は UI 層が判断する。`core` は
         表示の都合を知らないので、ここでは文字列であることだけを保証する。
         """
-        value = self._backend.value(_KEY_ZOOM_MODE, DEFAULT_ZOOM_MODE)
-        return value if isinstance(value, str) and value else DEFAULT_ZOOM_MODE
+        return self._name(_KEY_ZOOM_MODE, DEFAULT_ZOOM_MODE)
 
     @zoom_mode.setter
     def zoom_mode(self, value: str) -> None:
@@ -109,12 +112,30 @@ class Settings:
         `zoom_mode` と同じく、どのモードが存在するかは UI 層が判断する。
         `core` は文字列であることだけを保証する。
         """
-        value = self._backend.value(_KEY_PAGE_COLOR_MODE, DEFAULT_PAGE_COLOR_MODE)
-        return value if isinstance(value, str) and value else DEFAULT_PAGE_COLOR_MODE
+        return self._name(_KEY_PAGE_COLOR_MODE, DEFAULT_PAGE_COLOR_MODE)
 
     @page_color_mode.setter
     def page_color_mode(self, value: str) -> None:
         self._backend.setValue(_KEY_PAGE_COLOR_MODE, value)
+
+    # -------------------------------------------------- 外観
+    @property
+    def canvas_theme(self) -> str:
+        """保存されたキャンバスの色の名前。未保存や不正な型なら既定値。"""
+        return self._name(_KEY_CANVAS_THEME, DEFAULT_CANVAS_THEME)
+
+    @canvas_theme.setter
+    def canvas_theme(self, value: str) -> None:
+        self._backend.setValue(_KEY_CANVAS_THEME, value)
+
+    @property
+    def ui_theme(self) -> str:
+        """保存された UI テーマの名前。未保存や不正な型なら既定値。"""
+        return self._name(_KEY_UI_THEME, DEFAULT_UI_THEME)
+
+    @ui_theme.setter
+    def ui_theme(self, value: str) -> None:
+        self._backend.setValue(_KEY_UI_THEME, value)
 
     # -------------------------------------------------- 内部
     def sync(self) -> None:
@@ -128,6 +149,15 @@ class Settings:
         status = self._backend.status()
         if status != QSettings.Status.NoError:
             logger.warning("failed to persist settings: %s", status.name)
+
+    def _name(self, key: str, default: str) -> str:
+        """列挙の名前として保存されている文字列。
+
+        値の妥当性（その名前の選択肢が存在するか）は UI 層が判断する。
+        ここでは空でない文字列であることだけを保証する。
+        """
+        value = self._backend.value(key, default)
+        return value if isinstance(value, str) and value else default
 
     def _byte_array(self, key: str) -> QByteArray | None:
         value = self._backend.value(key)

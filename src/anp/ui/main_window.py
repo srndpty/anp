@@ -8,6 +8,10 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 レンダリング世代・要求の待ち行列・DPR ごとの要求サイズは PDF/ビュー層に
 閉じている。ここが知ってよいのは、開いているパス・倍率とそのモード・
 現在ページ・ページ数・全画面かどうかだけ。
+
+外観のうち **UI テーマだけ**をここが持つ。アプリ全体のウィジェットの
+配色はビューの責務ではないため。キャンバスの色は `PdfView`、ページの
+色変換は `PageRenderService` が持ち、3つは互いに連動しない。
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController, DocumentError
 from anp.pdf.render import PageRenderService
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
+from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.pdf_view import PdfView, ZoomMode
 
 logger = logging.getLogger(__name__)
@@ -59,6 +64,11 @@ class MainWindow(QMainWindow):
         # 全画面から戻るときに復元する状態。全画面へ入る直前に記録する。
         self._maximized_before_full_screen = False
 
+        # UI テーマはアプリ全体の外観なので、ビューではなくここが持つ。
+        # `QStyleHints` は「指定を外した」状態を読み出せないので、選ばれた
+        # テーマの情報源はこの属性になる。
+        self._ui_theme = UiTheme.SYSTEM
+
         # ウィンドウ状態の変化を `changeEvent()` で拾うので、ウィジェットを
         # 作る前にアクションを用意しておく。
         self._actions = create_actions(self)
@@ -79,10 +89,14 @@ class MainWindow(QMainWindow):
         self._view.current_page_changed.connect(self._on_current_page_changed)
         self._view.zoom_changed.connect(self._sync_zoom_ui)
         self._view.page_color_mode_changed.connect(self._sync_page_color_ui)
+        self._view.canvas_theme_changed.connect(self._sync_canvas_ui)
 
         self._install_escape_shortcut()
         self._restore_window_state()
         self._restore_zoom()
+        # 外観の3つの軸は互いに独立なので、復元の順序に依存しない。
+        self._restore_ui_theme()
+        self._restore_canvas_theme()
         self._restore_page_color_mode()
         self._sync_document_ui()
 
@@ -144,6 +158,22 @@ class MainWindow(QMainWindow):
             lambda: self._view.set_page_color_mode(PageColorMode.INVERT)
         )
 
+        # キャンバスと UI テーマも同様に、状態を変えてから選択表示を取り直す。
+        # ページの色に触らないので、3つの軸は独立したまま。
+        self._actions.canvas_black.triggered.connect(
+            lambda: self._view.set_canvas_theme(CanvasTheme.BLACK)
+        )
+        self._actions.canvas_dark_gray.triggered.connect(
+            lambda: self._view.set_canvas_theme(CanvasTheme.DARK_GRAY)
+        )
+        self._actions.canvas_white.triggered.connect(
+            lambda: self._view.set_canvas_theme(CanvasTheme.WHITE)
+        )
+
+        self._actions.ui_theme_system.triggered.connect(lambda: self.set_ui_theme(UiTheme.SYSTEM))
+        self._actions.ui_theme_light.triggered.connect(lambda: self.set_ui_theme(UiTheme.LIGHT))
+        self._actions.ui_theme_dark.triggered.connect(lambda: self.set_ui_theme(UiTheme.DARK))
+
         self._actions.previous_page.triggered.connect(
             lambda: self._view.go_to_page(self._view.current_page - 1)
         )
@@ -163,6 +193,26 @@ class MainWindow(QMainWindow):
         else:
             self._view.fit_page()
         self._sync_zoom_ui()
+
+    # -------------------------------------------------- UI テーマ
+    @property
+    def ui_theme(self) -> UiTheme:
+        """アプリのウィジェットに適用している配色。"""
+        return self._ui_theme
+
+    def set_ui_theme(self, theme: UiTheme) -> None:
+        """UI テーマを切り替える。
+
+        **PDF の表示には一切影響しない。** キャンバスもページの色変換も
+        ここからは触らない。「UI が暗いからページを反転する」といった
+        連動は行わない。
+
+        同じテーマでも適用し直すのは、`QStyleHints` の状態が外部から
+        変えられていても、選ばれたテーマに揃え直すため。
+        """
+        self._ui_theme = theme
+        apply_ui_theme(theme)
+        self._sync_ui_theme_ui()
 
     def _install_escape_shortcut(self) -> None:
         """Esc で全画面を抜ける。通常表示中は何もしない。"""
@@ -257,6 +307,19 @@ class MainWindow(QMainWindow):
         self._actions.page_color_original.setChecked(mode is PageColorMode.ORIGINAL)
         self._actions.page_color_invert.setChecked(mode is PageColorMode.INVERT)
 
+    def _sync_canvas_ui(self) -> None:
+        """キャンバスの選択表示を、ビューの状態に合わせる。"""
+        theme = self._view.canvas_theme
+        self._actions.canvas_black.setChecked(theme is CanvasTheme.BLACK)
+        self._actions.canvas_dark_gray.setChecked(theme is CanvasTheme.DARK_GRAY)
+        self._actions.canvas_white.setChecked(theme is CanvasTheme.WHITE)
+
+    def _sync_ui_theme_ui(self) -> None:
+        """UI テーマの選択表示を、いまの状態に合わせる。"""
+        self._actions.ui_theme_system.setChecked(self._ui_theme is UiTheme.SYSTEM)
+        self._actions.ui_theme_light.setChecked(self._ui_theme is UiTheme.LIGHT)
+        self._actions.ui_theme_dark.setChecked(self._ui_theme is UiTheme.DARK)
+
     def _on_current_page_changed(self, _page: int) -> None:
         """ビューの現在ページが変わったときだけ UI を更新する。
 
@@ -339,6 +402,33 @@ class MainWindow(QMainWindow):
             return
         self._view.set_page_color_mode(mode)
 
+    def _restore_canvas_theme(self) -> None:
+        """保存されたキャンバスの色を復元する。知らない名前ならダークグレー。
+
+        レンダリング要求は起きない。塗る色が変わるだけで、必要なページも
+        解像度も変わらないため。
+        """
+        name = self._settings.canvas_theme
+        try:
+            theme = CanvasTheme(name)
+        except ValueError:
+            logger.warning("unknown canvas theme in settings: %r", name)
+            theme = CanvasTheme.DARK_GRAY
+        self._view.set_canvas_theme(theme)
+        # 既定値のままだとビューの状態が変わらず信号が出ないので、
+        # ここで選択表示を揃える。
+        self._sync_canvas_ui()
+
+    def _restore_ui_theme(self) -> None:
+        """保存された UI テーマを復元する。知らない名前ならシステム。"""
+        name = self._settings.ui_theme
+        try:
+            theme = UiTheme(name)
+        except ValueError:
+            logger.warning("unknown ui theme in settings: %r", name)
+            theme = UiTheme.SYSTEM
+        self.set_ui_theme(theme)
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt の命名規則)
         """終了時にウィンドウの位置と状態、倍率を保存し、PDF を解放する。
 
@@ -358,6 +448,8 @@ class MainWindow(QMainWindow):
         # 値が焼き付いてしまい、手で選んだ倍率も失われる。
         self._settings.free_zoom = self._view.last_free_zoom
         self._settings.page_color_mode = self._view.page_color_mode.value
+        self._settings.canvas_theme = self._view.canvas_theme.value
+        self._settings.ui_theme = self._ui_theme.value
         self._settings.sync()
 
         self._view.clear_document()

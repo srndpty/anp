@@ -22,6 +22,7 @@ from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController
 from anp.pdf.layout import LayoutMetrics, PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
+from anp.ui.appearance import CanvasTheme
 from anp.ui.pdf_view import MAX_ZOOM, MIN_ZOOM, NO_PAGE, ZOOM_STEP, PdfView, ZoomMode
 
 VIEWPORT = (400, 600)
@@ -1407,6 +1408,205 @@ def test_the_transform_happens_once_when_the_mode_changes(
 
     assert calls == [PageColorMode.INVERT]
     assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
+
+
+# ------------------------------------------------------------------ キャンバスの色
+def test_the_default_canvas_theme_is_dark_gray(view: PdfView) -> None:
+    """既定はダークグレー。Phase 1 までと同じ見た目。"""
+    assert view.canvas_theme is CanvasTheme.DARK_GRAY
+    assert canvas_color(view) == QColor("#525659")
+
+
+@pytest.mark.parametrize(
+    ("theme", "expected"),
+    [
+        (CanvasTheme.BLACK, "#000000"),
+        (CanvasTheme.DARK_GRAY, "#525659"),
+        (CanvasTheme.WHITE, "#ffffff"),
+    ],
+)
+def test_each_canvas_theme_paints_its_color(
+    loaded_view: PdfView, theme: CanvasTheme, expected: str
+) -> None:
+    """選んだ色でページの外側が塗られる。"""
+    loaded_view.set_canvas_theme(theme)
+
+    assert loaded_view.canvas_theme is theme
+    assert canvas_color(loaded_view) == QColor(expected)
+
+
+def test_the_canvas_theme_does_not_change_the_page_pixels(
+    loaded_view: PdfView, cache: RenderCache
+) -> None:
+    """キャンバスを変えてもページの画素は変わらない。"""
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    before = page_center_color(loaded_view, 0)
+
+    loaded_view.set_canvas_theme(CanvasTheme.WHITE)
+
+    assert page_center_color(loaded_view, 0) == before
+
+
+def test_the_canvas_theme_does_not_change_the_page_color_mode(loaded_view: PdfView) -> None:
+    """キャンバスを変えてもページの色変換は変わらない（自動連動しない）。"""
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+
+    for theme in (CanvasTheme.WHITE, CanvasTheme.BLACK, CanvasTheme.DARK_GRAY):
+        loaded_view.set_canvas_theme(theme)
+        assert loaded_view.page_color_mode is PageColorMode.INVERT
+
+
+def test_the_page_color_mode_does_not_change_the_canvas_theme(loaded_view: PdfView) -> None:
+    """逆向きにも連動しない。"""
+    loaded_view.set_canvas_theme(CanvasTheme.BLACK)
+
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+
+    assert loaded_view.canvas_theme is CanvasTheme.BLACK
+
+
+def test_a_white_canvas_with_invert_is_allowed(loaded_view: PdfView, cache: RenderCache) -> None:
+    """白いキャンバスと反転ページの組み合わせも、そのまま描く。
+
+    見た目として好ましくなくても自動補正はしない。3つの軸は独立。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    loaded_view.set_canvas_theme(CanvasTheme.WHITE)
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+
+    assert canvas_color(loaded_view) == QColor(Qt.GlobalColor.white)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
+
+
+def test_a_black_canvas_with_original_is_allowed(loaded_view: PdfView, cache: RenderCache) -> None:
+    """黒いキャンバスとオリジナルページの組み合わせも、そのまま描く。"""
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.white)
+    loaded_view.set_canvas_theme(CanvasTheme.BLACK)
+
+    assert canvas_color(loaded_view) == QColor(Qt.GlobalColor.black)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.white)
+
+
+def test_the_canvas_color_stays_out_of_the_page_rect(loaded_view: PdfView) -> None:
+    """ページ矩形の下地はページの色変換由来で、キャンバスの色は入り込まない。
+
+    白いキャンバス + 反転でも、読み込み中のページ下地は黒のまま。
+    """
+    loaded_view.set_canvas_theme(CanvasTheme.WHITE)
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+
+    assert canvas_color(loaded_view) == QColor(Qt.GlobalColor.white)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+
+
+def test_a_canvas_change_repaints_the_viewport(loaded_view: PdfView) -> None:
+    """キャンバスを変えたらビューポートを描き直す。"""
+    spy = UpdateSpy(loaded_view)
+
+    loaded_view.set_canvas_theme(CanvasTheme.BLACK)
+
+    assert spy.rects == [None]
+
+
+def test_setting_the_same_canvas_theme_does_nothing(loaded_view: PdfView) -> None:
+    """同じ色を選び直しても、再描画も通知も起こさない。"""
+    loaded_view.set_canvas_theme(CanvasTheme.BLACK)
+    emitted: list[None] = []
+    loaded_view.canvas_theme_changed.connect(lambda: emitted.append(None))
+    spy = UpdateSpy(loaded_view)
+
+    loaded_view.set_canvas_theme(CanvasTheme.BLACK)
+
+    assert spy.rects == []
+    assert emitted == []
+
+
+def test_a_canvas_change_emits_the_signal(loaded_view: PdfView) -> None:
+    """色が変わったら通知する。"""
+    emitted: list[None] = []
+    loaded_view.canvas_theme_changed.connect(lambda: emitted.append(None))
+
+    loaded_view.set_canvas_theme(CanvasTheme.WHITE)
+
+    assert emitted == [None]
+
+
+def test_a_canvas_change_does_not_rerender(
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
+) -> None:
+    """キャンバスを変えてもレンダリングもキャッシュも動かさない。
+
+    P2-2 の最重要回帰条件。ページの色を変えていないのだから、表示用画像を
+    作り直す理由も無い。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+    service.repeat_last_request()
+
+    count = len(service.requests)
+    generation = service.generation
+    outstanding = service.outstanding_keys
+    raw_size = len(cache)
+    display_size = len(service.display_cache)
+
+    for theme in (CanvasTheme.BLACK, CanvasTheme.WHITE, CanvasTheme.DARK_GRAY):
+        loaded_view.set_canvas_theme(theme)
+
+    assert len(service.requests) == count
+    assert service.generation == generation
+    assert service.outstanding_keys == outstanding
+    assert len(cache) == raw_size
+    assert len(service.display_cache) == display_size
+
+
+def test_a_canvas_change_does_not_transform(
+    loaded_view: PdfView, cache: RenderCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """キャンバスを変えても色変換は走らない。描画もこれまでどおり転送だけ。"""
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+    calls = count_transforms(monkeypatch)
+
+    loaded_view.set_canvas_theme(CanvasTheme.BLACK)
+    render_view(loaded_view)
+
+    assert calls == []
+
+
+def test_a_canvas_change_keeps_the_zoom_and_the_position(loaded_view: PdfView) -> None:
+    """キャンバスを変えても倍率・倍率モード・現在ページ・スクロール位置は動かない。"""
+    loaded_view.fit_width()
+    loaded_view.verticalScrollBar().setValue(500)
+    zoom = loaded_view.zoom
+    position = loaded_view.verticalScrollBar().value()
+    page = loaded_view.current_page
+
+    loaded_view.set_canvas_theme(CanvasTheme.BLACK)
+
+    assert loaded_view.zoom == pytest.approx(zoom)
+    assert loaded_view.zoom_mode is ZoomMode.FIT_WIDTH
+    assert loaded_view.verticalScrollBar().value() == position
+    assert loaded_view.current_page == page
+
+
+def test_the_canvas_theme_survives_a_document_switch(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """ドキュメントを替えてもキャンバスの色は維持される。"""
+    loaded_view.set_canvas_theme(CanvasTheme.BLACK)
+
+    loaded_view.set_document(controller.document, controller.page_sizes())
+
+    assert loaded_view.canvas_theme is CanvasTheme.BLACK
+    assert canvas_color(loaded_view) == QColor(Qt.GlobalColor.black)
+
+
+def test_the_canvas_theme_can_be_set_without_a_document(view: PdfView) -> None:
+    """ドキュメントが無くても選べる。"""
+    view.set_canvas_theme(CanvasTheme.WHITE)
+
+    assert view.canvas_theme is CanvasTheme.WHITE
+    assert canvas_color(view) == QColor(Qt.GlobalColor.white)
 
 
 # ------------------------------------------------------------------ ページ移動
