@@ -208,6 +208,10 @@ class PageRenderService(QObject):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        if max_transform_inflight < 1:
+            msg = f"max_transform_inflight must be at least 1, got {max_transform_inflight}"
+            raise ValueError(msg)
+
         self._cache = cache
         self._display_cache = DisplayCache(display_max_bytes)
         self._color_mode = PageColorMode.ORIGINAL
@@ -236,10 +240,12 @@ class PageRenderService(QObject):
         # 持つので、ここは「いまワーカーで走っている `DisplayKey`」だけでよい。
         self._max_transform_inflight = max_transform_inflight
         self._transform_inflight: set[DisplayKey] = set()
-        # いまの `_desired` に対して既にワーカーへ出した鍵。表示用キャッシュの
-        # 予算に収まらない集合を要求されたとき、「完了 → 追い出し → 再投入」を
-        # 延々と繰り返さないための歯止め。必要なページの集合・モード・世代が
-        # 変わった時点で忘れる。
+        # いまの優先度の並びに対して、表示用キャッシュの予算に入れた鍵。
+        # 出来上がった画像をキャッシュへ入れてよいかの判断に使う。
+        self._transform_admitted: set[DisplayKey] = set()
+        # いまの優先度の並びに対して既にワーカーへ出した鍵。予算の勘定が
+        # ずれても「完了 → 追い出し → 再投入」を繰り返さないための安全弁。
+        # 必要なページの並び・モード・世代が変わった時点で忘れる。
         self._transform_attempted: set[DisplayKey] = set()
         # 専用のスレッドプール。`QPdfPageRenderer` が使うグローバルプールとは
         # 分ける。投入は台帳側で `max_transform_inflight` に抑えるので、
@@ -286,6 +292,7 @@ class PageRenderService(QObject):
         self._generation += 1
         self._desired.clear()
         self._transform_attempted.clear()
+        self._transform_admitted.clear()
         self._dispatch_timer.stop()
         self._cache.clear()
         self._display_cache.clear()
@@ -372,12 +379,20 @@ class PageRenderService(QObject):
         必要なページが次々変わっても、投入前の古い要求はそのまま消える。
         `self._desired` は優先度順（現在ページ → 他の可視ページ → 先読み）
         なので、枠の奪い合いもその順に決まる。
+
+        **表示用キャッシュの予算に収まる優先度の前半だけを作る。** 予算を
+        超える分まで作ると、LRU が「先に作った高優先度」から追い出すので、
+        現在ページが下地のままで先読みだけが残る、という逆転が起きる。
+        高コストな変換を捨てるために回すくらいなら、最初から作らない。
         """
         if self._color_mode is PageColorMode.ORIGINAL:
             # 変換が不要なので作るものが無い。raw の LRU は描画時の
             # 引き当てで更新される。
+            self._transform_admitted.clear()
             return
 
+        budget_used = 0
+        admitted: list[DisplayKey] = []
         for page_index, key in self._desired.items():
             # 目的の解像度がまだ無いページには、仮表示に使う別解像度を用意する。
             raw_key = (
@@ -385,22 +400,27 @@ class PageRenderService(QObject):
             )
             # raw 側の LRU もここで更新する。描画時の引き当ては表示用しか見ないので、
             # ここで触らないと、表示用が残っているのに元の raw が追い出されてしまう。
-            # 枠が埋まっていても最後まで回すのはこのため。
+            # 予算や枠が尽きても最後まで回すのはこのため。
             raw = self._cache.get(raw_key) if raw_key is not None else None
             if raw_key is None or raw is None:
                 # そのページには使える画像がまだ1枚も無い。
                 continue
 
+            # 変換後は必ず ARGB32 になるので、大きさは raw の画素数から決まる。
+            budget_used += raw_key.width_px * raw_key.height_px * _BYTES_PER_PIXEL
+            if budget_used > self._display_cache.max_bytes:
+                continue
+
             display_key = DisplayKey(render_key=raw_key, color_mode=self._color_mode)
+            admitted.append(display_key)
             if display_key in self._display_cache or display_key in self._transform_inflight:
                 # 同じ `DisplayKey` に複数のワーカーを起こさない。世代違いの
                 # 変換が走っている場合も、それが終わって枠が空いてから出し直す。
                 continue
             if display_key in self._transform_attempted:
-                # この集合に対しては一度作った。作った直後に予算から追い出された
-                # としても作り直さない。追い出されるということは、いま必要な
-                # ページ全部を表示用キャッシュに載せられないということで、
-                # 作り直せば同じことの繰り返しになる。
+                # この優先度の並びに対しては一度作った。予算の勘定が合わずに
+                # 追い出されたとしても作り直さない（作り直しても同じことの
+                # 繰り返しになる）。予算での足切りが本筋で、こちらは安全弁。
                 continue
             if len(self._transform_inflight) >= self._max_transform_inflight:
                 continue
@@ -416,6 +436,13 @@ class PageRenderService(QObject):
                     source=QImage(raw),
                 )
             )
+
+        self._transform_admitted = set(admitted)
+        # 予算に入れた分を **優先度の低い方から** 触り、LRU の並びを優先度と
+        # 揃える。追い出しが起きるときに真っ先に消えるのが最も低い優先度に
+        # なり、現在ページが最後まで残る。
+        for display_key in reversed(admitted):
+            self._display_cache.get(display_key)
 
     def _submit_transform(self, job: _TransformJob) -> None:
         """変換1件をワーカーへ投入する。
@@ -441,6 +468,10 @@ class PageRenderService(QObject):
         elif job.generation != self._generation:
             # 前のドキュメントの変換。**絶対にキャッシュへ入れない。**
             logger.debug("discarding stale transform for %r", job.display_key)
+        elif not self._admits(result.image, job.display_key):
+            # いま必要な分ではない結果が、いま必要な分を追い出しかけている。
+            # 遅れて届いた古い倍率や古いモードの絵がこれに当たる。
+            logger.debug("dropping unneeded transform for %r", job.display_key)
         # 現在のモードでなければ通知しない。旧モードの結果で今の表示を
         # 上書きしないため。キャッシュには残すので、戻したときに使える。
         elif (
@@ -451,6 +482,24 @@ class PageRenderService(QObject):
 
         # 枠が空いたので、いま必要な分の続きを投入する。
         self._pump_transforms()
+
+    def _admits(self, image: QImage, display_key: DisplayKey) -> bool:
+        """出来上がった表示用画像をキャッシュへ入れてよいか。
+
+        入れてよいのは次のどちらか。
+
+        1. いま必要な分として予算に入れた鍵（`_transform_admitted`）
+        2. 余っている予算にそのまま収まる場合
+
+        2 があるので、モードを戻したときに使い回せる画像は残る。一方、
+        遅れて届いた古い倍率・古いモードの結果が、いま表示に使っている
+        画像を LRU から押し出すことはない。
+        """
+        if display_key in self._transform_admitted:
+            return True
+        return self._display_cache.total_bytes + image.sizeInBytes() <= (
+            self._display_cache.max_bytes
+        )
 
     # -------------------------------------------------- 要求
     def request_pages(self, requests: Sequence[PageRequest]) -> None:
@@ -471,10 +520,14 @@ class PageRenderService(QObject):
             page in self._desired and self._desired[page].width_px != key.width_px
             for page, key in desired.items()
         )
-        if desired != self._desired:
-            # 必要なページが変わったので、変換済みの記憶は作り直す。
-            # 同じ集合を繰り返し宣言されるだけ（スクロールしない再描画）の
-            # ときに忘れると、追い出された分をまた作り始めてしまう。
+        # **並び順まで含めて比べる。** この dict の挿入順は実装の都合ではなく
+        # 「現在ページ → 他の可視ページ → 先読み」という優先度そのもので、
+        # 順序が入れ替われば予算に入る前半も変わる。dict の等値比較は順序を
+        # 見ないので、`items()` を並びごと比べる。
+        if tuple(desired.items()) != tuple(self._desired.items()):
+            # 優先度の並びが変わったので、安全弁の記憶は作り直す。同じ並びを
+            # 繰り返し宣言されるだけ（スクロールしない再描画）のときに忘れると、
+            # 追い出された分をまた作り始めてしまう。
             self._transform_attempted.clear()
         self._desired = desired
         self._pump_transforms()

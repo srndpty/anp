@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import gc
+import weakref
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -739,7 +740,11 @@ def test_the_placeholder_is_transformed_too(
 
 
 def test_the_display_cache_is_bounded() -> None:
-    """表示用キャッシュにも上限があり、超えた分は追い出される。"""
+    """表示用キャッシュの上限を超えない。
+
+    超える分は **作ってから追い出す** のではなく、最初から作らない。
+    残るのは優先度の高い方（先に渡された方）。
+    """
     image_bytes = QImage(595, 842, QImage.Format.Format_ARGB32).sizeInBytes()
     service = PageRenderService(RenderCache(), display_max_bytes=image_bytes * 2)
     transforms = ManualTransforms(service)
@@ -754,9 +759,10 @@ def test_the_display_cache_is_bounded() -> None:
 
     assert service.display_cache.total_bytes <= service.display_cache.max_bytes
     assert len(service.display_cache) == 2
-    # 残るのは最後に用意した2ページ分。
-    assert service.image_for(3, A4_AT_72DPI, 1.0) is not None
-    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
+    assert service.image_for(1, A4_AT_72DPI, 1.0) is not None
+    assert service.image_for(2, A4_AT_72DPI, 1.0) is None
+    assert service.image_for(3, A4_AT_72DPI, 1.0) is None
 
 
 def test_reset_drops_the_display_images_too(
@@ -1040,26 +1046,190 @@ def test_fast_scrolling_does_not_queue_every_page() -> None:
     assert len(transforms.pending) == 2
 
 
+def budget_service(images: int) -> tuple[PageRenderService, ManualTransforms]:
+    """表示用キャッシュが `images` 枚分しかない、Invert のサービス。
+
+    raw は 4 ページ分そろえておく。優先度と予算の関係だけを見たいので、
+    レンダリングの待ちは作らない。
+    """
+    image_bytes = QImage(595, 842, QImage.Format.Format_ARGB32).sizeInBytes()
+    service = PageRenderService(RenderCache(), display_max_bytes=image_bytes * images)
+    transforms = ManualTransforms(service)
+    for page in range(4):
+        image = QImage(595, 842, QImage.Format.Format_ARGB32)
+        image.fill(WHITE)
+        service._cache.put(RenderKey(page, 595, 842, 1.0), image)  # noqa: SLF001
+    service.set_color_mode(PageColorMode.INVERT)
+    return service, transforms
+
+
 def test_the_display_budget_does_not_cause_endless_retransforms() -> None:
     """予算に収まらない集合を要求されても、変換を延々と繰り返さない。
 
     「完了 → 追い出し → 再投入」が回り続けると、CPU を食い続けたうえに
     どのページも安定して表示できない。
     """
-    image_bytes = QImage(595, 842, QImage.Format.Format_ARGB32).sizeInBytes()
-    service = PageRenderService(RenderCache(), display_max_bytes=image_bytes * 2)
-    transforms = ManualTransforms(service)
-    for page in range(4):
-        service._cache.put(  # noqa: SLF001
-            RenderKey(page, 595, 842, 1.0), QImage(595, 842, QImage.Format.Format_ARGB32)
-        )
-    service.set_color_mode(PageColorMode.INVERT)
+    service, transforms = budget_service(images=2)
 
     service.request_pages(requests_for(range(0, 4)))
     transforms.complete_all()
 
-    assert len(transforms.submitted) == 4, "同じ集合に対して変換をやり直している"
+    assert len(transforms.submitted) == 2, "予算に入らない分まで変換している"
     assert service.transform_inflight_count == 0
+
+
+def test_the_current_page_survives_display_budget_pressure() -> None:
+    """予算が足りなくても、現在ページが先読みに追い出されない。
+
+    LRU 任せにすると、先に作った現在ページが後から作った先読みに押し出され、
+    **現在ページだけが下地のまま**という逆転が起きる。Smart Dark では
+    「変換が遅い」のか「scheduler が現在ページを捨てた」のか区別が
+    つかなくなるので、ここで固定しておく。
+    """
+    service, transforms = budget_service(images=2)
+
+    # 優先度は現在ページ 0 → 可視 1 → 先読み 2, 3。
+    service.request_pages(requests_for(range(0, 4)))
+    transforms.complete_all()
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is not None, "現在ページが追い出された"
+
+
+def test_cache_residency_follows_the_priority_order() -> None:
+    """キャッシュに残るのは優先度の高い方から順に、予算に入る分だけ。"""
+    service, transforms = budget_service(images=3)
+
+    service.request_pages(requests_for(range(0, 4)))
+    transforms.complete_all()
+
+    resident = {key.render_key.page_index for key in display_keys(service)}
+    assert resident == {0, 1, 2}, "優先度順に残っていない"
+
+
+def test_the_lowest_priority_image_is_evicted_first() -> None:
+    """追い出しが起きるときに消えるのは、いちばん優先度の低いページ。
+
+    予算に入れた分の LRU の並びを優先度と揃えていないと、先に作った
+    現在ページから消えていく。
+    """
+    service, transforms = budget_service(images=3)
+    service.request_pages(requests_for(range(0, 3)))
+    transforms.complete_all()
+
+    # 別解像度が1枚割り込んでくる（倍率が少しだけ動いた）。
+    intruder = QImage(600, 850, QImage.Format.Format_ARGB32)
+    intruder.fill(WHITE)
+    service._cache.put(RenderKey(0, 600, 850, 1.0), intruder)  # noqa: SLF001
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(600, 850), dpr=1.0)])
+    transforms.complete_all()
+
+    resident = {
+        (key.render_key.page_index, key.render_key.width_px) for key in display_keys(service)
+    }
+    assert (2, 595) not in resident, "いちばん低い優先度が残っている"
+    assert (0, 600) in resident
+
+
+def test_a_priority_only_reorder_is_treated_as_a_change() -> None:
+    """`RenderKey` の集合が同じでも、並びが変われば別の要求として扱う。
+
+    この dict の挿入順は「現在ページ → 可視 → 先読み」という優先度そのもの。
+    dict の等値比較は順序を見ないので、順序だけの入れ替わりを取りこぼすと、
+    新しく現在ページになったページが古い並びの記憶で抑止されてしまう。
+    """
+    service, transforms = budget_service(images=4)
+    service.request_pages(requests_for(range(0, 2)))
+    # ページ 0 の変換が失敗した。作られていないが「試した」記録は残る。
+    transforms.fail(transforms.pending[0])
+    submitted = len(transforms.submitted)
+
+    # 同じ並びで宣言し直しても作り直さない（安全弁が効いている）。
+    service.request_pages(requests_for(range(0, 2)))
+    assert len(transforms.submitted) == submitted
+
+    # 並びが変わればもう一度機会を与える。
+    service.request_pages(
+        [
+            PageRequest(page_index=1, size_px=A4_AT_72DPI, dpr=1.0),
+            PageRequest(page_index=0, size_px=A4_AT_72DPI, dpr=1.0),
+        ]
+    )
+
+    assert len(transforms.submitted) > submitted, "並びが変わったのに抑止されたまま"
+
+
+# ------------------------------------------------------------------ 遅れて届いた結果
+def test_a_late_low_priority_result_does_not_evict_the_current_page() -> None:
+    """遅れて届いた低優先度の結果で、いま使っている画像を追い出さない。
+
+    倍率が動いた直後は、古い倍率の変換がまだ走っている。それが後から
+    届いたときに現在の絵を押し出すと、表示が一段古い倍率へ巻き戻る。
+    """
+    # どちらか1枚だけが入る予算。2枚は入らない。
+    image_bytes = QImage(600, 850, QImage.Format.Format_ARGB32).sizeInBytes()
+    service = PageRenderService(RenderCache(), display_max_bytes=image_bytes)
+    transforms = ManualTransforms(service)
+    for width, height in ((595, 842), (600, 850)):
+        image = QImage(width, height, QImage.Format.Format_ARGB32)
+        image.fill(WHITE)
+        service._cache.put(RenderKey(0, width, height, 1.0), image)  # noqa: SLF001
+    service.set_color_mode(PageColorMode.INVERT)
+
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(595, 842), dpr=1.0)])
+    old = transforms.pending[0]
+    # 倍率が動いて、いま必要なのは別解像度になった。
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(600, 850), dpr=1.0)])
+    transforms.complete(transforms.pending[-1])
+    assert service.image_for(0, QSize(600, 850), 1.0) is not None
+
+    transforms.complete(old)
+
+    assert service.image_for(0, QSize(600, 850), 1.0) is not None, "古い倍率の結果に追い出された"
+    assert service.image_for(0, QSize(595, 842), 1.0) is None
+
+
+def test_an_old_mode_result_is_dropped_when_there_is_no_room() -> None:
+    """旧モードの結果も、予算に余りが無ければキャッシュへ入れない。
+
+    残しておけるのは「余っているから残す」場合だけ。いま表示に使っている
+    画像を押しのけてまで、使っていないモードの絵を持たない。
+    """
+    # どちらか1枚だけが入る予算。2枚は入らない。
+    image_bytes = QImage(600, 850, QImage.Format.Format_ARGB32).sizeInBytes()
+    service = PageRenderService(RenderCache(), display_max_bytes=image_bytes)
+    transforms = ManualTransforms(service)
+    for width, height in ((595, 842), (600, 850)):
+        image = QImage(width, height, QImage.Format.Format_ARGB32)
+        image.fill(WHITE)
+        service._cache.put(RenderKey(0, width, height, 1.0), image)  # noqa: SLF001
+
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(595, 842), dpr=1.0)])
+    transforms.complete_all()
+    assert len(service.display_cache) == 1
+
+    # 別解像度の Invert が走っている間に Original へ戻る。
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(600, 850), dpr=1.0)])
+    pending = transforms.pending[0]
+    service.set_color_mode(PageColorMode.ORIGINAL)
+    transforms.complete(pending)
+
+    assert len(service.display_cache) == 1, "予算が無いのに旧モードの絵を足している"
+    assert service.display_cache.total_bytes <= service.display_cache.max_bytes
+
+
+def test_an_old_mode_result_is_kept_when_there_is_room() -> None:
+    """余りがあるなら旧モードの結果は残す（戻したときに作り直さない）。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    pending = transforms.pending[0]
+
+    service.set_color_mode(PageColorMode.ORIGINAL)
+    transforms.complete(pending)
+
+    assert len(service.display_cache) == 1
 
 
 # ------------------------------------------------------------------ 世代
@@ -1348,8 +1518,17 @@ def test_the_worker_can_finish_after_the_service_is_gone() -> None:
         source=QImage(595, 842, QImage.Format.Format_ARGB32),
     )
 
+    reference = weakref.ref(service)
     del service
     gc.collect()
+    assert reference() is None, "サービスが生き残っていて、テストの前提が崩れている"
 
     # 行き先を失った通知。黙って捨てられる。
     signals.finished.emit(_TransformResult(job=job, image=None))
+
+
+# ------------------------------------------------------------------ 設定値
+def test_a_transform_cap_below_one_is_rejected() -> None:
+    """同時変換数を 0 以下にすると、何も投入されないまま止まる。設定させない。"""
+    with pytest.raises(ValueError, match="max_transform_inflight"):
+        PageRenderService(RenderCache(), max_transform_inflight=0)
