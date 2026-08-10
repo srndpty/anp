@@ -25,9 +25,14 @@
 別々に持つ。`PageColorMode` はレンダリング要求の条件ではないので、
 色を変えても `QPdfPageRenderer` へ再要求しない。
 
-表示用画像は `_prepare_display_images()` で **描画より前に** 作る。
+表示用画像は `QThreadPool` のワーカーで作る（`_pump_transforms()`）。
 `image_for()` / `placeholder_for()` は `paintEvent` から呼ばれるので、
-引き当てだけを行い画素には触らない。
+引き当てだけを行い画素には触らず、ワーカーの完了も待たない。
+
+**PDF のレンダリング要求と色変換の要求は別の台帳で管理する。** 前者は
+Qt が取り消せない待ち行列を持つのに対し、後者はこちらが投入量を決められる。
+混ぜると、どちらの上限を守っているのか分からなくなる。共通しているのは
+「世代が合わない結果は捨てる」という点だけで、そこは同じ `_generation` を見る。
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from PySide6.QtCore import QObject, QSize, QTimer, Signal
+from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtPdf import QPdfDocument, QPdfDocumentRenderOptions, QPdfPageRenderer
 
@@ -66,6 +71,12 @@ DEFAULT_DEBOUNCE_MS = 100
 # 同時に処理中にできる要求の数。可視ページ ± 1 の2画面分を目安にする。
 # 取り消せない以上、これがスクロール中の待ち行列の長さの上限になる。
 DEFAULT_MAX_INFLIGHT = 6
+
+# 同時にワーカーで走らせる色変換の数。CPU のコア数まで増やさない。
+# 大きな `QImage` を何枚も同時に変換すると、CPU の奪い合いと一時的な
+# メモリのピークがどちらも悪化する。ここはメモリの背圧も兼ねている
+# （変換中は「入力の raw」と「出力」がキャッシュ上限の外側に同時に載る）。
+DEFAULT_MAX_TRANSFORM_INFLIGHT = 2
 
 
 def clamp_render_size(size: QSize, max_bytes: int = DEFAULT_MAX_RENDER_BYTES) -> QSize:
@@ -119,6 +130,63 @@ class _OutstandingRequest:
     render_keys: list[RenderKey]
 
 
+@dataclass(frozen=True, slots=True)
+class _TransformJob:
+    """ワーカーへ渡す色変換1件。
+
+    ワーカースレッドが触ってよいのはこの中身だけ。キャッシュもウィジェットも
+    サービス自身も渡さない。
+
+    `source` は **暗黙共有された `QImage` の参照を job が自分で持つ**。
+    変換の最中に入力が raw の LRU から追い出されても、画素は生き続ける。
+    """
+
+    generation: int
+    display_key: DisplayKey
+    source: QImage
+
+
+@dataclass(frozen=True, slots=True)
+class _TransformResult:
+    """ワーカーから GUI スレッドへ戻す結果。失敗なら `image` は None。"""
+
+    job: _TransformJob
+    image: QImage | None
+
+
+class _TransformSignals(QObject):
+    """ワーカーの完了を GUI スレッドへ渡すためだけの中継。
+
+    **`PageRenderService` を親にしない。** ウィンドウを閉じている最中に
+    サービスが先に消えても、ワーカーが破棄済みのオブジェクトへ emit しない
+    ようにするため。受け手側の接続は Qt がサービスの破棄時に自動で切るので、
+    行き先を失った emit は黙って捨てられる。
+    """
+
+    finished = Signal(object)
+    """`_TransformResult` を1件運ぶ。"""
+
+
+class _TransformRunnable(QRunnable):
+    """1件の色変換をワーカースレッドで実行する。"""
+
+    def __init__(self, job: _TransformJob, signals: _TransformSignals) -> None:
+        super().__init__()
+        self._job = job
+        self._signals = signals
+
+    def run(self) -> None:
+        """ワーカースレッドで呼ばれる。GUI オブジェクトには触らない。"""
+        try:
+            image = transform_page(self._job.source, self._job.display_key.color_mode)
+        except Exception:
+            # スレッド境界。ここで漏らすと Qt のワーカースレッドごと死ぬ。
+            # 失敗しても台帳が詰まらないよう、必ず結果を返して枠を解放する。
+            logger.exception("page transform failed for %r", self._job.display_key)
+            image = None
+        self._signals.finished.emit(_TransformResult(job=self._job, image=image))
+
+
 class PageRenderService(QObject):
     """レンダリング要求とキャッシュ充填を受け持つ。
 
@@ -135,10 +203,15 @@ class PageRenderService(QObject):
         max_render_bytes: int = DEFAULT_MAX_RENDER_BYTES,
         display_max_bytes: int = DEFAULT_DISPLAY_MAX_BYTES,
         max_inflight: int = DEFAULT_MAX_INFLIGHT,
+        max_transform_inflight: int = DEFAULT_MAX_TRANSFORM_INFLIGHT,
         debounce_ms: int = DEFAULT_DEBOUNCE_MS,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
+        if max_transform_inflight < 1:
+            msg = f"max_transform_inflight must be at least 1, got {max_transform_inflight}"
+            raise ValueError(msg)
+
         self._cache = cache
         self._display_cache = DisplayCache(display_max_bytes)
         self._color_mode = PageColorMode.ORIGINAL
@@ -163,6 +236,31 @@ class PageRenderService(QObject):
         self._outstanding_keys: set[RenderKey] = set()
         self._desired: dict[int, RenderKey] = {}
 
+        # 色変換の台帳。PDF レンダリングの台帳とは共用しない。世代は job 自身が
+        # 持つので、ここは「いまワーカーで走っている `DisplayKey`」だけでよい。
+        self._max_transform_inflight = max_transform_inflight
+        self._transform_inflight: set[DisplayKey] = set()
+        # いまの優先度の並びに対して、表示用キャッシュの予算に入れた鍵。
+        # 出来上がった画像をキャッシュへ入れてよいかの判断に使う。
+        self._transform_admitted: set[DisplayKey] = set()
+        # いまの優先度の並びに対して既にワーカーへ出した鍵。予算の勘定が
+        # ずれても「完了 → 追い出し → 再投入」を繰り返さないための安全弁。
+        # 必要なページの並び・モード・世代が変わった時点で忘れる。
+        self._transform_attempted: set[DisplayKey] = set()
+        # 専用のスレッドプール。`QPdfPageRenderer` が使うグローバルプールとは
+        # 分ける。投入は台帳側で `max_transform_inflight` に抑えるので、
+        # プールの中に待ち行列は溜まらない。
+        #
+        # `QThreadPool` のデストラクタは走っている分の完了を待つ（GIL は
+        # 解放されるので固まらないことを実機で確認済み）。1件が数 ms の
+        # Invert では終了時の待ちは無視できる。
+        self._transform_pool = QThreadPool()
+        self._transform_pool.setMaxThreadCount(max_transform_inflight)
+        self._transform_signals = _TransformSignals()
+        self._transform_signals.finished.connect(
+            self._on_transform_finished, Qt.ConnectionType.QueuedConnection
+        )
+
         self._dispatch_timer = QTimer(self)
         self._dispatch_timer.setSingleShot(True)
         self._dispatch_timer.timeout.connect(self.flush)
@@ -186,9 +284,15 @@ class PageRenderService(QObject):
         台帳を消すと、同じパラメータで再利用された request ID の古い結果を
         新しい世代のものとして受け入れてしまう。古い結果は届いた時点で
         世代が合わず捨てられ、そこで空いた枠に現在必要な分が入る。
+
+        色変換の台帳も同じ理由で消さない。走っているワーカーは止められない
+        ので、消すと枠を二重に使ってしまう。古い世代の結果は完了時に捨てられ、
+        そこで空いた枠に現在必要な分が入る。
         """
         self._generation += 1
         self._desired.clear()
+        self._transform_attempted.clear()
+        self._transform_admitted.clear()
         self._dispatch_timer.stop()
         self._cache.clear()
         self._display_cache.clear()
@@ -201,24 +305,30 @@ class PageRenderService(QObject):
         return self._color_mode
 
     def set_color_mode(self, mode: PageColorMode) -> None:
-        """色変換を切り替える。**raw 画像は捨てない。**
+        """色変換を切り替える。**raw も表示用画像も捨てない。**
 
-        捨てるのは表示用画像だけ。`QPdfPageRenderer` への再要求は起きないので、
-        Original ⇄ Invert を往復してもレンダリング待ちの白紙には戻らない。
+        `QPdfPageRenderer` への再要求は起きないので、Original ⇄ Invert を
+        往復してもレンダリング待ちの白紙には戻らない。
 
-        `DisplayKey` はモードを含むので、古いモードの画像が返ることは
-        鍵の上でも起こらない。ここで捨てるのは、二度と引き当てられない
-        画像でメモリを占めないため。
+        `DisplayKey` はモードを含むので、古いモードの画像が引き当てられる
+        ことは鍵の上で起こらない。だから捨てずに残しておき、モードを戻した
+        ときに変換をやり直さずに済ませる。残った分は LRU の予算内で
+        古いものから追い出される。
+
+        **即座に戻る。** 変換はワーカーで走るので、切り替えた直後は現在の
+        モードの画像がまだ無いことがある。その間ビューは `PageColorMode`
+        由来のページ下地（Invert なら黒）を描く。
         """
         if mode is self._color_mode:
             return
         self._color_mode = mode
-        self._display_cache.clear()
-        self._prepare_display_images()
+        self._transform_attempted.clear()
+        self._pump_transforms()
 
     # -------------------------------------------------- 取得（描画経路）
     # ここは `paintEvent` から呼ばれる。**引き当てだけを行い、変換はしない。**
-    # 必要な表示用画像は `_prepare_display_images()` が先に作っておく。
+    # 表示用画像はワーカーが先に作っておく（`_pump_transforms()`）。
+    # まだ無ければ None を返す。**ワーカーの完了をここで待たない。**
     def image_for(self, page_index: int, size_px: QSize, dpr: float) -> QImage | None:
         """要求どおりの解像度の表示用画像があれば返す。"""
         return self._display_lookup(self._key_for(page_index, size_px, dpr))
@@ -229,9 +339,18 @@ class PageRenderService(QObject):
         同じページの別解像度があればそれを返す。呼び出し側が目標の矩形へ
         拡大縮小して描く。仮表示も **現在のモードのもの** を返す。
         変換前の絵を先に見せると、切り替えた瞬間に元の色が一瞬見える。
+
+        そのため Invert では **変換済みの画像の中から** いちばん近い解像度を
+        探す。raw の中から探して変換済みかどうかを後で見ると、raw はあるが
+        変換がまだ終わっていない解像度に当たった時点で仮表示を諦めてしまう。
         """
-        key = self._cache.nearest_key(page_index, clamp_render_size(size_px).width())
-        return self._display_lookup(key) if key is not None else None
+        width = clamp_render_size(size_px, self._max_render_bytes).width()
+        if self._color_mode is PageColorMode.ORIGINAL:
+            raw_key = self._cache.nearest_key(page_index, width)
+            return self._cache.get(raw_key) if raw_key is not None else None
+
+        display_key = self._display_cache.nearest_key(page_index, width, self._color_mode)
+        return self._display_cache.get(display_key) if display_key is not None else None
 
     def raw_image_for(self, page_index: int, size_px: QSize, dpr: float) -> QImage | None:
         """色変換をかける前の画像。検査用。"""
@@ -245,25 +364,35 @@ class PageRenderService(QObject):
         return self._display_cache.get(DisplayKey(render_key=key, color_mode=self._color_mode))
 
     # -------------------------------------------------- 表示用画像の用意
-    def _prepare_display_images(self) -> None:
-        """いま必要なページの表示用画像を、描画より前に作っておく。
+    def _pump_transforms(self) -> None:
+        """いま必要な表示用画像の変換を、空いている枠の分だけワーカーへ投入する。
 
-        呼ばれるのは次の3か所だけ。どれも描画の外側にある。
+        呼ばれるのは次の4か所だけ。どれも描画の外側にある。
 
         1. raw のレンダリングが終わったとき
         2. 色変換のモードが変わったとき
         3. 必要なページの集合が変わったとき（`request_pages()`）
+        4. 変換が1件終わって枠が空いたとき
 
-        **変換を描画経路へ持ち込まないための境界がここ。** Invert は
-        A4 の 400% でも 7ms 程度なので、いまは GUI スレッドでそのまま
-        変換している。重い変換（Smart Dark）が要るようになったら、
-        差し替えるのはこのメソッドの中だけで済む。
+        **待ち行列は持たない。** 必要なものは毎回 `self._desired` から数え
+        直し、枠が空いている分だけ投入する。高速なスクロールやズームで
+        必要なページが次々変わっても、投入前の古い要求はそのまま消える。
+        `self._desired` は優先度順（現在ページ → 他の可視ページ → 先読み）
+        なので、枠の奪い合いもその順に決まる。
+
+        **表示用キャッシュの予算に収まる優先度の前半だけを作る。** 予算を
+        超える分まで作ると、LRU が「先に作った高優先度」から追い出すので、
+        現在ページが下地のままで先読みだけが残る、という逆転が起きる。
+        高コストな変換を捨てるために回すくらいなら、最初から作らない。
         """
         if self._color_mode is PageColorMode.ORIGINAL:
             # 変換が不要なので作るものが無い。raw の LRU は描画時の
             # 引き当てで更新される。
+            self._transform_admitted.clear()
             return
 
+        budget_used = 0
+        admitted: list[DisplayKey] = []
         for page_index, key in self._desired.items():
             # 目的の解像度がまだ無いページには、仮表示に使う別解像度を用意する。
             raw_key = (
@@ -271,14 +400,106 @@ class PageRenderService(QObject):
             )
             # raw 側の LRU もここで更新する。描画時の引き当ては表示用しか見ないので、
             # ここで触らないと、表示用が残っているのに元の raw が追い出されてしまう。
+            # 予算や枠が尽きても最後まで回すのはこのため。
             raw = self._cache.get(raw_key) if raw_key is not None else None
             if raw_key is None or raw is None:
                 # そのページには使える画像がまだ1枚も無い。
                 continue
 
+            # 変換後は必ず ARGB32 になるので、大きさは raw の画素数から決まる。
+            budget_used += raw_key.width_px * raw_key.height_px * _BYTES_PER_PIXEL
+            if budget_used > self._display_cache.max_bytes:
+                continue
+
             display_key = DisplayKey(render_key=raw_key, color_mode=self._color_mode)
-            if display_key not in self._display_cache:
-                self._display_cache.put(display_key, transform_page(raw, self._color_mode))
+            admitted.append(display_key)
+            if display_key in self._display_cache or display_key in self._transform_inflight:
+                # 同じ `DisplayKey` に複数のワーカーを起こさない。世代違いの
+                # 変換が走っている場合も、それが終わって枠が空いてから出し直す。
+                continue
+            if display_key in self._transform_attempted:
+                # この優先度の並びに対しては一度作った。予算の勘定が合わずに
+                # 追い出されたとしても作り直さない（作り直しても同じことの
+                # 繰り返しになる）。予算での足切りが本筋で、こちらは安全弁。
+                continue
+            if len(self._transform_inflight) >= self._max_transform_inflight:
+                continue
+
+            self._transform_inflight.add(display_key)
+            self._transform_attempted.add(display_key)
+            self._submit_transform(
+                _TransformJob(
+                    generation=self._generation,
+                    display_key=display_key,
+                    # 暗黙共有の参照を job 側で持つ。変換の最中に raw の LRU
+                    # から追い出されても画素は生き続ける。
+                    source=QImage(raw),
+                )
+            )
+
+        self._transform_admitted = set(admitted)
+        # 予算に入れた分を **優先度の低い方から** 触り、LRU の並びを優先度と
+        # 揃える。追い出しが起きるときに真っ先に消えるのが最も低い優先度に
+        # なり、現在ページが最後まで残る。
+        for display_key in reversed(admitted):
+            self._display_cache.get(display_key)
+
+    def _submit_transform(self, job: _TransformJob) -> None:
+        """変換1件をワーカーへ投入する。
+
+        テストはここを差し替えてワーカーを捕捉し、`_on_transform_finished()`
+        を直接呼んで完了させる。
+        """
+        self._transform_pool.start(_TransformRunnable(job, self._transform_signals))
+
+    def _on_transform_finished(self, result: _TransformResult) -> None:
+        """変換の結果を受け取る（GUI スレッドで呼ばれる）。
+
+        キャッシュの書き換えと通知はここだけで行う。ワーカーは `QImage` を
+        作って返すだけで、キャッシュにもウィジェットにも触らない。
+        """
+        job = result.job
+        self._transform_inflight.discard(job.display_key)
+
+        if result.image is None or result.image.isNull():
+            # 失敗した画像はキャッシュに入れない。枠は上で解放済みなので、
+            # 台帳が詰まることはない。
+            logger.warning("dropping failed transform for %r", job.display_key)
+        elif job.generation != self._generation:
+            # 前のドキュメントの変換。**絶対にキャッシュへ入れない。**
+            logger.debug("discarding stale transform for %r", job.display_key)
+        elif not self._admits(result.image, job.display_key):
+            # いま必要な分ではない結果が、いま必要な分を追い出しかけている。
+            # 遅れて届いた古い倍率や古いモードの絵がこれに当たる。
+            logger.debug("dropping unneeded transform for %r", job.display_key)
+        # 現在のモードでなければ通知しない。旧モードの結果で今の表示を
+        # 上書きしないため。キャッシュには残すので、戻したときに使える。
+        elif (
+            self._display_cache.put(job.display_key, result.image)
+            and job.display_key.color_mode is self._color_mode
+        ):
+            self.page_ready.emit(job.display_key.render_key.page_index)
+
+        # 枠が空いたので、いま必要な分の続きを投入する。
+        self._pump_transforms()
+
+    def _admits(self, image: QImage, display_key: DisplayKey) -> bool:
+        """出来上がった表示用画像をキャッシュへ入れてよいか。
+
+        入れてよいのは次のどちらか。
+
+        1. いま必要な分として予算に入れた鍵（`_transform_admitted`）
+        2. 余っている予算にそのまま収まる場合
+
+        2 があるので、モードを戻したときに使い回せる画像は残る。一方、
+        遅れて届いた古い倍率・古いモードの結果が、いま表示に使っている
+        画像を LRU から押し出すことはない。
+        """
+        if display_key in self._transform_admitted:
+            return True
+        return self._display_cache.total_bytes + image.sizeInBytes() <= (
+            self._display_cache.max_bytes
+        )
 
     # -------------------------------------------------- 要求
     def request_pages(self, requests: Sequence[PageRequest]) -> None:
@@ -299,8 +520,17 @@ class PageRenderService(QObject):
             page in self._desired and self._desired[page].width_px != key.width_px
             for page, key in desired.items()
         )
+        # **並び順まで含めて比べる。** この dict の挿入順は実装の都合ではなく
+        # 「現在ページ → 他の可視ページ → 先読み」という優先度そのもので、
+        # 順序が入れ替われば予算に入る前半も変わる。dict の等値比較は順序を
+        # 見ないので、`items()` を並びごと比べる。
+        if tuple(desired.items()) != tuple(self._desired.items()):
+            # 優先度の並びが変わったので、安全弁の記憶は作り直す。同じ並びを
+            # 繰り返し宣言されるだけ（スクロールしない再描画）のときに忘れると、
+            # 追い出された分をまた作り始めてしまう。
+            self._transform_attempted.clear()
         self._desired = desired
-        self._prepare_display_images()
+        self._pump_transforms()
         self._schedule(scale_changed=scale_changed)
 
     def flush(self) -> None:
@@ -368,6 +598,11 @@ class PageRenderService(QObject):
         """表示用画像のキャッシュ。中身と上限を確かめるために公開している。"""
         return self._display_cache
 
+    @property
+    def transform_inflight_count(self) -> int:
+        """ワーカーで走っている色変換の数。"""
+        return len(self._transform_inflight)
+
     # -------------------------------------------------- 内部
     def _key_for(self, page_index: int, size_px: QSize, dpr: float) -> RenderKey:
         clamped = clamp_render_size(size_px, self._max_render_bytes)
@@ -415,11 +650,15 @@ class PageRenderService(QObject):
                 if self._cache.put(key, page_image):
                     ready.append(key.page_index)
 
-            # 通知より先に表示用画像を用意する。受け取った側は再描画するので、
-            # 順序を逆にすると変換が描画経路に入り込む。
-            self._prepare_display_images()
-            for page_index in ready:
-                self.page_ready.emit(page_index)
+            # raw が増えたので、必要な変換を投入し直す。
+            self._pump_transforms()
+
+            # 通知するのは ORIGINAL のときだけ。変換が要るモードでは、raw が
+            # 届いただけでは描けるものが増えていない。ここで通知すると、
+            # 変換の完了時と合わせて同じページを二度描き直すことになる。
+            if self._color_mode is PageColorMode.ORIGINAL:
+                for page_index in ready:
+                    self.page_ready.emit(page_index)
 
         # 枠が空いたので、いま必要な分の続きを発行する。
         self.flush()

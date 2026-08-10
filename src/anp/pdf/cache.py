@@ -156,7 +156,29 @@ class DisplayCache(ImageCache[DisplayKey]):
 
     `ORIGINAL` の画像はここに入れない。raw をそのまま表示できるので、
     同じ絵を二重に持つ意味がない。
+
+    **モードが変わってもここは空にしない。** `DisplayKey` がモードを含むので
+    別モードの画像が誤って引き当てられることはなく、残しておけば
+    Invert ⇄ Original を往復したときに変換をやり直さずに済む。
+    ドキュメントを入れ替えたときは `clear()` で全部捨てる。
     """
 
     def __init__(self, max_bytes: int = DEFAULT_DISPLAY_MAX_BYTES) -> None:
         super().__init__(max_bytes)
+
+    def nearest_key(
+        self, page_index: int, width_px: int, color_mode: PageColorMode
+    ) -> DisplayKey | None:
+        """同じページ・同じモードの、要求幅にいちばん近い画像の鍵を返す。
+
+        `RenderCache.nearest_key()` と違ってモードで絞る。仮表示に現在の
+        モード以外の絵を使うと、切り替えた瞬間に前の色が見えてしまう。
+        """
+        candidates = [
+            key
+            for key in self._entries
+            if key.color_mode is color_mode and key.render_key.page_index == page_index
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda key: abs(key.render_key.width_px - width_px))

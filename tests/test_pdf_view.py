@@ -24,6 +24,7 @@ from anp.pdf.layout import LayoutMetrics, PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
 from anp.ui.appearance import CanvasTheme
 from anp.ui.pdf_view import MAX_ZOOM, MIN_ZOOM, NO_PAGE, ZOOM_STEP, PdfView, ZoomMode
+from helpers import ManualTransforms
 
 VIEWPORT = (400, 600)
 
@@ -37,11 +38,16 @@ class RecordingService(PageRenderService):
     実際の `requestPage()` は出さない。本物のレンダリングが途中で完了すると
     キャッシュの中身がテストの仕込みと入れ替わり、結果がタイミング依存に
     なるため。要求の中身とキャッシュの読み出しはそのまま検証できる。
+
+    色変換も本物のワーカーには流さない。既定では投入と同時に完了させる
+    （`transforms.immediate`）。ビューの関心は「引き当てた画像をどう描くか」
+    なので、変換の完了タイミングを見たいテストだけが手動へ切り替える。
     """
 
     def __init__(self, cache: RenderCache) -> None:
         super().__init__(cache)
         self.requests: list[list[PageRequest]] = []
+        self.transforms = ManualTransforms(self, immediate=True)
 
     def request_pages(self, requests: Sequence[PageRequest]) -> None:
         self.requests.append(list(requests))
@@ -1408,6 +1414,81 @@ def test_the_transform_happens_once_when_the_mode_changes(
 
     assert calls == [PageColorMode.INVERT]
     assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
+
+
+# ------------------------------------------------------------------ 変換の完了待ち
+# 変換はワーカーで走るので、モードを切り替えた直後は現在のモードの画像が
+# まだ無いことがある。その間に何を描くか。
+
+
+def test_the_page_is_dark_while_the_invert_transform_is_pending(
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
+) -> None:
+    """変換の完了を待っている間は、ページ下地（黒）を描く。
+
+    **元の明るい画像を一瞬でも描いてはいけない。** 切り替えた瞬間に画面が
+    白く光るのを避けるのが Invert の目的そのもの。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    service.transforms.immediate = False
+
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+
+    assert service.transforms.pending, "テストの前提が崩れている（変換が既に終わっている）"
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+
+
+def test_the_page_becomes_inverted_when_the_transform_completes(
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
+) -> None:
+    """変換が終わったら、そのページを描き直して反転画像を出す。"""
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    service.transforms.immediate = False
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+    spy = UpdateSpy(loaded_view)
+
+    service.transforms.complete_all()
+
+    assert spy.rects != [], "変換が終わっても描き直していない"
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
+
+
+def test_the_nearest_inverted_image_is_shown_while_waiting(
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
+) -> None:
+    """目的の解像度の変換待ちでも、現在のモードの別解像度があればそれを描く。
+
+    ここで raw を出すと赤が見えてしまう。出すのは変換済みの絵だけ。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red, scale=0.5)
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
+
+    # 目的の解像度の raw が届いたが、その変換はまだ終わっていない。
+    service.transforms.immediate = False
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    service.repeat_last_request()
+
+    assert service.transforms.pending
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
+
+
+def test_a_mode_switch_returns_without_waiting_for_the_worker(
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
+) -> None:
+    """モードの切り替えは変換の完了を待たずに戻る。
+
+    待つ実装だと、Smart Dark で切り替えのたびに UI が固まる。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    service.transforms.immediate = False
+
+    for mode in (PageColorMode.INVERT, PageColorMode.ORIGINAL, PageColorMode.INVERT):
+        loaded_view.set_page_color_mode(mode)
+
+    # 連打しても走っているのは1件だけ。どの呼び出しも待たずに戻っている。
+    assert len(service.transforms.submitted) == 1
+    assert service.transform_inflight_count == 1
 
 
 # ------------------------------------------------------------------ キャンバスの色
