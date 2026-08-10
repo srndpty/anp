@@ -1473,6 +1473,113 @@ def test_the_nearest_inverted_image_is_shown_while_waiting(
     assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
 
 
+def test_smart_dark_paints_the_hue_preserving_pixels(
+    loaded_view: PdfView, cache: RenderCache
+) -> None:
+    """スマートダークでは赤が赤のまま描かれる。
+
+    反転なら水色になるところ。図表の色を補色へ変えないのが目的。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+
+    loaded_view.set_page_color_mode(PageColorMode.SMART_DARK)
+
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.red)
+
+
+def test_smart_dark_darkens_a_white_page(loaded_view: PdfView, cache: RenderCache) -> None:
+    """白い紙面は黒くなる（無彩色では反転と同じ）。"""
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.white)
+
+    loaded_view.set_page_color_mode(PageColorMode.SMART_DARK)
+
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+
+
+def test_the_loading_background_is_dark_in_smart_dark(loaded_view: PdfView) -> None:
+    """スマートダークでも、画像がまだ無い間のページ下地は黒。
+
+    変換待ちの間に明るい紙面を見せない。
+    """
+    loaded_view.set_page_color_mode(PageColorMode.SMART_DARK)
+
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+    assert canvas_color(loaded_view) != QColor(Qt.GlobalColor.black)
+
+
+def test_the_page_is_dark_while_the_smart_dark_transform_is_pending(
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
+) -> None:
+    """スマートダークの変換待ちでも、元の明るい画像を一瞬でも描かない。"""
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.white)
+    service.transforms.immediate = False
+
+    loaded_view.set_page_color_mode(PageColorMode.SMART_DARK)
+
+    assert service.transforms.pending, "テストの前提が崩れている（変換が既に終わっている）"
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+
+
+def test_the_invert_image_is_not_painted_while_smart_dark_is_pending(
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
+) -> None:
+    """反転からスマートダークへ切り替えた直後に、反転の絵を描かない。
+
+    他モードの絵を仮表示に使うと、切り替えた瞬間に前の色相が見えてしまう。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
+    service.transforms.immediate = False
+
+    loaded_view.set_page_color_mode(PageColorMode.SMART_DARK)
+
+    assert service.transforms.pending
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+
+    service.transforms.complete_all()
+
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.red)
+
+
+def test_painting_never_transforms_in_smart_dark(
+    loaded_view: PdfView, cache: RenderCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """スマートダークでも `paintEvent` で画素処理をしない。
+
+    Invert より重い変換なので、描画経路に入るとスクロールが目に見えて重くなる。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    loaded_view.set_page_color_mode(PageColorMode.SMART_DARK)
+    calls = count_transforms(monkeypatch)
+
+    for _ in range(5):
+        render_view(loaded_view)
+    loaded_view.verticalScrollBar().setValue(200)
+    render_view(loaded_view)
+
+    assert calls == []
+
+
+def test_switching_between_transformed_modes_does_not_rerender(
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
+) -> None:
+    """反転 ⇄ スマートダークでも PDF のレンダリングはやり直さない。
+
+    `PageColorMode` は `RenderKey` に入らないので、色を変えても raw は同じ。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    count = len(service.requests)
+    generation = service.generation
+
+    for mode in (PageColorMode.INVERT, PageColorMode.SMART_DARK, PageColorMode.INVERT):
+        loaded_view.set_page_color_mode(mode)
+
+    assert len(service.requests) == count
+    assert service.generation == generation
+    assert len(cache) == 1
+
+
 def test_a_mode_switch_returns_without_waiting_for_the_worker(
     loaded_view: PdfView, cache: RenderCache, service: RecordingService
 ) -> None:

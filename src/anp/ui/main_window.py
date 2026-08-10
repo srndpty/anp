@@ -161,6 +161,9 @@ class MainWindow(QMainWindow):
         self._actions.page_color_invert.triggered.connect(
             lambda: self._view.set_page_color_mode(PageColorMode.INVERT)
         )
+        self._actions.page_color_smart_dark.triggered.connect(
+            lambda: self._view.set_page_color_mode(PageColorMode.SMART_DARK)
+        )
 
         # キャンバスと UI テーマも同様に、状態を変えてから選択表示を取り直す。
         # ページの色に触らないので、3つの軸は独立したまま。
@@ -310,6 +313,7 @@ class MainWindow(QMainWindow):
         mode = self._view.page_color_mode
         self._actions.page_color_original.setChecked(mode is PageColorMode.ORIGINAL)
         self._actions.page_color_invert.setChecked(mode is PageColorMode.INVERT)
+        self._actions.page_color_smart_dark.setChecked(mode is PageColorMode.SMART_DARK)
 
     def _sync_canvas_ui(self) -> None:
         """キャンバスの選択表示を、ビューの状態に合わせる。"""

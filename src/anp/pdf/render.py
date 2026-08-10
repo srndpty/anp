@@ -252,8 +252,10 @@ class PageRenderService(QObject):
         # プールの中に待ち行列は溜まらない。
         #
         # `QThreadPool` のデストラクタは走っている分の完了を待つ（GIL は
-        # 解放されるので固まらないことを実機で確認済み）。1件が数 ms の
-        # Invert では終了時の待ちは無視できる。
+        # 解放されるので固まらないことを実機で確認済み）。終了時に待たされる
+        # のは走っている1件分だけで、最も重い条件（上限いっぱいの 32 MiB を
+        # Smart Dark）でも実測 50 ms 弱。体感できないので、取り消しの仕組みは
+        # 足していない。1件がこれより明らかに重くなったら考え直す。
         self._transform_pool = QThreadPool()
         self._transform_pool.setMaxThreadCount(max_transform_inflight)
         self._transform_signals = _TransformSignals()

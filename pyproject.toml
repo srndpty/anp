@@ -8,6 +8,10 @@ dependencies = [
     # UI テーマは QStyleHints のカラースキーム（Qt 6.8 で追加）を使う。
     # 実機での検証は 6.11 系で行っている。
     "PySide6>=6.8",
+    # Smart Dark は画素ごとに max/min を取るため、Qt の画像 API だけでは
+    # 表現できない。Python のループで書くと GIL を握ったままになるので、
+    # `QImage` のバッファを NumPy の配列として見て一括で計算する。
+    "numpy>=2.1",
 ]
 
 [project.scripts]

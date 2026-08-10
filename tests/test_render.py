@@ -1375,6 +1375,279 @@ def test_rapid_mode_switching_ending_on_invert_shows_the_inverted_image() -> Non
     assert rgba(image) == BLACK
 
 
+# --------------------------------------------------- Smart Dark（非同期の契約）
+# ここから下は、変換が要るモードが **2つ** になったことで初めて起きる状況の検証。
+# 赤で塗った raw を使うと、どちらのモードの結果が表示されているかを画素で
+# 見分けられる（Invert なら水色、Smart Dark なら赤のまま）。
+RED = 0xFFFF0000
+INVERTED_RED = (0, 255, 255, 255)
+SMART_DARK_RED = (255, 0, 0, 255)
+
+
+def test_smart_dark_does_not_run_while_requesting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Smart Dark も要求の呼び出しの中で同期実行されない。"""
+    service = seeded_service(range(0, 1), argb=RED)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.SMART_DARK)
+    calls = count_transforms(monkeypatch)
+
+    service.request_pages(requests_for(range(0, 1)))
+
+    assert calls == [], "GUI スレッドで Smart Dark をかけている"
+    assert len(transforms.submitted) == 1
+
+
+def test_the_smart_dark_image_is_missing_until_the_worker_finishes() -> None:
+    """ワーカーが終わるまで Smart Dark の画像は引き当てられない。"""
+    service = seeded_service(range(0, 1), argb=RED)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.SMART_DARK)
+
+    service.request_pages(requests_for(range(0, 1)))
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+    assert service.placeholder_for(0, A4_AT_72DPI) is None
+    assert len(service.display_cache) == 0
+    assert transforms.pending
+
+
+def test_the_smart_dark_image_lands_in_the_cache_and_notifies() -> None:
+    """ワーカーが終わったらキャッシュに入り、`page_ready` で知らせる。"""
+    service = seeded_service(range(0, 1), argb=RED)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.SMART_DARK)
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    service.request_pages(requests_for(range(0, 1)))
+    assert ready == [], "変換が終わる前に通知している"
+
+    transforms.complete_all()
+
+    assert ready == [0]
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == SMART_DARK_RED, "色相が保たれていない"
+
+
+def test_the_real_worker_produces_the_smart_dark_image(qtbot: QtBot) -> None:
+    """本物のワーカーでも Smart Dark の結果が GUI スレッドへ戻ってくる。"""
+    service = seeded_service(range(0, 1), argb=RED)
+    service.set_color_mode(PageColorMode.SMART_DARK)
+
+    with qtbot.waitSignal(service.page_ready, timeout=10_000) as blocker:
+        service.request_pages(requests_for(range(0, 1)))
+
+    assert blocker.args == [0]
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == SMART_DARK_RED
+    assert service.transform_inflight_count == 0
+
+
+# ------------------------------------------ 変換が要るモードどうしの競合
+def test_a_late_invert_result_does_not_pollute_the_smart_dark_display() -> None:
+    """Invert の変換中に Smart Dark へ切り替えても、Invert の結果が表示に出ない。
+
+    P2-3A までは「変換が要るモード」対「Original」の競合しかなかった。
+    ここが2つの変換モードが同時に存在する状況の要になる。
+    """
+    service = seeded_service(range(0, 1), argb=RED)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    invert_job = transforms.pending[0]
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    service.set_color_mode(PageColorMode.SMART_DARK)
+    transforms.complete(invert_job)
+
+    assert ready == [], "旧モードの結果で再描画を促している"
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None, "Invert の絵が Smart Dark として出た"
+    assert service.placeholder_for(0, A4_AT_72DPI) is None, "Invert の絵を仮表示に使っている"
+
+
+def test_a_late_smart_dark_result_does_not_pollute_the_invert_display() -> None:
+    """逆向き。Smart Dark の変換中に Invert へ切り替えた場合も同じ。"""
+    service = seeded_service(range(0, 1), argb=RED)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.SMART_DARK)
+    service.request_pages(requests_for(range(0, 1)))
+    smart_dark_job = transforms.pending[0]
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete(smart_dark_job)
+
+    assert ready == []
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None, "Smart Dark の絵が Invert として出た"
+
+
+def test_the_smart_dark_job_follows_the_finished_invert_job() -> None:
+    """枠が1つしか無くても、旧モードが終わった後に現在モードの変換が進む。
+
+    Invert 実行中 → Smart Dark を選択 → Invert 完了 → Smart Dark 投入 →
+    Smart Dark 完了 → Smart Dark 表示、という順序を決定的に固定する。
+    """
+    service = seeded_service(range(0, 1), max_transform_inflight=1, argb=RED)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    invert_job = transforms.pending[0]
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    service.set_color_mode(PageColorMode.SMART_DARK)
+    assert len(transforms.submitted) == 1, "枠が埋まっているのに投入している"
+
+    transforms.complete(invert_job)
+
+    assert len(transforms.submitted) == 2, "枠が空いたのに現在モードの変換が続かない"
+    smart_dark_job = transforms.submitted[-1]
+    assert smart_dark_job.display_key.color_mode is PageColorMode.SMART_DARK
+    assert ready == [], "Invert の完了で通知している"
+
+    transforms.complete(smart_dark_job)
+
+    assert ready == [0]
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == SMART_DARK_RED
+
+
+def test_switching_between_the_two_transformed_modes_reuses_the_cache() -> None:
+    """Smart Dark → Invert → Smart Dark で、残っていれば変換をやり直さない。
+
+    モードが増えたことを理由に、切り替えのたびに表示用キャッシュを
+    空にする実装へ戻っていないことを見る。
+    """
+    service = seeded_service(range(0, 1), argb=RED)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.SMART_DARK)
+    service.request_pages(requests_for(range(0, 1)))
+    transforms.complete_all()
+
+    service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete_all()
+    assert len(transforms.submitted) == 2
+
+    service.set_color_mode(PageColorMode.SMART_DARK)
+
+    assert len(transforms.submitted) == 2, "キャッシュにあるのに作り直している"
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == SMART_DARK_RED
+    # 両モードの絵が同居している。
+    assert {key.color_mode for key in display_keys(service)} == {
+        PageColorMode.INVERT,
+        PageColorMode.SMART_DARK,
+    }
+
+
+def test_rapid_switching_between_three_modes_does_not_duplicate_jobs() -> None:
+    """3モードを行き来しても、変換が増殖せず枠の上限も超えない。"""
+    service = seeded_service(range(0, 1), argb=RED)
+    transforms = ManualTransforms(service)
+    service.request_pages(requests_for(range(0, 1)))
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    for mode in (
+        PageColorMode.ORIGINAL,
+        PageColorMode.INVERT,
+        PageColorMode.SMART_DARK,
+        PageColorMode.INVERT,
+        PageColorMode.SMART_DARK,
+    ):
+        service.set_color_mode(mode)
+        assert service.transform_inflight_count <= DEFAULT_MAX_TRANSFORM_INFLIGHT
+
+    # 走るのは Invert と Smart Dark の1件ずつ。連打の回数だけは起こさない。
+    assert sorted(transforms.submitted_keys) == ["p0w595-invert", "p0w595-smart_dark"]
+
+    transforms.complete_all()
+
+    # 最後は Smart Dark。Invert の完了では通知しない。
+    assert ready == [0]
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == SMART_DARK_RED
+    assert service.display_cache.total_bytes <= service.display_cache.max_bytes
+
+
+def test_a_late_invert_result_does_not_evict_the_current_smart_dark_page() -> None:
+    """遅れて届いた Invert の結果が、いま表示している Smart Dark を追い出さない。
+
+    P2-3A の late-result admission が、変換モード2つの間でも効いていること。
+    """
+    # 1枚だけが入る予算。2枚は入らない。
+    image_bytes = QImage(595, 842, QImage.Format.Format_ARGB32).sizeInBytes()
+    service = PageRenderService(RenderCache(), display_max_bytes=image_bytes)
+    transforms = ManualTransforms(service)
+    raw = QImage(595, 842, QImage.Format.Format_ARGB32)
+    raw.fill(RED)
+    service._cache.put(RenderKey(0, 595, 842, 1.0), raw)  # noqa: SLF001
+
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    invert_job = transforms.pending[0]
+
+    service.set_color_mode(PageColorMode.SMART_DARK)
+    transforms.complete(transforms.pending[-1])
+    assert rgba(service.image_for(0, A4_AT_72DPI, 1.0) or QImage()) == SMART_DARK_RED
+
+    transforms.complete(invert_job)
+
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None, "Smart Dark が旧モードの結果に追い出された"
+    assert rgba(image) == SMART_DARK_RED
+    assert display_keys(service) == {
+        DisplayKey(render_key=RenderKey(0, 595, 842, 1.0), color_mode=PageColorMode.SMART_DARK)
+    }
+    assert service.display_cache.total_bytes <= service.display_cache.max_bytes
+
+
+def test_the_placeholder_does_not_fall_back_to_another_mode() -> None:
+    """Smart Dark 待ちのときに、Invert の絵を仮表示に使わない。
+
+    現在のモード以外の絵を出すと、切り替えた瞬間に前のモードの色が見える。
+    使えるものが無ければ何も返さず、ビューには黒い下地を描かせる。
+    """
+    service = seeded_service(range(0, 0), argb=RED)
+    transforms = ManualTransforms(service)
+    small = QImage(297, 421, QImage.Format.Format_ARGB32)
+    small.fill(RED)
+    service._cache.put(RenderKey(0, 297, 421, 1.0), small)  # noqa: SLF001
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(297, 421), dpr=1.0)])
+    transforms.complete_all()
+    assert rgba(service.placeholder_for(0, A4_AT_72DPI) or QImage()) == INVERTED_RED
+
+    service.set_color_mode(PageColorMode.SMART_DARK)
+
+    assert service.placeholder_for(0, A4_AT_72DPI) is None, "Invert の絵を仮表示に使っている"
+
+
+def test_the_nearest_smart_dark_image_is_used_as_a_placeholder() -> None:
+    """Smart Dark でも、同じモードの別解像度があれば仮表示に使う。"""
+    service = seeded_service(range(0, 0), argb=RED)
+    transforms = ManualTransforms(service)
+    small = QImage(297, 421, QImage.Format.Format_ARGB32)
+    small.fill(RED)
+    service._cache.put(RenderKey(0, 297, 421, 1.0), small)  # noqa: SLF001
+    service.set_color_mode(PageColorMode.SMART_DARK)
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(297, 421), dpr=1.0)])
+    transforms.complete_all()
+
+    placeholder = service.placeholder_for(0, QSize(1190, 1684))
+
+    assert placeholder is not None
+    assert placeholder.width() == 297
+    assert rgba(placeholder) == SMART_DARK_RED
+
+
 # ------------------------------------------------------------------ 仮表示
 def test_no_placeholder_while_the_transform_is_pending() -> None:
     """現在のモードの画像が1枚も無ければ、仮表示も返さない。

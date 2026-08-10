@@ -612,7 +612,11 @@ def test_the_page_color_menu_exists(window: MainWindow) -> None:
     """表示メニューの中に「ページの色」がある。"""
     submenu = menu_titled(window, "ページの色(&C)")
 
-    assert [action.text() for action in submenu.actions()] == ["オリジナル(&O)", "反転(&I)"]
+    assert [action.text() for action in submenu.actions()] == [
+        "オリジナル(&O)",
+        "反転(&I)",
+        "スマートダーク(&K)",
+    ]
     assert submenu.menuAction() in menu_titled(window, "表示(&V)").actions()
 
 
@@ -620,6 +624,7 @@ def test_original_is_checked_at_startup(window: MainWindow) -> None:
     """既定ではオリジナルが選択されている。"""
     assert window.reader_actions.page_color_original.isChecked()
     assert not window.reader_actions.page_color_invert.isChecked()
+    assert not window.reader_actions.page_color_smart_dark.isChecked()
     assert window.view.page_color_mode is PageColorMode.ORIGINAL
 
 
@@ -628,6 +633,13 @@ def test_the_menu_switches_to_invert(opened: MainWindow) -> None:
     opened.reader_actions.page_color_invert.trigger()
 
     assert opened.view.page_color_mode is PageColorMode.INVERT
+
+
+def test_the_menu_switches_to_smart_dark(opened: MainWindow) -> None:
+    """メニューからスマートダークへ切り替えられる。"""
+    opened.reader_actions.page_color_smart_dark.trigger()
+
+    assert opened.view.page_color_mode is PageColorMode.SMART_DARK
 
 
 def test_the_menu_switches_back_to_original(opened: MainWindow) -> None:
@@ -640,16 +652,20 @@ def test_the_menu_switches_back_to_original(opened: MainWindow) -> None:
 
 
 def test_the_page_color_choices_are_exclusive(opened: MainWindow) -> None:
-    """チェックは常にどちらか一方だけ。"""
+    """チェックは常に3つのうち1つだけ。"""
     actions = opened.reader_actions
+    choices = {
+        PageColorMode.ORIGINAL: actions.page_color_original,
+        PageColorMode.INVERT: actions.page_color_invert,
+        PageColorMode.SMART_DARK: actions.page_color_smart_dark,
+    }
+    assert set(choices) == set(PageColorMode), "モードが増えたのにメニューに出ていない"
 
-    actions.page_color_invert.trigger()
-    assert actions.page_color_invert.isChecked()
-    assert not actions.page_color_original.isChecked()
+    for mode, chosen in choices.items():
+        chosen.trigger()
 
-    actions.page_color_original.trigger()
-    assert actions.page_color_original.isChecked()
-    assert not actions.page_color_invert.isChecked()
+        assert opened.view.page_color_mode is mode
+        assert [action for action in choices.values() if action.isChecked()] == [chosen]
 
 
 def test_the_page_color_can_be_chosen_without_a_document(window: MainWindow) -> None:
@@ -701,12 +717,36 @@ def test_the_page_color_mode_round_trips(qapp: QApplication, tmp_path: Path) -> 
         second.deleteLater()
 
 
+def test_smart_dark_round_trips(qapp: QApplication, tmp_path: Path) -> None:
+    """スマートダークも保存され、次回起動時に復元される。"""
+    ini = str(tmp_path / "settings.ini")
+
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first.reader_actions.page_color_smart_dark.trigger()
+    first.close()
+    first.deleteLater()
+
+    stored = QSettings(ini, QSettings.Format.IniFormat).value("view/page_color_mode")
+    assert stored == "smart_dark"
+
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    try:
+        assert second.view.page_color_mode is PageColorMode.SMART_DARK
+        assert second.reader_actions.page_color_smart_dark.isChecked()
+    finally:
+        second.deleteLater()
+
+
+@pytest.mark.parametrize("stored", ["solarized", "unknown", "sepia"])
 def test_an_unknown_page_color_mode_falls_back_to_original(
-    qapp: QApplication, tmp_path: Path
+    qapp: QApplication, tmp_path: Path, stored: str
 ) -> None:
-    """知らないページの色が保存されていたらオリジナルで起動する。"""
+    """知らないページの色が保存されていたらオリジナルで起動する。
+
+    `smart_dark` は P2-3B から正式な値なので、ここでは使わない。
+    """
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    backend.setValue("view/page_color_mode", "smart_dark")
+    backend.setValue("view/page_color_mode", stored)
 
     window = MainWindow(Settings(backend))
     try:
