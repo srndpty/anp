@@ -344,7 +344,10 @@ def test_smart_dark_unpremultiplies_before_transforming() -> None:
     なってしまい、非乗算の赤を変換した「赤のまま」と食い違う。
     """
     source = solid(0x80FF0000).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
-    assert source.constBits()[2] != 0xFF  # 前提: BGRA 並びの R が減っている
+    # 前提の確認。BGRA 並びの R が alpha 分だけ減っている。この添字だけは
+    # リトルエンディアン前提（`_smart_dark()` のコメントを参照）。検証本体は
+    # `pixel()` 経由なのでバイト順に依存しない。
+    assert source.constBits()[2] != 0xFF
 
     red, green, blue, alpha = rgba(transform_page(source, PageColorMode.SMART_DARK))
 
@@ -379,7 +382,7 @@ def test_smart_dark_is_continuous_across_stripe_boundaries() -> None:
     一時配列を抑えるために数百行ずつ処理するので、刻み目のある高さで
     全画素を確かめる。
     """
-    height = 600  # 刻み幅（256 行）を跨ぎ、端数も出る高さ
+    height = 600  # 刻み幅（128 行）を複数回跨ぎ、端数も出る高さ
     source = QImage(3, height, QImage.Format.Format_ARGB32)
     for y in range(height):
         source.setPixel(0, y, 0xFF000000 | ((y % 256) << 16))

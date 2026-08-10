@@ -175,9 +175,18 @@ def _smart_dark(image: QImage) -> QImage:
     # `constBits()` は読み取り専用なので、入力と暗黙共有されたままでも
     # 書き換えの心配がない。書き込むのは新しく確保した `result` だけ。
     # 最後の軸を (幅, 4) へ割るのは、行内が連続なのでコピーを伴わない。
-    # Format_ARGB32 はリトルエンディアンでは B, G, R, A の並びになるが、
-    # 色の3チャンネルは対称に扱うので並び順は結果に影響しない。効くのは
-    # 「アルファが4バイト目」という点だけ。
+    #
+    # **バイト順はリトルエンディアンを前提にする。** `Format_ARGB32` は
+    # 32bit 値 0xAARRGGBB としての定義なので、バイトの並びは環境の
+    # エンディアンで変わる。リトルエンディアンでは B, G, R, A になる。
+    # 色の3チャンネルは max/min と加減算で対称に扱うため並び順は結果に
+    # 影響せず、効いてくるのは **「アルファが4バイト目」** の1点だけ。
+    #
+    # anp は Windows（x86-64 / ARM64）専用でどちらもリトルエンディアン
+    # なので、ここは前提として置く。ビッグエンディアンへ移すことが
+    # 現実の要求になったら、この関数の中だけ `Format_RGBA8888`
+    # （バイト順が R, G, B, A で固定）へ正規化すればよい。今それをすると、
+    # ARGB32 のまま扱えば無料の変換に、毎回1パス分の並べ替えが増える。
     src_bytes = np.frombuffer(source.constBits(), dtype=np.uint8)
     dst_bytes = np.asarray(result.bits(), dtype=np.uint8)
     src_pixels = src_bytes.reshape(height, source.bytesPerLine())[:, : width * 4].reshape(
