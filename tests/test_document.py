@@ -119,6 +119,80 @@ def test_failed_open_closes_the_previous_document(sample_pdf: Path, broken_pdf: 
     assert controller.page_count == 0
 
 
+def test_empty_file_raises_with_japanese_message(empty_pdf: Path) -> None:
+    """0バイトのファイルも PDF として読めないものとして扱う。"""
+    controller = DocumentController()
+
+    with pytest.raises(DocumentError) as excinfo:
+        controller.open(empty_pdf)
+
+    assert excinfo.value.message == "PDF として読み取れないファイルです。"
+    assert not controller.is_open
+
+
+def test_a_directory_raises_with_japanese_message(directory_pdf: Path) -> None:
+    """開けないパス（ディレクトリ）でもクラッシュしない。"""
+    controller = DocumentController()
+
+    with pytest.raises(DocumentError) as excinfo:
+        controller.open(directory_pdf)
+
+    assert excinfo.value.message == "ファイルが見つかりません。"
+    assert not controller.is_open
+
+
+def test_password_protected_pdf_is_not_opened(encrypted_pdf: Path) -> None:
+    """パスワードが要る PDF は Phase 1 では開かず、理由を伝える。"""
+    controller = DocumentController()
+
+    with pytest.raises(DocumentError) as excinfo:
+        controller.open(encrypted_pdf)
+
+    assert excinfo.value.message == "パスワードで保護されているため開けません。"
+    assert not controller.is_open
+    assert controller.page_count == 0
+
+
+def test_a_pdf_without_pages_is_not_opened(pageless_pdf: Path) -> None:
+    """読めてもページが無い PDF は開いたことにしない。
+
+    レイアウトはページ0枚を扱えないので、ここで止める。
+    """
+    controller = DocumentController()
+
+    with pytest.raises(DocumentError) as excinfo:
+        controller.open(pageless_pdf)
+
+    assert excinfo.value.message == "ページが1つも含まれていません。"
+    assert not controller.is_open
+
+
+@pytest.mark.parametrize(
+    "bad", ["broken_pdf", "empty_pdf", "encrypted_pdf", "pageless_pdf", "missing"]
+)
+def test_a_valid_pdf_opens_after_a_failure(
+    bad: str, sample_pdf: Path, tmp_path: Path, request: pytest.FixtureRequest
+) -> None:
+    """開くのに失敗しても、次に正常な PDF を開ける。
+
+    失敗した `QPdfDocument` を使い回すので、エラー状態が残っていると
+    以後どの PDF も開けなくなる。
+    """
+    path = tmp_path / "missing.pdf" if bad == "missing" else request.getfixturevalue(bad)
+
+    controller = DocumentController()
+    try:
+        with pytest.raises(DocumentError):
+            controller.open(path)
+
+        controller.open(sample_pdf)
+
+        assert controller.is_open
+        assert controller.page_count == 3
+    finally:
+        controller.close()
+
+
 def test_every_error_value_has_a_message() -> None:
     """`QPdfDocument.Error` のすべての値に日本語メッセージがある。
 

@@ -40,6 +40,21 @@ def opened(window: MainWindow, sample_pdf: Path) -> MainWindow:
     return window
 
 
+@pytest.fixture
+def warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """`QMessageBox.warning` を捕まえて本文を集める。
+
+    テスト中にモーダルダイアログを出さないため。Phase 1 のエラー通知は
+    この1種類だけなので、専用の抽象は作らずここで差し替える。
+    """
+    messages: list[str] = []
+    monkeypatch.setattr(
+        "anp.ui.main_window.QMessageBox.warning",
+        lambda *args: messages.append(args[2]),
+    )
+    return messages
+
+
 def page_input(window: MainWindow) -> QSpinBox:
     """ページ番号の入力欄。ツールバー上の唯一のスピンボックス。"""
     boxes = window.findChildren(QSpinBox)
@@ -124,24 +139,112 @@ def test_opening_a_pdf_updates_the_page_controls(opened: MainWindow) -> None:
 
 
 def test_a_failed_open_clears_the_view(
-    opened: MainWindow, broken_pdf: Path, monkeypatch: pytest.MonkeyPatch
+    opened: MainWindow, broken_pdf: Path, warnings: list[str]
 ) -> None:
     """開けなかったら、前の PDF の表示だけを残さない。
 
     `DocumentController.open()` は失敗時に前のドキュメントも閉じる契約なので、
     表示を残すと見えている内容と実体がずれる。
     """
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        "anp.ui.main_window.QMessageBox.warning",
-        lambda *args: warnings.append(args[2]),
-    )
-
     opened.open_path(broken_pdf)
 
     assert not opened.view.has_document
     assert opened.view.page_count == 0
     assert warnings and "PDF として読み取れない" in warnings[0]
+
+
+def test_a_failed_open_resets_the_title_and_status(
+    opened: MainWindow, broken_pdf: Path, warnings: list[str]
+) -> None:
+    """開くのに失敗したら、前の PDF の名前も状態表示も残さない。"""
+    opened.open_path(broken_pdf)
+
+    assert opened.windowTitle() == "anp"
+    assert opened.statusBar().currentMessage() == "PDF が開かれていません"
+    assert warnings
+
+
+def test_a_failed_open_disables_the_controls(
+    opened: MainWindow, broken_pdf: Path, warnings: list[str]
+) -> None:
+    """失敗後は、開いているつもりで押せる操作を残さない。"""
+    opened.open_path(broken_pdf)
+
+    actions = opened.reader_actions
+    assert not page_input(opened).isEnabled()
+    assert not actions.zoom_in.isEnabled()
+    assert not actions.fit_width.isEnabled()
+    assert not actions.next_page.isEnabled()
+    assert not actions.previous_page.isEnabled()
+    assert actions.open.isEnabled()
+    assert warnings
+
+
+@pytest.mark.parametrize(
+    "bad", ["broken_pdf", "empty_pdf", "directory_pdf", "encrypted_pdf", "pageless_pdf"]
+)
+def test_every_kind_of_failure_is_reported_and_clears_the_view(
+    opened: MainWindow, bad: str, warnings: list[str], request: pytest.FixtureRequest
+) -> None:
+    """壊れた・空・開けないパス・パスワード付きのいずれでも同じ後始末をする。"""
+    opened.open_path(request.getfixturevalue(bad))
+
+    assert not opened.view.has_document
+    assert opened.view.page_count == 0
+    assert len(warnings) == 1
+    assert warnings[0].strip() != ""
+
+
+def test_a_missing_file_is_reported(
+    opened: MainWindow, tmp_path: Path, warnings: list[str]
+) -> None:
+    """存在しないファイルは理由を添えて知らせる。"""
+    opened.open_path(tmp_path / "no_such_file.pdf")
+
+    assert not opened.view.has_document
+    assert "ファイルが見つかりません" in warnings[0]
+
+
+def test_a_password_protected_pdf_is_reported(
+    opened: MainWindow, encrypted_pdf: Path, warnings: list[str]
+) -> None:
+    """パスワード付き PDF は Phase 1 では開かず、理由を伝える。"""
+    opened.open_path(encrypted_pdf)
+
+    assert not opened.view.has_document
+    assert "パスワード" in warnings[0]
+
+
+def test_a_pdf_can_be_opened_after_a_failure(
+    window: MainWindow, broken_pdf: Path, sample_pdf: Path, warnings: list[str]
+) -> None:
+    """失敗しても、次に正常な PDF を開ける。"""
+    window.open_path(broken_pdf)
+    assert warnings
+
+    window.open_path(sample_pdf)
+
+    assert window.view.has_document
+    assert window.view.page_count == 3
+    assert window.view.current_page == 0
+    assert sample_pdf.name in window.windowTitle()
+    assert page_input(window).isEnabled()
+    assert len(warnings) == 1
+
+
+def test_a_failed_open_does_not_change_the_last_directory(
+    opened: MainWindow, settings: Settings, sample_pdf: Path, tmp_path: Path, warnings: list[str]
+) -> None:
+    """開けなかったディレクトリは覚えない。"""
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    broken = other / "broken.pdf"
+    broken.write_text("no", encoding="utf-8")
+
+    opened.open_path(broken)
+
+    assert Path(settings.last_directory) == sample_pdf.parent
+    assert warnings
 
 
 def test_the_controls_are_disabled_without_a_document(window: MainWindow) -> None:
@@ -377,6 +480,117 @@ def test_leaving_full_screen_restores_a_normal_window(window: MainWindow) -> Non
 
     assert not window.isFullScreen()
     assert not window.isMaximized()
+
+
+# ------------------------------------------------------------------ 後始末
+def test_closing_releases_the_document(opened: MainWindow) -> None:
+    """閉じるときに表示とドキュメントを手放す。
+
+    閉じたウィンドウがレンダリング結果を抱えたままにならないようにする。
+    """
+    assert opened.view.has_document
+
+    opened.close()
+
+    assert not opened.view.has_document
+    assert opened.view.page_count == 0
+
+
+def test_closing_while_renders_are_in_flight_is_safe(
+    window: MainWindow, sample_pdf: Path, qapp: QApplication
+) -> None:
+    """レンダリングが飛んでいる最中に閉じても例外にならない。
+
+    要求は取り消せないので、閉じた後に結果が返ってくる。受け取り側が
+    先に消えていると落ちる。
+    """
+    window.open_path(sample_pdf)
+    window.view.verticalScrollBar().setValue(400)
+
+    window.close()
+    for _ in range(8):
+        qapp.processEvents()
+
+    assert not window.view.has_document
+
+
+def test_switching_documents_while_renders_are_in_flight_is_safe(
+    window: MainWindow, sample_pdf: Path, two_page_pdf: Path, qapp: QApplication
+) -> None:
+    """レンダリング中に別の PDF へ切り替えても、古い結果が表示に残らない。"""
+    window.open_path(sample_pdf)
+    window.view.verticalScrollBar().setValue(400)
+
+    window.open_path(two_page_pdf)
+    for _ in range(8):
+        qapp.processEvents()
+
+    assert window.view.page_count == 2
+    assert window.view.current_page == 0
+    assert page_input(window).maximum() == 2
+
+
+def test_opening_the_same_pdf_again_starts_from_the_top(
+    opened: MainWindow, sample_pdf: Path, qapp: QApplication
+) -> None:
+    """同じ PDF を開き直しても壊れない。"""
+    opened.view.go_to_page(2)
+
+    opened.open_path(sample_pdf)
+    for _ in range(4):
+        qapp.processEvents()
+
+    assert opened.view.page_count == 3
+    assert opened.view.current_page == 0
+
+
+# ------------------------------------------------------------------ 全画面とフィット
+def test_full_screen_keeps_the_fit_mode(opened: MainWindow, qapp: QApplication) -> None:
+    """全画面へ入っても倍率モードは保たれ、倍率は新しい大きさで取り直される。"""
+    opened.reader_actions.fit_width.trigger()
+    before = opened.view.zoom
+
+    opened.reader_actions.full_screen.trigger()
+    for _ in range(8):
+        qapp.processEvents()
+
+    assert opened.isFullScreen()
+    assert opened.view.zoom_mode is ZoomMode.FIT_WIDTH
+    assert zoom_label_text(opened) == "幅に合わせる"
+    rect = opened.view.page_viewport_rect(0)
+    assert rect is not None
+    assert rect.width() <= opened.view.viewport().width()
+    assert opened.view.zoom != pytest.approx(before)
+
+
+def test_leaving_full_screen_restores_the_fit_zoom(opened: MainWindow, qapp: QApplication) -> None:
+    """全画面から戻ると元の大きさのフィット倍率に戻る。"""
+    opened.reader_actions.fit_width.trigger()
+    for _ in range(8):
+        qapp.processEvents()
+    before = opened.view.zoom
+
+    opened.reader_actions.full_screen.trigger()
+    for _ in range(8):
+        qapp.processEvents()
+    opened.reader_actions.full_screen.trigger()
+    for _ in range(8):
+        qapp.processEvents()
+
+    assert not opened.isFullScreen()
+    assert opened.view.zoom == pytest.approx(before)
+
+
+def test_a_single_page_pdf_disables_both_page_actions(
+    window: MainWindow, single_page_pdf: Path
+) -> None:
+    """1ページの PDF では前へも次へも無効。"""
+    window.open_path(single_page_pdf)
+
+    assert window.view.page_count == 1
+    assert not window.reader_actions.previous_page.isEnabled()
+    assert not window.reader_actions.next_page.isEnabled()
+    assert page_input(window).maximum() == 1
 
 
 # ------------------------------------------------------------------ 設定
