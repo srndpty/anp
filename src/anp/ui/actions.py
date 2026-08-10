@@ -33,8 +33,9 @@ class ReaderActions:
 
     page_color_original: QAction
     page_color_invert: QAction
+    page_color_smart_dark: QAction
     page_color_group: QActionGroup
-    """ページの色は排他選択。どちらか一方だけがチェックされる。"""
+    """ページの色は排他選択。いずれか1つだけがチェックされる。"""
 
     canvas_black: QAction
     canvas_dark_gray: QAction
@@ -101,6 +102,7 @@ def create_actions(parent: QWidget) -> ReaderActions:
     """
     page_color_original = _action(parent, "オリジナル(&O)", checkable=True)
     page_color_invert = _action(parent, "反転(&I)", checkable=True)
+    page_color_smart_dark = _action(parent, "スマートダーク(&K)", checkable=True)
 
     canvas_black = _action(parent, "黒(&B)", checkable=True)
     canvas_dark_gray = _action(parent, "ダークグレー(&G)", checkable=True)
@@ -123,7 +125,10 @@ def create_actions(parent: QWidget) -> ReaderActions:
         full_screen=_action(parent, "全画面表示(&F)", shortcuts=["F11"], checkable=True),
         page_color_original=page_color_original,
         page_color_invert=page_color_invert,
-        page_color_group=_exclusive_group(parent, [page_color_original, page_color_invert]),
+        page_color_smart_dark=page_color_smart_dark,
+        page_color_group=_exclusive_group(
+            parent, [page_color_original, page_color_invert, page_color_smart_dark]
+        ),
         canvas_black=canvas_black,
         canvas_dark_gray=canvas_dark_gray,
         canvas_white=canvas_white,
@@ -158,6 +163,7 @@ def populate_menus(menu_bar: QMenuBar, actions: ReaderActions) -> None:
     page_color_menu = QMenu("ページの色(&C)", view_menu)
     page_color_menu.addAction(actions.page_color_original)
     page_color_menu.addAction(actions.page_color_invert)
+    page_color_menu.addAction(actions.page_color_smart_dark)
     view_menu.addMenu(page_color_menu)
 
     canvas_menu = QMenu("キャンバス(&N)", view_menu)

@@ -79,14 +79,15 @@ def test_unset_page_color_mode_returns_the_default(settings: Settings) -> None:
     assert settings.page_color_mode == "original"
 
 
-def test_the_page_color_mode_round_trips(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["invert", "smart_dark"])
+def test_the_page_color_mode_round_trips(tmp_path: Path, mode: str) -> None:
     """ページの色を読み戻せる。"""
     ini = str(tmp_path / "settings.ini")
     first = Settings(QSettings(ini, QSettings.Format.IniFormat))
-    first.page_color_mode = "invert"
+    first.page_color_mode = mode
     first.sync()
 
-    assert Settings(QSettings(ini, QSettings.Format.IniFormat)).page_color_mode == "invert"
+    assert Settings(QSettings(ini, QSettings.Format.IniFormat)).page_color_mode == mode
 
 
 def test_a_broken_page_color_mode_falls_back(tmp_path: Path) -> None:
