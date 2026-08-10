@@ -11,18 +11,21 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QEvent, QRect, QSizeF, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSizeF, Qt
+from PySide6.QtGui import QColor, QImage, QWheelEvent
 from PySide6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 
 from anp.pdf.cache import RenderCache, RenderKey
 from anp.pdf.document import DocumentController
-from anp.pdf.layout import PageLayout
+from anp.pdf.layout import LayoutMetrics, PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
-from anp.ui.pdf_view import MAX_ZOOM, MIN_ZOOM, NO_PAGE, PdfView
+from anp.ui.pdf_view import MAX_ZOOM, MIN_ZOOM, NO_PAGE, ZOOM_STEP, PdfView, ZoomMode
 
 VIEWPORT = (400, 600)
+
+# ビューが既定で使う配置寸法。フィット倍率の検算に使う。
+MARGIN = LayoutMetrics().margin
 
 
 class RecordingService(PageRenderService):
@@ -593,3 +596,387 @@ def test_a_rejected_document_does_not_disturb_the_current_one(
 
     assert loaded_view.page_count == 3
     assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.red)
+
+
+# ------------------------------------------------------------------ 倍率モード
+def test_manual_zoom_switches_to_free(loaded_view: PdfView) -> None:
+    """手動でズームすると FREE になる。"""
+    loaded_view.fit_width()
+    fitted: ZoomMode = loaded_view.zoom_mode
+    assert fitted is ZoomMode.FIT_WIDTH
+
+    loaded_view.set_zoom(1.0)
+
+    assert loaded_view.zoom_mode is ZoomMode.FREE
+    assert loaded_view.zoom == pytest.approx(1.0)
+
+
+def test_zoom_in_and_out_use_a_ratio(loaded_view: PdfView) -> None:
+    """ズームは加算ではなく倍率比で変わる。"""
+    loaded_view.set_zoom(1.0)
+
+    loaded_view.zoom_in()
+    assert loaded_view.zoom == pytest.approx(ZOOM_STEP)
+
+    loaded_view.zoom_in()
+    assert loaded_view.zoom == pytest.approx(2.0)
+
+    loaded_view.zoom_out()
+    assert loaded_view.zoom == pytest.approx(ZOOM_STEP)
+
+
+def test_the_zoom_ratio_is_the_same_at_any_zoom(loaded_view: PdfView) -> None:
+    """どの倍率からでも同じ比率で変わる（一定量の加算ではない）。"""
+    loaded_view.set_zoom(2.0)
+
+    loaded_view.zoom_in()
+
+    assert loaded_view.zoom == pytest.approx(2.0 * ZOOM_STEP)
+
+
+def test_zoom_in_switches_to_free(loaded_view: PdfView) -> None:
+    """ズームイン/アウトでも FREE へ移る。"""
+    loaded_view.fit_page()
+
+    loaded_view.zoom_in()
+
+    assert loaded_view.zoom_mode is ZoomMode.FREE
+
+
+def test_fit_width_matches_the_viewport(loaded_view: PdfView) -> None:
+    """幅フィットでページ幅が余白を除いたビューポート幅に一致する。"""
+    loaded_view.fit_width()
+
+    rect = loaded_view.page_viewport_rect(0)
+    assert rect is not None
+    assert rect.width() == pytest.approx(loaded_view.viewport().width() - MARGIN * 2)
+    assert loaded_view.zoom_mode is ZoomMode.FIT_WIDTH
+
+
+def test_fit_page_fits_the_whole_page(loaded_view: PdfView) -> None:
+    """ページフィットでページ全体がビューポートに収まる。"""
+    loaded_view.fit_page()
+
+    rect = loaded_view.page_viewport_rect(0)
+    assert rect is not None
+    assert rect.width() <= loaded_view.viewport().width()
+    assert rect.height() <= loaded_view.viewport().height()
+    assert loaded_view.zoom_mode is ZoomMode.FIT_PAGE
+
+
+def test_fit_page_is_not_larger_than_fit_width(loaded_view: PdfView) -> None:
+    """ページフィットは幅フィット以下の倍率になる（縦横の厳しい方）。"""
+    loaded_view.fit_width()
+    width_zoom = loaded_view.zoom
+
+    loaded_view.fit_page()
+
+    assert loaded_view.zoom <= width_zoom
+
+
+def test_fit_zoom_stays_within_the_limits(view: PdfView, controller: DocumentController) -> None:
+    """収まりようがない大きさでもフィット倍率は上下限に収まる。"""
+    view.set_document(controller.document, controller.page_sizes())
+
+    view.resize(60, 60)
+    view.fit_page()
+    assert view.zoom == MIN_ZOOM
+
+    view.resize(20000, 20000)
+    view.fit_width()
+    assert view.zoom == MAX_ZOOM
+
+
+def test_fit_uses_the_page_current_at_that_moment(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """フィットの基準はその瞬間の現在ページ。"""
+    sizes = [QSizeF(100.0, 200.0), QSizeF(400.0, 200.0), QSizeF(100.0, 200.0)]
+    loaded_view.set_document(controller.document, sizes)
+    loaded_view.fit_width()
+    first = loaded_view.zoom
+
+    loaded_view.go_to_page(1)
+    assert loaded_view.current_page == 1
+
+    loaded_view.fit_width()
+
+    # 2ページ目は4倍幅なので、同じ幅に収めるには 1/4 の倍率になる。
+    assert loaded_view.zoom == pytest.approx(first / 4.0)
+
+
+def test_scrolling_does_not_change_the_fit_zoom(loaded_view: PdfView) -> None:
+    """スクロールしただけでは倍率を計算し直さない。"""
+    loaded_view.fit_page()
+    zoom = loaded_view.zoom
+
+    loaded_view.verticalScrollBar().setValue(loaded_view.verticalScrollBar().maximum())
+
+    assert loaded_view.zoom == pytest.approx(zoom)
+    assert loaded_view.zoom_mode is ZoomMode.FIT_PAGE
+
+
+def test_crossing_a_page_does_not_change_the_fit_zoom(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """幅の違うページへ移っても、跨いだだけでは倍率が動かない。"""
+    sizes = [QSizeF(595.0, 842.0), QSizeF(200.0, 842.0), QSizeF(595.0, 842.0)]
+    loaded_view.set_document(controller.document, sizes)
+    loaded_view.fit_width()
+    zoom = loaded_view.zoom
+
+    loaded_view.go_to_page(1)
+
+    assert loaded_view.current_page == 1
+    assert loaded_view.zoom == pytest.approx(zoom)
+
+
+def test_resize_keeps_a_free_zoom(loaded_view: PdfView) -> None:
+    """FREE ならリサイズで倍率は変わらない。"""
+    loaded_view.set_zoom(1.0)
+
+    loaded_view.resize(700, 500)
+
+    assert loaded_view.zoom == pytest.approx(1.0)
+
+
+def test_resize_recomputes_a_fit_zoom(loaded_view: PdfView, controller: DocumentController) -> None:
+    """フィットモードならリサイズで倍率を計算し直す。"""
+    loaded_view.fit_width()
+    before = loaded_view.zoom
+
+    loaded_view.resize(700, 500)
+
+    expected = layout_of(controller).fit_width_zoom(0, loaded_view.viewport().width())
+    assert loaded_view.zoom == pytest.approx(expected)
+    assert loaded_view.zoom != pytest.approx(before)
+    assert loaded_view.zoom_mode is ZoomMode.FIT_WIDTH
+
+
+def test_a_fit_resize_does_not_add_render_requests(
+    loaded_view: PdfView, service: RecordingService
+) -> None:
+    """フィット中のリサイズでも、倍率変更とリサイズで要求が二重に出ない。
+
+    Qt はスクロールバーの出入りで1回のリサイズに複数の `resizeEvent` を
+    送るので、絶対数ではなく FREE のときとの差で見る。
+    """
+    loaded_view.set_zoom(1.0)
+    count = len(service.requests)
+    loaded_view.resize(700, 500)
+    free_cost = len(service.requests) - count
+
+    loaded_view.fit_width()
+    count = len(service.requests)
+    loaded_view.resize(500, 400)
+    fit_cost = len(service.requests) - count
+
+    assert fit_cost == free_cost
+
+
+def test_zoom_changed_reports_a_mode_switch(loaded_view: PdfView) -> None:
+    """倍率の値が同じでもモードが変われば通知する。"""
+    emitted: list[None] = []
+    loaded_view.zoom_changed.connect(lambda: emitted.append(None))
+
+    loaded_view.fit_width()
+    assert len(emitted) == 1
+
+    loaded_view.set_zoom(loaded_view.zoom)
+
+    assert loaded_view.zoom_mode is ZoomMode.FREE
+    assert len(emitted) == 2
+
+
+def test_a_new_document_reapplies_the_fit_mode(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """ドキュメントを差し替えてもモードは保たれ、倍率は計算し直される。"""
+    loaded_view.fit_width()
+
+    loaded_view.set_document(controller.document, [QSizeF(200.0, 400.0)] * 3)
+
+    assert loaded_view.zoom_mode is ZoomMode.FIT_WIDTH
+    rect = loaded_view.page_viewport_rect(0)
+    assert rect is not None
+    assert rect.width() == pytest.approx(loaded_view.viewport().width() - MARGIN * 2)
+
+
+def test_a_new_document_keeps_the_free_zoom(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """FREE なら手動で指定した倍率をそのまま引き継ぐ。"""
+    loaded_view.set_zoom(2.0)
+
+    loaded_view.set_document(controller.document, controller.page_sizes())
+
+    assert loaded_view.zoom == pytest.approx(2.0)
+
+
+def test_the_last_free_zoom_survives_a_fit(loaded_view: PdfView) -> None:
+    """フィットへ切り替えても、最後に手で指定した倍率は覚えている。"""
+    loaded_view.set_zoom(2.0)
+
+    loaded_view.fit_page()
+
+    assert loaded_view.zoom != pytest.approx(2.0)
+    assert loaded_view.last_free_zoom == pytest.approx(2.0)
+
+
+def test_the_last_free_zoom_follows_manual_zoom(loaded_view: PdfView) -> None:
+    """手動の倍率変更のたびに更新される。"""
+    loaded_view.set_zoom(2.0)
+    assert loaded_view.last_free_zoom == pytest.approx(2.0)
+
+    loaded_view.zoom_in()
+
+    assert loaded_view.last_free_zoom == pytest.approx(loaded_view.zoom)
+
+
+def test_fit_without_a_document_only_records_the_mode(view: PdfView) -> None:
+    """ドキュメントが無くてもモードだけは覚える。"""
+    view.fit_width()
+
+    assert view.zoom_mode is ZoomMode.FIT_WIDTH
+    assert view.zoom == pytest.approx(1.0)
+
+
+# ------------------------------------------------------------------ Ctrl+ホイール
+def send_wheel(
+    view: PdfView, position: QPointF, delta: int, modifiers: Qt.KeyboardModifier
+) -> None:
+    """ビューポートへホイールイベントを送る。"""
+    event = QWheelEvent(
+        position,
+        QPointF(view.viewport().mapToGlobal(position.toPoint())),
+        QPoint(0, 0),
+        QPoint(0, delta),
+        Qt.MouseButton.NoButton,
+        modifiers,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+    QApplication.sendEvent(view.viewport(), event)
+
+
+def test_ctrl_wheel_zooms_in(loaded_view: PdfView) -> None:
+    """Ctrl+ホイールで拡大する。"""
+    loaded_view.set_zoom(1.0)
+
+    send_wheel(loaded_view, QPointF(200.0, 300.0), 120, Qt.KeyboardModifier.ControlModifier)
+
+    assert loaded_view.zoom == pytest.approx(ZOOM_STEP)
+    assert loaded_view.zoom_mode is ZoomMode.FREE
+
+
+def test_ctrl_wheel_zooms_out(loaded_view: PdfView) -> None:
+    """逆回転では縮小する。"""
+    loaded_view.set_zoom(1.0)
+
+    send_wheel(loaded_view, QPointF(200.0, 300.0), -120, Qt.KeyboardModifier.ControlModifier)
+
+    assert loaded_view.zoom == pytest.approx(1.0 / ZOOM_STEP)
+
+
+def test_plain_wheel_scrolls_without_zooming(loaded_view: PdfView) -> None:
+    """修飾なしのホイールはスクロールだけ。"""
+    loaded_view.set_zoom(1.0)
+    before = loaded_view.verticalScrollBar().value()
+
+    send_wheel(loaded_view, QPointF(200.0, 300.0), -120, Qt.KeyboardModifier.NoModifier)
+
+    assert loaded_view.zoom == pytest.approx(1.0)
+    assert loaded_view.verticalScrollBar().value() > before
+
+
+def test_ctrl_wheel_keeps_the_point_under_the_cursor(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """カーソル直下の PDF 上の点が、ズームの前後でほぼ動かない。"""
+    layout = layout_of(controller)
+    loaded_view.verticalScrollBar().setValue(300)
+    position = QPointF(200.0, 250.0)
+
+    def under_cursor(zoom: float) -> QPointF:
+        content = position + loaded_view.content_viewport_rect().topLeft()
+        return layout.to_normalized(loaded_view.current_page, content, zoom)
+
+    before = under_cursor(loaded_view.zoom)
+
+    send_wheel(loaded_view, position, 120, Qt.KeyboardModifier.ControlModifier)
+
+    after = under_cursor(loaded_view.zoom)
+    assert after.x() == pytest.approx(before.x(), abs=0.01)
+    assert after.y() == pytest.approx(before.y(), abs=0.01)
+
+
+def test_ctrl_wheel_over_the_canvas_clamps_to_the_page(loaded_view: PdfView) -> None:
+    """カーソルがページの外なら、いちばん近いページの縁を留める。
+
+    ページ外の比率をそのまま使うと、1.0 を超える正規化座標になり、
+    拡大した瞬間に遠くへ飛んでしまう。
+    """
+    loaded_view.set_zoom(MIN_ZOOM)
+    rect = loaded_view.page_viewport_rect(0)
+    assert rect is not None
+    # 1ページ目の左下、ページの外のキャンバス上。
+    position = QPointF(5.0, rect.bottom() + 5.0)
+
+    send_wheel(loaded_view, position, 120, Qt.KeyboardModifier.ControlModifier)
+
+    after = loaded_view.page_viewport_rect(0)
+    assert after is not None
+    assert after.bottom() == pytest.approx(position.y(), abs=2)
+    assert 0 in loaded_view.visible_pages()
+
+
+def test_ctrl_wheel_requests_render_only_once(
+    loaded_view: PdfView, service: RecordingService
+) -> None:
+    """ホイール1回につきレンダリング要求は1回。"""
+    count = len(service.requests)
+
+    send_wheel(loaded_view, QPointF(200.0, 300.0), 120, Qt.KeyboardModifier.ControlModifier)
+
+    assert len(service.requests) == count + 1
+
+
+# ------------------------------------------------------------------ ページ移動
+def test_go_to_page_brings_the_page_to_the_top(loaded_view: PdfView) -> None:
+    """指定ページの上端付近がビューポート上端に来る。"""
+    loaded_view.go_to_page(1)
+
+    rect = loaded_view.page_viewport_rect(1)
+    assert rect is not None
+    assert rect.top() == pytest.approx(MARGIN, abs=1)
+    assert loaded_view.current_page == 1
+
+
+def test_go_to_page_updates_current_page_and_requests(
+    loaded_view: PdfView, service: RecordingService
+) -> None:
+    """移動後に現在ページ・通知・レンダリング要求が追随する。"""
+    emitted: list[int] = []
+    loaded_view.current_page_changed.connect(emitted.append)
+
+    loaded_view.go_to_page(2)
+
+    assert loaded_view.current_page == 2
+    assert emitted[-1] == 2
+    assert service.last_pages[0] == 2
+
+
+def test_go_to_page_clamps_out_of_range(loaded_view: PdfView) -> None:
+    """範囲外は先頭/末尾へ丸める。"""
+    loaded_view.go_to_page(99)
+    assert loaded_view.current_page == 2
+
+    loaded_view.go_to_page(-5)
+    assert loaded_view.current_page == 0
+
+
+def test_go_to_page_without_a_document_is_harmless(view: PdfView) -> None:
+    """ドキュメントが無ければ何もしない。"""
+    view.go_to_page(3)
+
+    assert view.current_page == NO_PAGE

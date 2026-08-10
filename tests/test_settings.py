@@ -29,6 +29,51 @@ def test_values_round_trip(settings: Settings) -> None:
     assert settings.last_directory == r"C:\books"
 
 
+def test_unset_zoom_returns_defaults(settings: Settings) -> None:
+    """倍率の設定が無ければ既定値。"""
+    assert settings.zoom_mode == "free"
+    assert settings.free_zoom == pytest.approx(1.0)
+
+
+def test_zoom_values_round_trip(settings: Settings) -> None:
+    """倍率モードと手動倍率を読み戻せる。"""
+    settings.zoom_mode = "fit_width"
+    settings.free_zoom = 1.75
+
+    assert settings.zoom_mode == "fit_width"
+    assert settings.free_zoom == pytest.approx(1.75)
+
+
+def test_zoom_values_persist_as_text(tmp_path: Path) -> None:
+    """INI に文字列として書かれても数値として読み戻せる。"""
+    ini = str(tmp_path / "settings.ini")
+    first = Settings(QSettings(ini, QSettings.Format.IniFormat))
+    first.free_zoom = 2.5
+    first.zoom_mode = "fit_page"
+    first.sync()
+
+    second = Settings(QSettings(ini, QSettings.Format.IniFormat))
+    assert second.free_zoom == pytest.approx(2.5)
+    assert second.zoom_mode == "fit_page"
+
+
+@pytest.mark.parametrize("stored", ["", "とても大きく", "0", "-3", "1e9", "nan"])
+def test_broken_free_zoom_falls_back(tmp_path: Path, stored: str) -> None:
+    """壊れた倍率が保存されていたら既定値へ落とす。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("view/free_zoom", stored)
+
+    assert Settings(backend).free_zoom == pytest.approx(1.0)
+
+
+def test_broken_zoom_mode_falls_back(tmp_path: Path) -> None:
+    """文字列でない倍率モードは既定値へ落とす。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("view/zoom_mode", QByteArray(b"\x00\x01"))
+
+    assert Settings(backend).zoom_mode == "free"
+
+
 def test_sync_failure_is_logged_but_not_raised(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

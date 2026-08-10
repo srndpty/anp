@@ -95,6 +95,32 @@ class PageLayout:
             size.height() * zoom,
         )
 
+    # -------------------------------------------------- フィット倍率
+    def fit_width_zoom(self, index: int, viewport_width: float) -> float:
+        """ページの幅がビューポート幅に収まる倍率。
+
+        余白はズームしないので、使える幅から先に差し引く。収まりようが
+        ない大きさのときは 0.0 を返し、下限への丸めは呼び出し側に任せる
+        （このクラスは表示倍率の許容範囲を知らない）。
+        """
+        available = viewport_width - self._metrics.margin * 2
+        width = self._page_sizes[index].width()
+        if available <= 0 or width <= 0:
+            return 0.0
+        return available / width
+
+    def fit_page_zoom(self, index: int, viewport_size: QSizeF) -> float:
+        """ページ全体がビューポートに収まる倍率。
+
+        縦横のうち厳しい方に合わせる。縦の余白もページの上下に1つずつ
+        入るため、幅と同じように差し引く。
+        """
+        available = viewport_size.height() - self._metrics.margin * 2
+        height = self._page_sizes[index].height()
+        if available <= 0 or height <= 0:
+            return 0.0
+        return min(self.fit_width_zoom(index, viewport_size.width()), available / height)
+
     # -------------------------------------------------- 可視範囲
     def visible_pages(self, viewport: QRectF, zoom: float) -> range:
         """viewport と縦方向に重なるページの範囲。
@@ -149,6 +175,17 @@ class PageLayout:
         return max(visible, key=lambda index: self._overlap(index, viewport, zoom))
 
     # -------------------------------------------------- 座標変換
+    def page_at(self, point: QPointF, zoom: float) -> int | None:
+        """コンテンツ座標の点が乗っているページ。余白や隙間の上なら None。"""
+        tops = self._tops(zoom)
+        index = bisect_right(tops, point.y()) - 1
+        if index < 0 or point.y() > self._page_bottom(index, zoom):
+            return None
+        rect = self.page_rect(index, zoom)
+        if not rect.left() <= point.x() <= rect.right():
+            return None
+        return index
+
     def to_normalized(self, index: int, point: QPointF, zoom: float) -> QPointF:
         """コンテンツ座標をページ内の正規化座標（0.0〜1.0）に変換する。
 
