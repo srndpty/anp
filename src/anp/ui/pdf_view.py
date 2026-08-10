@@ -6,12 +6,22 @@
 `PageLayout`、画像の生成とキャッシュは `PageRenderService` にあり、
 ここに写し取らない。`QPdfDocument` を直接レンダリングもしない。
 
-座標系は2つある。
+座標系は4つある。
 
-- **コンテンツ座標**: `PageLayout` が使う、文書全体を縦に並べた論理座標
-- **ビューポート座標**: いま画面に見えている領域の座標。`paintEvent` が使う
+- **ビューポート座標**: いま画面に見えている領域の論理座標。`paintEvent` と
+  マウスイベントが使う
+- **コンテンツ座標**: `PageLayout` が使う、文書全体を縦に並べた論理座標。
+  ビューポート座標との差はスクロール量だけ
+- **ページ内の正規化座標**: ページ左上を (0, 0)、右下を (1, 1) とする比率。
+  学習マークはこの座標で持つ
+- **レンダリング画像の物理ピクセル**: 論理サイズ × `devicePixelRatio`。
+  `PageRenderService` への要求サイズだけに使う
 
-変換は `content_viewport_rect()` と `page_viewport_rect()` に集約する。
+**オーバーレイの位置計算に物理ピクセルを混ぜない。** 学習マークの位置は
+上の3つの論理座標だけで決まり、DPR には依存しない。
+
+変換は `content_viewport_rect()` と `page_viewport_rect()`、
+`page_position_at()` と `viewport_point_for()` に集約する。
 スクロール量の足し引きを描画やイベント処理のあちこちに散らさない。
 
 Qt のスクロールバーは整数、レイアウトは浮動小数点なので、境界は
@@ -35,7 +45,9 @@ from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 from anp.pdf.color import PageColorMode, page_background_color
 from anp.pdf.layout import PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
+from anp.storage.study_mark import StudyMark, validate_position
 from anp.ui.appearance import CanvasTheme, canvas_color
+from anp.ui.study_marks import PagePosition, StudyMarkIndex, badge_path, draw_badge
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +173,7 @@ class PdfView(QAbstractScrollArea):
         self._last_free_zoom = 1.0
         self._current_page = NO_PAGE
         self._canvas_theme = CanvasTheme.DARK_GRAY
+        self._study_marks = StudyMarkIndex()
 
         # 可動域と位置をまとめて更新している間だけ立てる。`_quiet_scrollbars()` を参照。
         self._scroll_updates_suppressed = False
@@ -182,6 +195,11 @@ class PdfView(QAbstractScrollArea):
         表示倍率は現在の `ZoomMode` を新しいドキュメントに適用し直す。
         フィット系なら1ページ目に対して計算し直し、FREE なら手動で
         指定された倍率をそのまま引き継ぐ。
+
+        **学習マークは即座に捨てる。** ビューは表示中の PDF と学習マークの
+        対応を確かめる手立てを持たない（識別子は呼び出し側が持つ）ので、
+        残しておくと別の PDF の同じページ番号へ古いマークを描いてしまう。
+        新しいドキュメントの分は呼び出し側が `set_study_marks()` で入れ直す。
         """
         if len(page_sizes) != document.pageCount():
             msg = (
@@ -198,6 +216,7 @@ class PdfView(QAbstractScrollArea):
         # 新しいレイアウトで描いたページに古い PDF の画像が仮表示として乗る。
         self._render.set_document(document)
         self._layout = layout
+        self._study_marks = StudyMarkIndex()
 
         before = self._zoom
         self._zoom = self._resolved_zoom(0)
@@ -214,8 +233,9 @@ class PdfView(QAbstractScrollArea):
             self.zoom_changed.emit()
 
     def clear_document(self) -> None:
-        """表示を空にする。"""
+        """表示を空にする。学習マークも一緒に捨てる。"""
         self._layout = None
+        self._study_marks = StudyMarkIndex()
         self._render.reset()
         with self._quiet_scrollbars():
             self._update_scrollbars()
@@ -505,6 +525,45 @@ class PdfView(QAbstractScrollArea):
             return None
         return self._layout.page_rect(index, self._zoom).translated(-self._scroll_offset())
 
+    def page_position_at(self, viewport_pos: QPointF) -> PagePosition | None:
+        """ビューポート上の点が乗っているページと、そのページ内の正規化座標。
+
+        **ページの上でなければ `None`。** 余白・ページ間の隙間・文書の
+        上下いずれも `None` になる。いちばん近いページへ吸着させたり、
+        0.0〜1.0 へ丸めたりはしない。ページ外を押したときに「何もしない」
+        と決められるのは、ここが丸めないからこそ。
+
+        戻り値はそのまま `StudyMark` の座標として使える契約
+        （`page_index >= 0`、`x_norm` と `y_norm` は 0.0〜1.0）。
+        """
+        if self._layout is None:
+            return None
+        content = viewport_pos + self._scroll_offset()
+        page = self._layout.page_at(content, self._zoom)
+        if page is None:
+            return None
+        normalized = self._layout.to_normalized(page, content, self._zoom)
+        return PagePosition(page_index=page, x_norm=normalized.x(), y_norm=normalized.y())
+
+    def viewport_point_for(self, page_index: int, x_norm: float, y_norm: float) -> QPointF | None:
+        """ページ内の正規化座標に対応するビューポート上の点。
+
+        `page_position_at()` の逆変換。ビューポートの外に出る点も、そのまま
+        返す（見えているかどうかは呼び出し側の判断）。
+
+        **契約外の値は黙って丸めずに失敗させる。** 判定は P3-1 の
+        `validate_position()` をそのまま使い、UI 側に別の基準を作らない。
+
+        いま開いているドキュメントに存在しないページ番号は `None`。
+        保存済みのマークがページ数の減った PDF を指していても落ちない
+        （最終ページへ丸めたりはしない）。
+        """
+        validate_position(page_index, x_norm, y_norm)
+        if self._layout is None or page_index >= self._layout.page_count:
+            return None
+        content = self._layout.from_normalized(page_index, QPointF(x_norm, y_norm), self._zoom)
+        return content - self._scroll_offset()
+
     def visible_pages(self) -> range:
         """いま見えているページの範囲。描画対象はここに限る。"""
         if self._layout is None:
@@ -527,6 +586,56 @@ class PdfView(QAbstractScrollArea):
         if content_width < viewport_width:
             return QPointF(-(viewport_width - content_width) / 2, y)
         return QPointF(float(self.horizontalScrollBar().value()), y)
+
+    # -------------------------------------------------- 学習マーク
+    @property
+    def study_marks(self) -> tuple[StudyMark, ...]:
+        """表示中の学習マーク（`id` 昇順）。
+
+        現在のドキュメントに存在しないページを指すマークもここには含まれる。
+        描画とヒットテストの対象から外すだけで、預かったものを捨てはしない。
+        """
+        return self._study_marks.marks
+
+    def set_study_marks(self, marks: Sequence[StudyMark]) -> None:
+        """描画する学習マークを差し替える。
+
+        ビューは **読み取り専用のコレクションだけ** を受け取る。SQLite も
+        `StudyMarkRepository` も知らない。どのマークを渡すかは呼び出し側
+        （将来のコントローラ）が決める。
+
+        渡されたコレクションは写し取るので、呼び出し側が後から中身を
+        変えても表示は動かない。
+
+        起きるのは再描画だけ。PDF のレンダリング要求も色変換も世代の更新も
+        起こさない。倍率・スクロール位置・現在ページも触らない。
+        """
+        self._study_marks = StudyMarkIndex(marks)
+        self.viewport().update()
+
+    def study_marks_at(self, viewport_pos: QPointF) -> list[StudyMark]:
+        """その点に描かれている学習マーク。上に描かれているものから並べる。
+
+        **バッジの形の中だけがヒット。** 近くにあるだけのマークは返さない。
+        判定に使う形は描画とまったく同じ `badge_path()`。
+
+        同じ場所に複数のマークがあってもまとめない。並びは描画順の逆
+        （`id` 降順）で決定的。
+
+        対象は描かれているマーク、つまり見えているページの分だけ。
+        `page_position_at()` とは別の API のままにしてあるのは、「マークを
+        押した」と「空いている場所を押した」が別の操作になるため。
+        """
+        hits: list[StudyMark] = []
+        for index in self.visible_pages():
+            for mark in self._study_marks.for_page(index):
+                anchor = self.viewport_point_for(index, mark.x_norm, mark.y_norm)
+                if anchor is not None and badge_path(anchor, mark.mistake_count).contains(
+                    viewport_pos
+                ):
+                    hits.append(mark)
+        hits.reverse()
+        return hits
 
     # -------------------------------------------------- スクロールバー
     def _update_scrollbars(self) -> None:
@@ -626,20 +735,34 @@ class PdfView(QAbstractScrollArea):
 
     # -------------------------------------------------- 描画
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 (Qt の命名規則)
-        """見えているページだけを描く。"""
+        """見えているページだけを描く。
+
+        重ね順は キャンバス → ページ下地 → ページ画像 → 学習マーク。
+        学習マークは **ページ画像より後** に描く。ページを1枚ずつ
+        「画像 → マーク」と描くのではなくオーバーレイを別の周回にするのは、
+        ページの端にあるバッジが次のページの下地で消されないようにするため。
+
+        ここで行うのは軽いベクタ描画だけ。画素変換もレンダリング要求も
+        待ち合わせもしない（P2 からの契約）。
+        """
         painter = QPainter(self.viewport())
         try:
             painter.fillRect(event.rect(), canvas_color(self._canvas_theme))
             if self._layout is None:
                 return
 
+            pages = self.visible_pages()
+
             # 目的の解像度が揃うまで別解像度の画像を拡大縮小して描くので、
             # 補間を有効にする。paintEvent 内で画像を作り直さないため、
             # QImage.scaled() は使わない。
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             painter.setPen(_PAGE_BORDER_COLOR)
-            for index in self.visible_pages():
+            for index in pages:
                 self._paint_page(painter, index)
+
+            for index in pages:
+                self._paint_study_marks(painter, index)
         finally:
             painter.end()
 
@@ -661,6 +784,21 @@ class PdfView(QAbstractScrollArea):
             painter.drawImage(rect, image)
 
         painter.drawRect(rect)
+
+    def _paint_study_marks(self, painter: QPainter, index: int) -> None:
+        """1ページ分の学習マークを描く。
+
+        引くのはそのページの索引だけなので、マークが何千件あっても
+        描画で全件を走査しない。
+
+        バッジはページの色変換（Invert / Smart Dark）を通さない。
+        オーバーレイはページ画像の外側にあり、`DisplayCache` にも入らない。
+        """
+        for mark in self._study_marks.for_page(index):
+            anchor = self.viewport_point_for(index, mark.x_norm, mark.y_norm)
+            if anchor is None:
+                continue
+            draw_badge(painter, anchor, mark.mistake_count)
 
     def _on_page_ready(self, page_index: int) -> None:
         """レンダリングが終わったページの領域だけ描き直す。"""
