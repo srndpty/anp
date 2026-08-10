@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -19,15 +20,19 @@ from PySide6.QtPdf import QPdfDocumentRenderOptions
 from pytestqt.qtbot import QtBot
 
 from anp.pdf import render as render_module
-from anp.pdf.cache import RenderCache, RenderKey
+from anp.pdf.cache import DisplayKey, RenderCache, RenderKey
 from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController
 from anp.pdf.render import (
     DEFAULT_MAX_RENDER_BYTES,
+    DEFAULT_MAX_TRANSFORM_INFLIGHT,
     PageRenderService,
     PageRequest,
+    _TransformJob,
+    _TransformResult,
     clamp_render_size,
 )
+from helpers import ManualTransforms
 
 A4_AT_72DPI = QSize(595, 842)
 
@@ -47,6 +52,12 @@ def service(controller: DocumentController) -> PageRenderService:
     service = PageRenderService(RenderCache(), debounce_ms=50)
     service.set_document(controller.document)
     return service
+
+
+@pytest.fixture
+def transforms(service: PageRenderService) -> ManualTransforms:
+    """色変換のワーカーを捕捉して、テストが手で完了させる。"""
+    return ManualTransforms(service)
 
 
 @pytest.fixture
@@ -536,25 +547,33 @@ def test_original_returns_the_raw_image(service: PageRenderService) -> None:
     assert len(service.display_cache) == 0
 
 
-def test_invert_transforms_the_page_image(service: PageRenderService) -> None:
+def test_invert_transforms_the_page_image(
+    service: PageRenderService, transforms: ManualTransforms
+) -> None:
     """Invert では反転した画像を返す。"""
     render_page(service)
 
     service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete_all()
 
     image = service.image_for(0, A4_AT_72DPI, 1.0)
     assert image is not None
     assert rgba(image) == BLACK
 
 
-def test_the_raw_image_does_not_depend_on_the_color_mode(service: PageRenderService) -> None:
+def test_the_raw_image_does_not_depend_on_the_color_mode(
+    service: PageRenderService, transforms: ManualTransforms
+) -> None:
     """raw 画像は色変換の影響を受けない。
 
     その場で反転すると、Original へ戻したときに反転済みの絵が残る。
+    ワーカーへ渡すのも暗黙共有の参照なので、変換で入力が書き換わっては
+    いけない点は同じ。
     """
     render_page(service)
 
     service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete_all()
     assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
 
     raw = service.raw_image_for(0, A4_AT_72DPI, 1.0)
@@ -574,7 +593,9 @@ def test_changing_the_mode_keeps_the_raw_cache(service: PageRenderService) -> No
     assert service.raw_image_for(0, A4_AT_72DPI, 1.0) is not None
 
 
-def test_changing_the_mode_does_not_request_a_new_render(service: PageRenderService) -> None:
+def test_changing_the_mode_does_not_request_a_new_render(
+    service: PageRenderService, transforms: ManualTransforms
+) -> None:
     """モードを変えても `QPdfPageRenderer` へ要求し直さない。
 
     往復しても、レンダリング待ちの白紙には戻らない。
@@ -584,6 +605,7 @@ def test_changing_the_mode_does_not_request_a_new_render(service: PageRenderServ
 
     for mode in (PageColorMode.INVERT, PageColorMode.ORIGINAL, PageColorMode.INVERT):
         service.set_color_mode(mode)
+        transforms.complete_all()
         service.flush()
 
     assert service.outstanding_count == 0
@@ -591,10 +613,13 @@ def test_changing_the_mode_does_not_request_a_new_render(service: PageRenderServ
     assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
 
 
-def test_going_back_to_original_restores_the_original_pixels(service: PageRenderService) -> None:
+def test_going_back_to_original_restores_the_original_pixels(
+    service: PageRenderService, transforms: ManualTransforms
+) -> None:
     """Invert から Original へ戻すと元の画素に戻る。"""
     render_page(service)
     service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete_all()
     assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
 
     service.set_color_mode(PageColorMode.ORIGINAL)
@@ -604,82 +629,90 @@ def test_going_back_to_original_restores_the_original_pixels(service: PageRender
     assert rgba(image) == (255, 255, 255, 255)
 
 
-def test_the_display_image_is_prepared_before_it_is_asked_for(
-    service: PageRenderService, monkeypatch: pytest.MonkeyPatch
+def test_the_display_image_is_not_transformed_on_lookup(
+    service: PageRenderService, transforms: ManualTransforms, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """変換はモードを変えた時点で済ませ、取得時には行わない。
+    """引き当てでは変換しない。
 
     `image_for()` は `paintEvent` から呼ばれる。ここで変換すると、
     描画経路に画素処理が入り込む。
     """
     render_page(service)
-    calls = count_transforms(monkeypatch)
-
     service.set_color_mode(PageColorMode.INVERT)
-    assert calls == [PageColorMode.INVERT], "モード変更の時点で用意されていない"
+    transforms.complete_all()
+    calls = count_transforms(monkeypatch)
 
     for _ in range(5):
         assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
+        assert service.placeholder_for(0, A4_AT_72DPI) is not None
 
-    assert calls == [PageColorMode.INVERT], "取得のたびに変換している"
+    assert calls == [], "取得のたびに変換している"
 
 
-def test_the_display_image_is_prepared_when_the_render_completes(
-    service: PageRenderService, monkeypatch: pytest.MonkeyPatch
+def test_the_transform_is_submitted_when_the_render_completes(
+    service: PageRenderService, transforms: ManualTransforms
 ) -> None:
-    """レンダリングが終わった時点で表示用画像も用意しておく。"""
+    """レンダリングが終わった時点で変換をワーカーへ投入する。"""
     service.set_color_mode(PageColorMode.INVERT)
-    calls = count_transforms(monkeypatch)
 
     render_page(service)
 
-    assert calls == [PageColorMode.INVERT]
+    assert len(transforms.submitted) == 1
+    transforms.complete_all()
     image = service.image_for(0, A4_AT_72DPI, 1.0)
     assert image is not None
     assert rgba(image) == BLACK
 
 
-def test_the_display_image_is_prepared_when_the_pages_change(
-    service: PageRenderService, monkeypatch: pytest.MonkeyPatch
+def test_no_new_transform_when_the_pages_change_but_the_images_are_ready(
+    service: PageRenderService, transforms: ManualTransforms
 ) -> None:
-    """必要なページの集合が変わったときにも用意し直す。
+    """必要なページの集合が変わっても、用意済みなら変換し直さない。
 
-    仮表示に使う別解像度の分も含める。倍率を変えた直後、目的の解像度が
-    届くまでのあいだも変換済みの絵を描けるようにするため。
+    倍率を上げて目的の解像度がまだ無い場合は、仮表示に使う別解像度の
+    変換済み画像をそのまま使う。
     """
     render_page(service, size=QSize(297, 421))
     service.set_color_mode(PageColorMode.INVERT)
-    calls = count_transforms(monkeypatch)
+    transforms.complete_all()
+    submitted = len(transforms.submitted)
 
     # 倍率が上がって、まだ無い解像度が必要になった。
     service.request_pages([PageRequest(page_index=0, size_px=QSize(1190, 1684), dpr=1.0)])
 
-    assert calls == []  # 既に用意済みの仮表示を使い回すので、変換は起きない
+    assert len(transforms.submitted) == submitted
     assert service.placeholder_for(0, QSize(1190, 1684)) is not None
 
 
-def test_returning_to_a_mode_transforms_again(
-    service: PageRenderService, monkeypatch: pytest.MonkeyPatch
+def test_returning_to_a_mode_reuses_the_cached_display_image(
+    service: PageRenderService, transforms: ManualTransforms
 ) -> None:
-    """モードを戻すと、表示用画像は作り直す（raw は作り直さない）。
+    """モードを戻したら、残っている変換済み画像をそのまま使う。
 
-    使えない画像でメモリを占めないよう、切り替え時に表示用は捨てる。
+    `DisplayKey` がモードを含むので、別モードの画像を残しておいても誤って
+    引き当てられることはない。残しておけば Invert ⇄ Original の往復で
+    変換をやり直さずに済む。Smart Dark ではここが効いてくる。
     """
     render_page(service)
-    calls = count_transforms(monkeypatch)
-
     service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete_all()
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    submitted = len(transforms.submitted)
+
     service.set_color_mode(PageColorMode.ORIGINAL)
     service.set_color_mode(PageColorMode.INVERT)
 
-    assert calls == [PageColorMode.INVERT, PageColorMode.INVERT]
-    assert len(service._cache) == 1  # noqa: SLF001
+    assert len(transforms.submitted) == submitted, "残っている画像があるのに変換し直している"
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is image
 
 
-def test_setting_the_same_mode_keeps_the_display_cache(service: PageRenderService) -> None:
+def test_setting_the_same_mode_keeps_the_display_cache(
+    service: PageRenderService, transforms: ManualTransforms
+) -> None:
     """同じモードを選び直しても表示用画像は捨てない（連打で作り直さない）。"""
     render_page(service)
     service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete_all()
     image = service.image_for(0, A4_AT_72DPI, 1.0)
 
     service.set_color_mode(PageColorMode.INVERT)
@@ -687,13 +720,16 @@ def test_setting_the_same_mode_keeps_the_display_cache(service: PageRenderServic
     assert service.image_for(0, A4_AT_72DPI, 1.0) is image
 
 
-def test_the_placeholder_is_transformed_too(service: PageRenderService) -> None:
+def test_the_placeholder_is_transformed_too(
+    service: PageRenderService, transforms: ManualTransforms
+) -> None:
     """仮表示も現在のモードで変換して返す。
 
     変換前の絵を先に見せると、切り替えた瞬間に元の色が一瞬見える。
     """
     render_page(service, size=QSize(297, 421))
     service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete_all()
 
     placeholder = service.placeholder_for(0, QSize(1190, 1684))
 
@@ -706,6 +742,7 @@ def test_the_display_cache_is_bounded() -> None:
     """表示用キャッシュにも上限があり、超えた分は追い出される。"""
     image_bytes = QImage(595, 842, QImage.Format.Format_ARGB32).sizeInBytes()
     service = PageRenderService(RenderCache(), display_max_bytes=image_bytes * 2)
+    transforms = ManualTransforms(service)
     service.set_color_mode(PageColorMode.INVERT)
     for page in range(4):
         service._cache.put(  # noqa: SLF001
@@ -713,6 +750,7 @@ def test_the_display_cache_is_bounded() -> None:
         )
 
     service.request_pages(requests_for(range(0, 4)))
+    transforms.complete_all()
 
     assert service.display_cache.total_bytes <= service.display_cache.max_bytes
     assert len(service.display_cache) == 2
@@ -721,10 +759,13 @@ def test_the_display_cache_is_bounded() -> None:
     assert service.image_for(0, A4_AT_72DPI, 1.0) is None
 
 
-def test_reset_drops_the_display_images_too(service: PageRenderService) -> None:
+def test_reset_drops_the_display_images_too(
+    service: PageRenderService, transforms: ManualTransforms
+) -> None:
     """ドキュメントを入れ替えると、raw も表示用も前の PDF の画像が残らない。"""
     render_page(service)
     service.set_color_mode(PageColorMode.INVERT)
+    transforms.complete_all()
     assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
 
     service.reset()
@@ -771,3 +812,544 @@ def test_the_render_size_fits_both_caches() -> None:
     key = service._key_for(0, QSize(4000, 5000), 1.0)  # noqa: SLF001
 
     assert key.width_px * key.height_px * 4 <= 2 * 1024 * 1024
+
+
+# ------------------------------------------------------------------ 色変換の非同期実行
+# ここから下は「変換を GUI スレッドから追い出した」ことそのものの検証。
+# ワーカーの完了は `ManualTransforms` で手動で起こすので、sleep も
+# タイミング頼みの待ち合わせも使わない。
+
+
+def seeded_service(
+    pages: range = range(0, 4),
+    *,
+    max_transform_inflight: int = DEFAULT_MAX_TRANSFORM_INFLIGHT,
+    argb: int = WHITE,
+) -> PageRenderService:
+    """raw 画像を直接仕込んだ、ドキュメント未設定のサービス。
+
+    ドキュメントを持たないので `flush()` は何も要求しない。本物の
+    レンダリングが途中で完了して仕込みを上書きすることがなくなる。
+    """
+    service = PageRenderService(RenderCache(), max_transform_inflight=max_transform_inflight)
+    for page in pages:
+        image = QImage(595, 842, QImage.Format.Format_ARGB32)
+        image.fill(argb)
+        service._cache.put(RenderKey(page, 595, 842, 1.0), image)  # noqa: SLF001
+    return service
+
+
+def display_keys(service: PageRenderService) -> set[DisplayKey]:
+    """表示用キャッシュに入っている鍵。"""
+    return set(service._display_cache._entries)  # noqa: SLF001
+
+
+# ------------------------------------------------------------------ 非同期の基本
+def test_the_transform_does_not_run_while_requesting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """要求の呼び出しの中で変換が同期実行されない。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    calls = count_transforms(monkeypatch)
+
+    service.request_pages(requests_for(range(0, 1)))
+
+    assert calls == [], "GUI スレッドで変換している"
+    assert len(transforms.submitted) == 1
+
+
+def test_the_display_image_is_missing_until_the_worker_finishes() -> None:
+    """ワーカーが終わるまで表示用画像は引き当てられない。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+
+    service.request_pages(requests_for(range(0, 1)))
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+    assert len(service.display_cache) == 0
+    assert transforms.pending
+
+
+def test_the_display_image_lands_in_the_cache_after_the_worker_finishes() -> None:
+    """ワーカーが終わったら表示用キャッシュに入る。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+
+    transforms.complete_all()
+
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == BLACK
+
+
+def test_page_ready_is_emitted_when_the_worker_finishes() -> None:
+    """変換が終わったら `page_ready` で知らせる。まだの間は黙っている。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    service.request_pages(requests_for(range(0, 1)))
+    assert ready == [], "変換が終わる前に通知している"
+
+    transforms.complete_all()
+
+    assert ready == [0]
+
+
+def test_lookups_do_not_wait_for_the_worker() -> None:
+    """引き当ては即座に返る。ワーカーの完了を待たない。
+
+    待つ実装なら、`pending` が残ったままここへ来た時点で戻ってこない。
+    """
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+    assert service.placeholder_for(0, A4_AT_72DPI) is None
+    assert transforms.pending, "テストの前提が崩れている（変換が既に終わっている）"
+
+
+def test_the_real_worker_produces_the_display_image(qtbot: QtBot) -> None:
+    """本物のワーカーでも、結果が GUI スレッドへ戻ってキャッシュに入る。
+
+    手動の完了に差し替えたテストだけでは、スレッドをまたぐ経路
+    （`QThreadPool` と queued connection）が動くことを確かめられない。
+    """
+    service = seeded_service(range(0, 1))
+    service.set_color_mode(PageColorMode.INVERT)
+
+    with qtbot.waitSignal(service.page_ready, timeout=10_000) as blocker:
+        service.request_pages(requests_for(range(0, 1)))
+
+    assert blocker.args == [0]
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == BLACK
+    assert service.transform_inflight_count == 0
+
+
+# ------------------------------------------------------------------ 重複の抑止
+def test_the_same_display_key_is_submitted_once() -> None:
+    """同じ `DisplayKey` を何度要求してもワーカーは1つだけ。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+
+    for _ in range(5):
+        service.request_pages(requests_for(range(0, 1)))
+
+    assert len(transforms.submitted) == 1
+    assert service.transform_inflight_count == 1
+
+
+def test_the_same_render_key_in_another_mode_is_another_job() -> None:
+    """同じ `RenderKey` でもモードが違えば別の変換。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    transforms.complete_all()
+
+    # ORIGINAL は変換が要らないので、増えるのは Invert の1件だけ。
+    service.set_color_mode(PageColorMode.ORIGINAL)
+    service.request_pages(requests_for(range(0, 1)))
+
+    keys = {job.display_key for job in transforms.submitted}
+    assert keys == {
+        DisplayKey(render_key=RenderKey(0, 595, 842, 1.0), color_mode=PageColorMode.INVERT)
+    }
+
+
+def test_a_completed_transform_is_not_submitted_again() -> None:
+    """出来上がった分を、要求のたびに作り直さない。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    transforms.complete_all()
+
+    for _ in range(5):
+        service.request_pages(requests_for(range(0, 1)))
+
+    assert len(transforms.submitted) == 1
+
+
+# ------------------------------------------------------------------ 投入量の上限
+def test_transforms_in_flight_are_capped() -> None:
+    """大量に要求されても、ワーカーで走るのは上限まで。"""
+    service = seeded_service(range(0, 4), max_transform_inflight=2)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+
+    service.request_pages(requests_for(range(0, 4)))
+
+    assert service.transform_inflight_count == 2
+    assert len(transforms.submitted) == 2
+
+
+def test_completing_one_transform_starts_one_more() -> None:
+    """1件終わったら、次の1件だけを投入する。"""
+    service = seeded_service(range(0, 4), max_transform_inflight=2)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 4)))
+
+    transforms.complete(transforms.pending[0])
+
+    assert service.transform_inflight_count == 2
+    assert len(transforms.submitted) == 3
+
+
+def test_the_transforms_follow_the_requested_priority() -> None:
+    """要求された順（現在ページ → 他の可視ページ → 先読み）に投入する。"""
+    service = seeded_service(range(0, 4), max_transform_inflight=1)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+
+    service.request_pages(requests_for(range(0, 4)))
+    pages = [transforms.submitted[0].display_key.render_key.page_index]
+    for _ in range(3):
+        transforms.complete(transforms.pending[0])
+        pages.append(transforms.submitted[-1].display_key.render_key.page_index)
+
+    assert pages == [0, 1, 2, 3]
+
+
+def test_fast_scrolling_does_not_queue_every_page() -> None:
+    """必要なページが次々変わっても、待ち行列は作らない。
+
+    投入前の古い要求は捨ててよい。ワーカーで走っている分だけが残る。
+    """
+    service = seeded_service(range(0, 4), max_transform_inflight=2)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+
+    for start in range(0, 4):
+        service.request_pages(requests_for(range(start, start + 1)))
+        assert service.transform_inflight_count <= 2
+
+    # 走っているのは最初に投入した2件だけ。残りは投入されずに消えた。
+    assert len(transforms.submitted) == 2
+    assert len(transforms.pending) == 2
+
+
+def test_the_display_budget_does_not_cause_endless_retransforms() -> None:
+    """予算に収まらない集合を要求されても、変換を延々と繰り返さない。
+
+    「完了 → 追い出し → 再投入」が回り続けると、CPU を食い続けたうえに
+    どのページも安定して表示できない。
+    """
+    image_bytes = QImage(595, 842, QImage.Format.Format_ARGB32).sizeInBytes()
+    service = PageRenderService(RenderCache(), display_max_bytes=image_bytes * 2)
+    transforms = ManualTransforms(service)
+    for page in range(4):
+        service._cache.put(  # noqa: SLF001
+            RenderKey(page, 595, 842, 1.0), QImage(595, 842, QImage.Format.Format_ARGB32)
+        )
+    service.set_color_mode(PageColorMode.INVERT)
+
+    service.request_pages(requests_for(range(0, 4)))
+    transforms.complete_all()
+
+    assert len(transforms.submitted) == 4, "同じ集合に対して変換をやり直している"
+    assert service.transform_inflight_count == 0
+
+
+# ------------------------------------------------------------------ 世代
+def test_a_stale_transform_does_not_reach_the_cache() -> None:
+    """前のドキュメントの変換結果は、新しいドキュメントのキャッシュに入らない。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    stale = transforms.pending[0]
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    # 別の PDF を開いた後で、前の変換が終わる。
+    service.reset()
+    transforms.complete(stale)
+
+    assert len(service.display_cache) == 0
+    assert ready == []
+    assert service.transform_inflight_count == 0
+
+
+def test_a_stale_transform_frees_its_slot() -> None:
+    """世代の合わない結果でも枠は解放される（台帳が詰まらない）。"""
+    service = seeded_service(range(0, 1), max_transform_inflight=1)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    stale = transforms.pending[0]
+
+    service.reset()
+    service._cache.put(  # noqa: SLF001
+        RenderKey(0, 595, 842, 1.0), QImage(595, 842, QImage.Format.Format_ARGB32)
+    )
+    service.request_pages(requests_for(range(0, 1)))
+    # 同じ鍵の古い変換が走っているので、二重には投入しない。
+    assert len(transforms.submitted) == 1
+
+    transforms.complete(stale)
+
+    # 枠が空いたので、新しい世代の分が改めて投入されている。
+    assert len(transforms.submitted) == 2
+    assert transforms.submitted[-1].generation == service.generation
+
+
+def test_switching_documents_back_and_forth_keeps_generations_apart() -> None:
+    """A → B → A と切り替えても、A の古い結果を新しい A として受け入れない。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    from_first_a = transforms.pending[0]
+
+    service.reset()  # B へ
+    service.reset()  # A へ戻る（同じパスでも世代は別）
+    service._cache.put(  # noqa: SLF001
+        RenderKey(0, 595, 842, 1.0), QImage(595, 842, QImage.Format.Format_ARGB32)
+    )
+    transforms.complete(from_first_a)
+
+    assert len(service.display_cache) == 0
+
+
+# ------------------------------------------------------------------ モードの競合
+def test_an_old_mode_result_is_not_shown_as_the_current_mode() -> None:
+    """モードを戻した後に届いた旧モードの結果で、いまの表示を上書きしない。"""
+    service = seeded_service(range(0, 1), argb=WHITE)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    pending = transforms.pending[0]
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    service.set_color_mode(PageColorMode.ORIGINAL)
+    transforms.complete(pending)
+
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == (255, 255, 255, 255), "Original の表示が Invert の結果で上書きされた"
+    assert ready == [], "旧モードの結果で再描画を促している"
+
+
+def test_an_old_mode_result_is_still_cached() -> None:
+    """旧モードの結果もキャッシュには残す。戻したときに作り直さずに済む。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    pending = transforms.pending[0]
+    service.set_color_mode(PageColorMode.ORIGINAL)
+
+    transforms.complete(pending)
+
+    invert_key = DisplayKey(render_key=RenderKey(0, 595, 842, 1.0), color_mode=PageColorMode.INVERT)
+    assert display_keys(service) == {invert_key}
+    # 戻すと、作り直さずにそのまま使える。
+    service.set_color_mode(PageColorMode.INVERT)
+    assert len(transforms.submitted) == 1
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == BLACK
+
+
+def test_rapid_mode_switching_does_not_duplicate_jobs() -> None:
+    """モードを連打しても変換が増殖しない。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.request_pages(requests_for(range(0, 1)))
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    for mode in (PageColorMode.INVERT, PageColorMode.ORIGINAL) * 4:
+        service.set_color_mode(mode)
+
+    assert len(transforms.submitted) == 1, "連打の回数だけワーカーを起こしている"
+
+    # 最後は ORIGINAL。Invert の結果が届いても表示にも通知にも使わない。
+    transforms.complete_all()
+    assert ready == []
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == (255, 255, 255, 255)
+
+
+def test_rapid_mode_switching_ending_on_invert_shows_the_inverted_image() -> None:
+    """連打の末に Invert で止まれば、届いた結果はそのまま表示に使える。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.request_pages(requests_for(range(0, 1)))
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    for mode in (PageColorMode.INVERT, PageColorMode.ORIGINAL) * 3:
+        service.set_color_mode(mode)
+    service.set_color_mode(PageColorMode.INVERT)
+
+    transforms.complete_all()
+
+    assert ready == [0]
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == BLACK
+
+
+# ------------------------------------------------------------------ 仮表示
+def test_no_placeholder_while_the_transform_is_pending() -> None:
+    """現在のモードの画像が1枚も無ければ、仮表示も返さない。
+
+    ここで raw を返すとビューが明るい元の絵を一瞬描いてしまう。返さなければ
+    ビューは `PageColorMode` 由来のページ下地（Invert なら黒）を描く。
+    """
+    service = seeded_service(range(0, 1))
+    ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+
+    service.request_pages(requests_for(range(0, 1)))
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+    assert service.placeholder_for(0, QSize(1190, 1684)) is None
+
+
+def test_the_nearest_current_mode_image_is_used_as_a_placeholder() -> None:
+    """現在のモードの別解像度があれば、それを仮表示に使う。"""
+    service = seeded_service(range(0, 0))
+    transforms = ManualTransforms(service)
+    small = QImage(297, 421, QImage.Format.Format_ARGB32)
+    small.fill(WHITE)
+    service._cache.put(RenderKey(0, 297, 421, 1.0), small)  # noqa: SLF001
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(297, 421), dpr=1.0)])
+    transforms.complete_all()
+
+    # 倍率が上がり、目的の解像度はまだ無い。
+    placeholder = service.placeholder_for(0, QSize(1190, 1684))
+
+    assert placeholder is not None
+    assert placeholder.width() == 297
+    assert rgba(placeholder) == BLACK
+
+
+def test_the_placeholder_ignores_resolutions_that_are_not_transformed_yet() -> None:
+    """変換がまだの解像度に引っ張られて仮表示を諦めない。
+
+    raw の中からいちばん近い解像度を選ぶと、そこが未変換だった時点で
+    「仮表示なし」になってしまう。変換済みの中から選ぶ。
+    """
+    service = seeded_service(range(0, 0))
+    transforms = ManualTransforms(service)
+    for width, height in ((297, 421), (1190, 1684)):
+        image = QImage(width, height, QImage.Format.Format_ARGB32)
+        image.fill(WHITE)
+        service._cache.put(RenderKey(0, width, height, 1.0), image)  # noqa: SLF001
+    service.set_color_mode(PageColorMode.INVERT)
+
+    # 小さい方だけ変換が終わっている状態を作る。
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(297, 421), dpr=1.0)])
+    transforms.complete_all()
+
+    placeholder = service.placeholder_for(0, QSize(1190, 1684))
+
+    assert placeholder is not None
+    assert placeholder.width() == 297
+    assert rgba(placeholder) == BLACK
+
+
+def test_original_uses_the_raw_image_as_a_placeholder() -> None:
+    """Original は変換が要らないので、従来どおり raw を仮表示に使う。"""
+    service = seeded_service(range(0, 0))
+    small = QImage(297, 421, QImage.Format.Format_ARGB32)
+    small.fill(WHITE)
+    service._cache.put(RenderKey(0, 297, 421, 1.0), small)  # noqa: SLF001
+
+    placeholder = service.placeholder_for(0, QSize(1190, 1684))
+
+    assert placeholder is not None
+    assert placeholder.width() == 297
+
+
+# ------------------------------------------------------------------ 失敗
+def test_a_failed_transform_is_not_cached() -> None:
+    """変換に失敗した画像はキャッシュにも通知にも出さない。"""
+    service = seeded_service(range(0, 1))
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    ready: list[int] = []
+    service.page_ready.connect(ready.append)
+
+    transforms.fail(transforms.pending[0])
+
+    assert len(service.display_cache) == 0
+    assert ready == []
+
+
+def test_a_failed_transform_frees_the_slot() -> None:
+    """変換に失敗しても台帳が詰まらず、次の分が進む。"""
+    service = seeded_service(range(0, 2), max_transform_inflight=1)
+    transforms = ManualTransforms(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 2)))
+    assert len(transforms.submitted) == 1
+
+    transforms.fail(transforms.pending[0])
+
+    assert service.transform_inflight_count == 1
+    assert len(transforms.submitted) == 2
+    assert transforms.submitted[-1].display_key.render_key.page_index == 1
+
+
+def test_an_exception_in_the_worker_does_not_escape(
+    qtbot: QtBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ワーカーの中で例外が出ても、アプリを巻き込まず枠が解放される。"""
+
+    def exploding(image: QImage, mode: PageColorMode) -> QImage:
+        msg = "boom"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(render_module, "transform_page", exploding)
+    service = seeded_service(range(0, 1))
+    service.set_color_mode(PageColorMode.INVERT)
+
+    service.request_pages(requests_for(range(0, 1)))
+    qtbot.waitUntil(lambda: service.transform_inflight_count == 0, timeout=10_000)
+
+    assert len(service.display_cache) == 0
+
+
+# ------------------------------------------------------------------ 終了時
+def test_the_worker_can_finish_after_the_service_is_gone() -> None:
+    """サービスが先に消えても、ワーカーの完了通知で落ちない。
+
+    中継役をサービスの子にしていると、閉じている最中にワーカーが
+    破棄済みのオブジェクトへ emit してプロセスごと落ちる。親を持たせず、
+    受け手側の接続は Qt に切らせる。
+    """
+    service = seeded_service(range(0, 1))
+    signals = service._transform_signals  # noqa: SLF001
+    assert signals.parent() is None
+    job = _TransformJob(
+        generation=service.generation,
+        display_key=DisplayKey(
+            render_key=RenderKey(0, 595, 842, 1.0), color_mode=PageColorMode.INVERT
+        ),
+        source=QImage(595, 842, QImage.Format.Format_ARGB32),
+    )
+
+    del service
+    gc.collect()
+
+    # 行き先を失った通知。黙って捨てられる。
+    signals.finished.emit(_TransformResult(job=job, image=None))
