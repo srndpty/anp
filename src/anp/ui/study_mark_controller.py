@@ -115,17 +115,29 @@ class StudyMarkController:
         self._view.set_study_marks(self._repository.list_for_document(self._active_path))
 
     # -------------------------------------------------- 追加・更新・削除
-    def create_mark(self, position: PagePosition) -> None:
+    def create_mark(self, position: PagePosition, *, expected_document: Path | None) -> None:
         """表示中の PDF に学習マークを1件追加する。
 
         位置は `PdfView.page_position_at()` が返した `PagePosition` だけを
         受け取る。ページ番号と 0.0〜1.0 の座標であることはそこで保証されて
         いるので、ビューポートのピクセル座標がリポジトリまで届くことはない。
 
+        `expected_document` は **その位置を取った時点の表示対象**。
+        `PagePosition` は正規化座標なのでどの PDF のものか自分では名乗れず、
+        照合しないと「A のページで開いたメニューを B へ切り替えてから実行」
+        で B に A 由来の座標のマークができてしまう。既存マークの
+        `_require_owned()` と同じ役割を、新規作成に対して果たす。
+
+        既定値は置かない。呼び出し側にどの PDF のつもりかを必ず書かせる。
+
         間違えた回数は呼び出し側に選ばせない。「マークを作る＝最初に
         間違えた」なので、P3-1 の契約どおり必ず 1 から始まる。
         """
         path = self._require_active_document()
+        if expected_document is None or document_key(expected_document) != document_key(path):
+            msg = "the active document changed after the position was captured"
+            raise StudyMarkError(msg)
+
         self._repository.create(path, position.page_index, position.x_norm, position.y_norm)
         self._sync_after_mutation()
 

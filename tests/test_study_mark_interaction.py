@@ -140,7 +140,9 @@ def test_creating_a_mark_starts_at_one(
     sample_pdf: Path,
 ) -> None:
     """作成した直後の間違い回数は 1。呼び出し側に初期値を選ばせない。"""
-    study_mark_controller.create_mark(PagePosition(page_index=1, x_norm=0.25, y_norm=0.75))
+    study_mark_controller.create_mark(
+        PagePosition(page_index=1, x_norm=0.25, y_norm=0.75), expected_document=sample_pdf
+    )
 
     (stored,) = study_marks.list_for_document(sample_pdf)
     assert stored.page_index == 1
@@ -158,7 +160,9 @@ def test_creating_without_an_active_document_is_refused(
     controller = StudyMarkController(study_marks, view)
 
     with pytest.raises(StudyMarkError):
-        controller.create_mark(PagePosition(page_index=0, x_norm=0.5, y_norm=0.5))
+        controller.create_mark(
+            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+        )
 
     assert study_marks.list_for_document(sample_pdf) == []
 
@@ -197,7 +201,9 @@ def test_the_count_stays_an_exact_integer(
     sample_pdf: Path,
 ) -> None:
     """1 → 2 → … → 10 と整数のまま増える。「3+」へ丸めない。"""
-    study_mark_controller.create_mark(PagePosition(page_index=0, x_norm=0.5, y_norm=0.5))
+    study_mark_controller.create_mark(
+        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+    )
     (mark,) = study_marks.list_for_document(sample_pdf)
 
     for expected in range(2, 11):
@@ -253,6 +259,26 @@ def test_deleting_removes_the_row_and_the_overlay(
 
     assert study_marks.get(mark.id) is None
     assert view.study_marks == ()
+
+
+def test_creating_for_a_different_document_is_refused(
+    study_mark_controller: StudyMarkController,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+) -> None:
+    """位置を取ったときの PDF と表示中の PDF が違えば作成しない。
+
+    `PagePosition` は正規化座標なのでどの PDF のものか名乗れない。照合が
+    無いと、B を開いた後に A のメニューを発火させて B へマークができる。
+    """
+    with pytest.raises(StudyMarkError):
+        study_mark_controller.create_mark(
+            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=two_page_pdf
+        )
+
+    assert study_marks.list_for_document(sample_pdf) == []
+    assert study_marks.list_for_document(two_page_pdf) == []
 
 
 @pytest.mark.parametrize("operation", ["increment_mark", "delete_mark"])
@@ -349,7 +375,9 @@ def test_a_failed_create_adds_nothing(
     repository.failing = "create"
 
     with pytest.raises(sqlite3.OperationalError):
-        controller.create_mark(PagePosition(page_index=0, x_norm=0.5, y_norm=0.5))
+        controller.create_mark(
+            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+        )
 
     assert view.study_marks == ()
     assert controller.active_document_path == sample_pdf
@@ -427,7 +455,9 @@ def test_a_mutation_does_not_touch_the_rendering(
 
     study_mark_controller.increment_mark(mark.id)
     study_mark_controller.update_note(mark.id, "メモ")
-    study_mark_controller.create_mark(PagePosition(page_index=0, x_norm=0.2, y_norm=0.2))
+    study_mark_controller.create_mark(
+        PagePosition(page_index=0, x_norm=0.2, y_norm=0.2), expected_document=sample_pdf
+    )
     study_mark_controller.delete_mark(mark.id)
 
     assert len(service.requests) == requests
@@ -443,7 +473,9 @@ def test_a_badge_wins_over_the_page_underneath(
 ) -> None:
     """バッジの上を指したら、新規作成ではなく既存マークが対象になる。"""
     view.fit_page()
-    study_mark_controller.create_mark(PagePosition(page_index=0, x_norm=0.5, y_norm=0.5))
+    study_mark_controller.create_mark(
+        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+    )
     point = page_point(view, 0, 0.5, 0.5)
 
     target = view.study_mark_target_at(point)
@@ -1135,6 +1167,36 @@ def test_a_stale_menu_action_does_not_touch_the_other_document(
     assert study_marks.get(b_mark.id) == b_mark
     assert len(errors) == 1
     assert window.view.has_document
+
+
+def test_a_stale_create_action_does_not_add_to_the_other_document(
+    window: MainWindow,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+    errors: list[str],
+) -> None:
+    """A のページで開いた「追加」が、B を開いた後に発火しても B を汚さない。
+
+    `PagePosition` だけを持ち回すと、B に A 由来の座標のマークができる。
+    メニューを開いた時点の表示対象を一緒に捕まえておく理由。
+    """
+    b_mark = study_marks.create(two_page_pdf, 0, 0.1, 0.1)
+    page_menu = window.study_mark_interaction.build_menu(
+        window.view.study_mark_target_at(page_point(window.view, 0, 0.3, 0.7))
+    )
+    assert page_menu is not None
+    stale = menu_actions(page_menu)[0]
+
+    window.open_path(two_page_pdf)
+    stale.trigger()
+
+    assert study_marks.list_for_document(sample_pdf) == []
+    assert study_marks.list_for_document(two_page_pdf) == [b_mark]
+    assert len(errors) == 1
+    assert window.view.has_document
+    assert window.study_marks.active_document_path == two_page_pdf
+    assert window.view.study_marks == (b_mark,)
 
 
 def test_marks_created_in_one_session_come_back_in_the_next(
