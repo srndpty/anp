@@ -60,8 +60,8 @@ _CANVAS_COLORS = {
     CanvasTheme.WHITE: QColor(0xFF, 0xFF, 0xFF),
 }
 
-# SYSTEM に対応する Qt の値はここには置かない。「指定しない」ことでしか
-# 表せないため、`apply_ui_theme()` で `unsetColorScheme()` を使う。
+# SYSTEM に対応する値はここには置かない。SYSTEM は「どれかの配色を選ぶ」のでは
+# なく「明示した指定を解除する」ことなので、`apply_ui_theme()` で扱う。
 _COLOR_SCHEMES = {
     UiTheme.LIGHT: Qt.ColorScheme.Light,
     UiTheme.DARK: Qt.ColorScheme.Dark,
@@ -80,10 +80,10 @@ def apply_ui_theme(theme: UiTheme) -> None:
     パレットの手組みも使わないので、Windows ネイティブスタイルのまま
     明暗が切り替わり、スクロールバーやメッセージボックスにも及ぶ。
 
-    `SYSTEM` は「指定を外す」ことで表す。`Qt.ColorScheme.Unknown` を
-    設定するのではなく `unsetColorScheme()` を呼ぶのは、こちらだけが
-    OS 側の設定への追随を復活させるため。追随は Qt が行うので、
-    レジストリの監視やポーリングは要らない。
+    `SYSTEM` は明示した指定を解除して表す。`setColorScheme()` に
+    `Qt.ColorScheme.Unknown` を渡しても同じく解除されるが、意図が読み取り
+    やすい `unsetColorScheme()` を使う。解除後の OS 設定への追随は Qt が
+    行うので、レジストリの監視やポーリングは要らない。
 
     キャンバスとページ画像はここでは変わらない。PDF の描画は
     `QStyleHints` を見ていない。

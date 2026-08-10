@@ -79,10 +79,10 @@ def test_light_requests_the_light_color_scheme(scheme_requests: list[object]) ->
 
 
 def test_system_unsets_the_color_scheme(scheme_requests: list[object]) -> None:
-    """システムは指定を外す。
+    """システムは明示した指定を解除する。
 
-    `Qt.ColorScheme.Unknown` を設定するのではなく `unsetColorScheme()` を
-    呼ぶことが、OS の設定への追随を復活させる唯一の手段。
+    `setColorScheme(Qt.ColorScheme.Unknown)` でも解除できるが、意図が
+    読み取りやすい `unsetColorScheme()` を使う方に固定しておく。
     """
     apply_ui_theme(UiTheme.SYSTEM)
 
