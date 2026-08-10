@@ -12,7 +12,8 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 **学習マークの永続化にもここから触らない。** SQLite の接続はアプリケーション
 層が持ち、ここが受け取るのは `StudyMarkRepository` だけ。どの PDF のマークを
 表示するかは `StudyMarkController` が決める。ここの仕事は「PDF が開けた」
-「表示が空になった」を伝えることまで。
+「表示が空になった」を伝えることまで。マークの追加・更新・削除の操作は
+`StudyMarkInteraction` が受け持つので、ここには接続しかない。
 
 外観のうち **UI テーマだけ**をここが持つ。アプリ全体のウィジェットの
 配色はビューの責務ではないため。キャンバスの色は `PdfView`、ページの
@@ -47,6 +48,7 @@ from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.pdf_view import PdfView, ZoomMode
 from anp.ui.study_mark_controller import StudyMarkController
+from anp.ui.study_mark_interaction import StudyMarkInteraction
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,10 @@ class MainWindow(QMainWindow):
         # `document_key()` や SQL を持ち込まない。DB 接続はアプリケーション
         # 層が持ち、ここはリポジトリを受け取るだけ。
         self._study_marks = StudyMarkController(study_marks, self._view)
+
+        # マウス操作・メニュー・ダイアログは別に分ける。ウィンドウの関心
+        # （PDF を開く・ズーム・ページ移動）と混ぜない。
+        self._study_mark_interaction = StudyMarkInteraction(self._view, self._study_marks, self)
 
         self.setWindowTitle("anp")
         populate_menus(self.menuBar(), self._actions)
@@ -526,3 +532,8 @@ class MainWindow(QMainWindow):
     def study_marks(self) -> StudyMarkController:
         """学習マークのコントローラ。"""
         return self._study_marks
+
+    @property
+    def study_mark_interaction(self) -> StudyMarkInteraction:
+        """学習マークのマウス操作とメニュー。"""
+        return self._study_mark_interaction
