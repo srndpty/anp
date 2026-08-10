@@ -230,6 +230,33 @@ def test_the_fit_check_state_follows_the_view(opened: MainWindow) -> None:
     assert not actions.fit_page.isChecked()
 
 
+def test_triggering_the_same_fit_twice_stays_checked(opened: MainWindow) -> None:
+    """同じフィットをもう一度押しても選択表示が外れない。
+
+    チェック可能なアクションは押すたびにチェックが反転するが、ビューの
+    状態は変わらないので `zoom_changed` は出ない。表示だけが実態から
+    外れるのを防ぐ。
+    """
+    action = opened.reader_actions.fit_width
+
+    action.trigger()
+    action.trigger()
+
+    assert action.isChecked()
+    assert opened.view.zoom_mode is ZoomMode.FIT_WIDTH
+
+
+def test_triggering_the_same_fit_page_twice_stays_checked(opened: MainWindow) -> None:
+    """ページ全体でも同じ。"""
+    action = opened.reader_actions.fit_page
+
+    action.trigger()
+    action.trigger()
+
+    assert action.isChecked()
+    assert opened.view.zoom_mode is ZoomMode.FIT_PAGE
+
+
 def test_the_zoom_label_shows_a_percentage(opened: MainWindow) -> None:
     """FREE ではパーセントを表示する。"""
     opened.reader_actions.actual_size.trigger()
@@ -383,6 +410,28 @@ def test_the_free_zoom_round_trips(qapp: QApplication, tmp_path: Path) -> None:
     try:
         assert second.view.zoom == pytest.approx(2.0)
         assert second.view.zoom_mode is ZoomMode.FREE
+    finally:
+        second.deleteLater()
+
+
+def test_the_free_zoom_survives_quitting_in_a_fit_mode(qapp: QApplication, tmp_path: Path) -> None:
+    """フィット中に終了しても、最後に手で指定した倍率が残る。
+
+    保存する倍率を「終了時の倍率」にすると、フィット中に終了したときに
+    手で選んだ倍率がどこにも残らない。
+    """
+    ini = str(tmp_path / "settings.ini")
+
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first.view.set_zoom(2.0)
+    first.view.fit_page()
+    first.close()
+    first.deleteLater()
+
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    try:
+        assert second.view.zoom_mode is ZoomMode.FIT_PAGE
+        assert second.view.last_free_zoom == pytest.approx(2.0)
     finally:
         second.deleteLater()
 

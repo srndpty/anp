@@ -127,8 +127,8 @@ class MainWindow(QMainWindow):
         self._actions.zoom_in.triggered.connect(self._view.zoom_in)
         self._actions.zoom_out.triggered.connect(self._view.zoom_out)
         self._actions.actual_size.triggered.connect(lambda: self._view.set_zoom(1.0))
-        self._actions.fit_width.triggered.connect(self._view.fit_width)
-        self._actions.fit_page.triggered.connect(self._view.fit_page)
+        self._actions.fit_width.triggered.connect(lambda: self._apply_fit(ZoomMode.FIT_WIDTH))
+        self._actions.fit_page.triggered.connect(lambda: self._apply_fit(ZoomMode.FIT_PAGE))
         self._actions.full_screen.triggered.connect(self._set_full_screen)
 
         self._actions.previous_page.triggered.connect(
@@ -137,6 +137,19 @@ class MainWindow(QMainWindow):
         self._actions.next_page.triggered.connect(
             lambda: self._view.go_to_page(self._view.current_page + 1)
         )
+
+    def _apply_fit(self, mode: ZoomMode) -> None:
+        """フィットを適用し、選択表示を取り直す。
+
+        チェック可能なアクションは押されるたびにチェックが反転する。同じ
+        モードのまま押された場合はビューの状態が変わらず `zoom_changed` が
+        出ないので、勝手に外れたチェックをここで戻す。
+        """
+        if mode is ZoomMode.FIT_WIDTH:
+            self._view.fit_width()
+        else:
+            self._view.fit_page()
+        self._sync_zoom_ui()
 
     def _install_escape_shortcut(self) -> None:
         """Esc で全画面を抜ける。通常表示中は何もしない。"""
@@ -301,10 +314,10 @@ class MainWindow(QMainWindow):
         self._settings.window_geometry = self.saveGeometry()
         self._settings.window_state = self.saveState()
         self._settings.zoom_mode = self._view.zoom_mode.value
-        if self._view.zoom_mode is ZoomMode.FREE:
-            # フィット中の倍率はビューポートの大きさ次第なので保存しない。
-            # 次に FREE へ戻ったときは、最後に手で指定した倍率を使う。
-            self._settings.free_zoom = self._view.zoom
+        # 終了時のモードに関わらず、最後に手で指定した倍率を保存する。
+        # 現在の倍率を使うと、フィット中に終了したときにビューポート依存の
+        # 値が焼き付いてしまい、手で選んだ倍率も失われる。
+        self._settings.free_zoom = self._view.last_free_zoom
         self._settings.sync()
         logger.info("main window closed")
         super().closeEvent(event)

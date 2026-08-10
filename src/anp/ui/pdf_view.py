@@ -139,6 +139,7 @@ class PdfView(QAbstractScrollArea):
         self._layout: PageLayout | None = None
         self._zoom = 1.0
         self._zoom_mode = ZoomMode.FREE
+        self._last_free_zoom = 1.0
         self._current_page = NO_PAGE
 
         self.viewport().setAutoFillBackground(False)
@@ -219,6 +220,16 @@ class PdfView(QAbstractScrollArea):
         """表示倍率の決め方。"""
         return self._zoom_mode
 
+    @property
+    def last_free_zoom(self) -> float:
+        """最後に手動で指定された倍率。
+
+        フィット中の倍率はビューポートの大きさ次第なので保存しても意味が
+        ない。一方「最後に手で選んだ倍率」は、フィットへ切り替えたあとも
+        覚えておきたい値なので、`zoom` とは別に持つ。
+        """
+        return self._last_free_zoom
+
     def set_zoom(self, zoom: float) -> None:
         """表示倍率を手動で指定する。`ZoomMode.FREE` へ移行する。
 
@@ -288,6 +299,8 @@ class PdfView(QAbstractScrollArea):
         changed = zoom != self._zoom or mode is not self._zoom_mode
 
         self._zoom_mode = mode
+        if mode is ZoomMode.FREE:
+            self._last_free_zoom = zoom
         if zoom != self._zoom:
             self._commit_zoom(zoom, anchor)
         if changed:

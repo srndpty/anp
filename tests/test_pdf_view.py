@@ -813,6 +813,26 @@ def test_a_new_document_keeps_the_free_zoom(
     assert loaded_view.zoom == pytest.approx(2.0)
 
 
+def test_the_last_free_zoom_survives_a_fit(loaded_view: PdfView) -> None:
+    """フィットへ切り替えても、最後に手で指定した倍率は覚えている。"""
+    loaded_view.set_zoom(2.0)
+
+    loaded_view.fit_page()
+
+    assert loaded_view.zoom != pytest.approx(2.0)
+    assert loaded_view.last_free_zoom == pytest.approx(2.0)
+
+
+def test_the_last_free_zoom_follows_manual_zoom(loaded_view: PdfView) -> None:
+    """手動の倍率変更のたびに更新される。"""
+    loaded_view.set_zoom(2.0)
+    assert loaded_view.last_free_zoom == pytest.approx(2.0)
+
+    loaded_view.zoom_in()
+
+    assert loaded_view.last_free_zoom == pytest.approx(loaded_view.zoom)
+
+
 def test_fit_without_a_document_only_records_the_mode(view: PdfView) -> None:
     """ドキュメントが無くてもモードだけは覚える。"""
     view.fit_width()
