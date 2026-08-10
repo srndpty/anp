@@ -5,7 +5,9 @@ dynamic = ["version"]
 description = "学習向けPDFリーダー（annotator for pdf）"
 requires-python = ">=3.12"
 dependencies = [
-    "PySide6>=6.7",
+    # UI テーマは QStyleHints のカラースキーム（Qt 6.8 で追加）を使う。
+    # 実機での検証は 6.11 系で行っている。
+    "PySide6>=6.8",
 ]
 
 [project.scripts]

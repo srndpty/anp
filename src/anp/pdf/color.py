@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QColor, QImage
 
 # 変換の入口で揃える形式。`QPdfPageRenderer` は今のところ ARGB32 を返すが、
 # 形式の違いで壊れないようここで明示的に正規化する。乗算済みアルファ
@@ -39,6 +39,27 @@ class PageColorMode(Enum):
 
     INVERT = "invert"
     """RGB を単純に反転する。白地の本を黒地にするための最小の手段。"""
+
+
+# ページ矩形の下地。画像がまだ無い間と、画像が矩形を覆い切らない端で見える色。
+# 変換後のページ画像に馴染む色を選ぶ。Invert 中に白で塗ると、読み込み中だけ
+# 画面が白く光る。
+#
+# **キャンバス（ページの外側）の色とは無関係。** キャンバスは
+# `anp.ui.appearance.CanvasTheme` が決める。
+_PAGE_BACKGROUNDS = {
+    PageColorMode.ORIGINAL: QColor(0xFF, 0xFF, 0xFF),
+    PageColorMode.INVERT: QColor(0x00, 0x00, 0x00),
+}
+
+
+def page_background_color(mode: PageColorMode) -> QColor:
+    """ページ矩形の下地の色。
+
+    モードが増えるたびにビューが `PageColorMode` の中身を知らずに済むよう、
+    対応表はここに置く。
+    """
+    return _PAGE_BACKGROUNDS[mode]
 
 
 def transform_page(image: QImage, mode: PageColorMode) -> QImage:

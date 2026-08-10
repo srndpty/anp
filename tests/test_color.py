@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtGui import QImage, qAlpha, qBlue, qGreen, qRed
+from PySide6.QtGui import QColor, QImage, qAlpha, qBlue, qGreen, qRed
 
-from anp.pdf.color import PageColorMode, transform_page
+from anp.pdf.color import PageColorMode, page_background_color, transform_page
 
 
 def solid(argb: int, *, size: int = 4, fmt: QImage.Format = QImage.Format.Format_ARGB32) -> QImage:
@@ -176,3 +176,16 @@ def test_the_mode_values_are_stable_strings() -> None:
     """設定へ保存する文字列は変えない。"""
     assert PageColorMode.ORIGINAL.value == "original"
     assert PageColorMode.INVERT.value == "invert"
+
+
+# ------------------------------------------------------------------ ページの下地
+def test_the_page_background_matches_the_mode() -> None:
+    """下地はモードに合わせる。反転中に白で塗ると読み込み中だけ画面が光る。"""
+    assert page_background_color(PageColorMode.ORIGINAL) == QColor(0xFF, 0xFF, 0xFF)
+    assert page_background_color(PageColorMode.INVERT) == QColor(0x00, 0x00, 0x00)
+
+
+def test_every_mode_has_a_page_background() -> None:
+    """モードの追加時に定義漏れがないことを確かめる。"""
+    for mode in PageColorMode:
+        assert page_background_color(mode).isValid()

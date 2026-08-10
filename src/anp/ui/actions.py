@@ -36,6 +36,18 @@ class ReaderActions:
     page_color_group: QActionGroup
     """ページの色は排他選択。どちらか一方だけがチェックされる。"""
 
+    canvas_black: QAction
+    canvas_dark_gray: QAction
+    canvas_white: QAction
+    canvas_group: QActionGroup
+    """キャンバスの色は排他選択。ページの色とは別のグループにする。"""
+
+    ui_theme_system: QAction
+    ui_theme_light: QAction
+    ui_theme_dark: QAction
+    ui_theme_group: QActionGroup
+    """UI テーマは排他選択。外観の3つの軸は互いに混ぜない。"""
+
     previous_page: QAction
     next_page: QAction
 
@@ -68,18 +80,35 @@ def _action(
     return action
 
 
+def _exclusive_group(parent: QWidget, actions: list[QAction]) -> QActionGroup:
+    """排他選択のグループを作る。
+
+    グループも親にぶら下げるので、`ReaderActions` が凍結されていても
+    寿命は Qt 側で持つ。
+    """
+    group = QActionGroup(parent)
+    group.setExclusive(True)
+    for action in actions:
+        group.addAction(action)
+    return group
+
+
 def create_actions(parent: QWidget) -> ReaderActions:
     """アクションを作る。親を渡すのは Qt の所有権をウィンドウに持たせるため。
 
-    ページの色は排他なので `QActionGroup` にまとめる。グループも親に
-    ぶら下げるので、`ReaderActions` が凍結されていても寿命は Qt 側で持つ。
+    外観の3つの軸（ページの色・キャンバス・UI テーマ）はそれぞれ独立した
+    排他グループにする。1つにまとめると、軸をまたいで選択が外れてしまう。
     """
     page_color_original = _action(parent, "オリジナル(&O)", checkable=True)
     page_color_invert = _action(parent, "反転(&I)", checkable=True)
-    page_color_group = QActionGroup(parent)
-    page_color_group.setExclusive(True)
-    page_color_group.addAction(page_color_original)
-    page_color_group.addAction(page_color_invert)
+
+    canvas_black = _action(parent, "黒(&B)", checkable=True)
+    canvas_dark_gray = _action(parent, "ダークグレー(&G)", checkable=True)
+    canvas_white = _action(parent, "白(&W)", checkable=True)
+
+    ui_theme_system = _action(parent, "システム(&S)", checkable=True)
+    ui_theme_light = _action(parent, "ライト(&L)", checkable=True)
+    ui_theme_dark = _action(parent, "ダーク(&D)", checkable=True)
 
     return ReaderActions(
         open=_action(parent, "開く(&O)...", shortcuts=["Ctrl+O"]),
@@ -94,7 +123,15 @@ def create_actions(parent: QWidget) -> ReaderActions:
         full_screen=_action(parent, "全画面表示(&F)", shortcuts=["F11"], checkable=True),
         page_color_original=page_color_original,
         page_color_invert=page_color_invert,
-        page_color_group=page_color_group,
+        page_color_group=_exclusive_group(parent, [page_color_original, page_color_invert]),
+        canvas_black=canvas_black,
+        canvas_dark_gray=canvas_dark_gray,
+        canvas_white=canvas_white,
+        canvas_group=_exclusive_group(parent, [canvas_black, canvas_dark_gray, canvas_white]),
+        ui_theme_system=ui_theme_system,
+        ui_theme_light=ui_theme_light,
+        ui_theme_dark=ui_theme_dark,
+        ui_theme_group=_exclusive_group(parent, [ui_theme_system, ui_theme_light, ui_theme_dark]),
         # 通常の PageUp/PageDown はスクロール操作として空けておく。
         previous_page=_action(parent, "前のページ(&P)", shortcuts=["Ctrl+PgUp"]),
         next_page=_action(parent, "次のページ(&N)", shortcuts=["Ctrl+PgDown"]),
@@ -122,6 +159,18 @@ def populate_menus(menu_bar: QMenuBar, actions: ReaderActions) -> None:
     page_color_menu.addAction(actions.page_color_original)
     page_color_menu.addAction(actions.page_color_invert)
     view_menu.addMenu(page_color_menu)
+
+    canvas_menu = QMenu("キャンバス(&N)", view_menu)
+    canvas_menu.addAction(actions.canvas_black)
+    canvas_menu.addAction(actions.canvas_dark_gray)
+    canvas_menu.addAction(actions.canvas_white)
+    view_menu.addMenu(canvas_menu)
+
+    ui_theme_menu = QMenu("UI テーマ(&U)", view_menu)
+    ui_theme_menu.addAction(actions.ui_theme_system)
+    ui_theme_menu.addAction(actions.ui_theme_light)
+    ui_theme_menu.addAction(actions.ui_theme_dark)
+    view_menu.addMenu(ui_theme_menu)
     view_menu.addSeparator()
     view_menu.addAction(actions.full_screen)
 
