@@ -50,6 +50,7 @@ select = [
     "SIM",  # simplify
     "PTH",  # pathlib を使う
     "ARG",  # 未使用引数
+    "SLF",  # 他オブジェクトの非公開メンバへのアクセス
     "TID",  # 相対importの制限
     "T20",  # print の禁止（ログを使う）
     "ANN",  # 型注釈の強制
