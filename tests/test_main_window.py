@@ -10,8 +10,8 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QByteArray, QSettings, Qt
-from PySide6.QtWidgets import QApplication, QLabel, QMenu, QSpinBox
+from PySide6.QtCore import QByteArray, QSettings, QSize, Qt
+from PySide6.QtWidgets import QApplication, QLabel, QMenu, QSpinBox, QWidget
 from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
@@ -109,18 +109,35 @@ def test_geometry_is_saved_on_close(qapp: QApplication, settings: Settings) -> N
 
 
 def test_saved_geometry_is_restored(qapp: QApplication, settings: Settings) -> None:
-    """保存されたジオメトリが次回起動時に復元される。"""
+    """保存されたジオメトリが次回起動時に復元される。
+
+    **論理サイズを直接書かない。** `restoreGeometry()` は保存時と復元時の
+    画面 DPI の差を吸収するので、高 DPI スケーリング下では 720×540 が
+    そのまま戻るとは限らない。素の `QWidget` に同じデータを復元させ、
+    「Qt が返す大きさ」を基準にする。こうすると、確かめたい contract
+    （保存したジオメトリを使っている。既定サイズに落ちていない）だけが
+    残り、テストが実行環境のスケーリングに左右されなくなる。
+    """
     first = MainWindow(settings)
     first.resize(720, 540)
     first.close()
     first.deleteLater()
 
-    second = MainWindow(settings)
+    geometry = settings.window_geometry
+    assert geometry is not None
+    reference = QWidget()
     try:
-        assert second.size().width() == 720
-        assert second.size().height() == 540
+        assert reference.restoreGeometry(geometry)
+        # 既定サイズと区別できなければ、この検証は何も言っていない。
+        assert reference.size() != QSize(1000, 800), "テストの前提が崩れている"
+
+        second = MainWindow(settings)
+        try:
+            assert second.size() == reference.size()
+        finally:
+            second.deleteLater()
     finally:
-        second.deleteLater()
+        reference.deleteLater()
 
 
 # ------------------------------------------------------------------ PDF を開く
