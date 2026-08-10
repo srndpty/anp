@@ -32,6 +32,7 @@ from PySide6.QtGui import QColor, QPainter, QPaintEvent, QResizeEvent, QWheelEve
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
+from anp.pdf.color import PageColorMode
 from anp.pdf.layout import PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
 
@@ -68,11 +69,17 @@ class ZoomMode(Enum):
     """現在ページ全体がビューポートに収まる倍率。"""
 
 
-# ページの下地。Phase 2 でページ色変換を入れるため、キャンバスとは分けて塗る。
-_PAGE_COLOR = QColor(0xFF, 0xFF, 0xFF)
+# ページの下地。画像がまだ無い間と、画像が矩形を覆い切らない端で見える色。
+# ページ色変換に合わせて選ぶ。Invert 中に白で塗ると、読み込み中だけ
+# 画面が白く光る。キャンバスとは独立に塗る。
+_PAGE_COLORS = {
+    PageColorMode.ORIGINAL: QColor(0xFF, 0xFF, 0xFF),
+    PageColorMode.INVERT: QColor(0x00, 0x00, 0x00),
+}
 _PAGE_BORDER_COLOR = QColor(0x9A, 0x9A, 0x9A)
 
-# キャンバス（ページの外側）。Phase 2 でダークキャンバスに差し替える。
+# キャンバス（ページの外側）。**ページ色変換の影響を受けない。**
+# 反転するのはページの中身だけで、ページ外の領域は常にこの色。
 _CANVAS_COLOR = QColor(0x52, 0x56, 0x59)
 
 # スクロールの最小単位（論理ピクセル）。ホイール1ノッチではこれが
@@ -227,6 +234,31 @@ class PdfView(QAbstractScrollArea):
     def page_count(self) -> int:
         """ページ数。ドキュメントが無ければ 0。"""
         return self._layout.page_count if self._layout is not None else 0
+
+    # -------------------------------------------------- ページの色
+    @property
+    def page_color_mode(self) -> PageColorMode:
+        """ページ画像に適用している色変換。"""
+        return self._render.color_mode
+
+    def set_page_color_mode(self, mode: PageColorMode) -> None:
+        """ページ色変換を切り替える。
+
+        アプリ全体の表示設定なので、ドキュメントを開き直しても保たれる。
+
+        **PDF のレンダリングはやり直さない。** 表示用画像を捨てて描き直す
+        だけで、raw 画像はそのまま残る。倍率・倍率モード・現在ページ・
+        スクロール位置のどれも触らない。
+
+        raw がまだ無いページについても、ここで要求を積み直さない。必要な
+        ページの要求は `PageRenderService` の台帳に残っており、処理中の
+        枠が空くたびに続きが発行されるため、モードを変えたことで足りなく
+        なる要求は無い。積み直すと、モードの連打で要求だけが増える。
+        """
+        if mode is self.page_color_mode:
+            return
+        self._render.set_color_mode(mode)
+        self.viewport().update()
 
     # -------------------------------------------------- 表示倍率
     @property
@@ -595,7 +627,7 @@ class PdfView(QAbstractScrollArea):
         if rect is None:
             return
 
-        painter.fillRect(rect, _PAGE_COLOR)
+        painter.fillRect(rect, _PAGE_COLORS[self._render.color_mode])
 
         size_px = self._render_size(rect.size())
         image = self._render.image_for(index, size_px, self.devicePixelRatioF())

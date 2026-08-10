@@ -14,11 +14,13 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QSize
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, qAlpha, qBlue, qGreen, qRed
 from PySide6.QtPdf import QPdfDocumentRenderOptions
 from pytestqt.qtbot import QtBot
 
-from anp.pdf.cache import RenderCache
+from anp.pdf import render as render_module
+from anp.pdf.cache import RenderCache, RenderKey
+from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController
 from anp.pdf.render import (
     DEFAULT_MAX_RENDER_BYTES,
@@ -471,3 +473,264 @@ def test_placeholder_uses_another_resolution(service: PageRenderService, qtbot: 
 def test_placeholder_is_none_for_unrendered_page(service: PageRenderService) -> None:
     """まだ何も無いページには仮表示も無い。"""
     assert service.placeholder_for(2, A4_AT_72DPI) is None
+
+
+# ------------------------------------------------------------------ ページの色
+WHITE = 0xFFFFFFFF
+BLACK = (0, 0, 0, 255)
+
+
+def deliver_filled(service: PageRenderService, request_id: int, argb: int = WHITE) -> None:
+    """単色で塗った画像がレンダリング結果として届いた状況を再現する。
+
+    `deliver()` の画像は未初期化なので、画素値を見るテストには使えない。
+    """
+    key = service._outstanding[request_id].render_keys[0]  # noqa: SLF001
+    image = QImage(key.width_px, key.height_px, QImage.Format.Format_ARGB32)
+    image.fill(argb)
+    service._on_page_rendered(  # noqa: SLF001
+        key.page_index,
+        QSize(key.width_px, key.height_px),
+        image,
+        QPdfDocumentRenderOptions(),
+        request_id,
+    )
+
+
+def render_page(service: PageRenderService, size: QSize = A4_AT_72DPI, argb: int = WHITE) -> None:
+    """1ページ目を要求して、単色の結果を届ける。"""
+    service.request_pages([PageRequest(page_index=0, size_px=size, dpr=1.0)])
+    service.flush()
+    deliver_filled(service, next(iter(service._outstanding)), argb)  # noqa: SLF001
+
+
+def rgba(image: QImage) -> tuple[int, int, int, int]:
+    """左上の画素の (R, G, B, A)。"""
+    pixel = image.pixel(0, 0)
+    return qRed(pixel), qGreen(pixel), qBlue(pixel), qAlpha(pixel)
+
+
+def count_transforms(monkeypatch: pytest.MonkeyPatch) -> list[PageColorMode]:
+    """色変換が呼ばれるたびに記録するリストを返す。"""
+    calls: list[PageColorMode] = []
+    original = render_module.transform_page
+
+    def counting(image: QImage, mode: PageColorMode) -> QImage:
+        calls.append(mode)
+        return original(image, mode)
+
+    monkeypatch.setattr(render_module, "transform_page", counting)
+    return calls
+
+
+def test_the_default_mode_is_original(service: PageRenderService) -> None:
+    """既定は Original。"""
+    assert service.color_mode is PageColorMode.ORIGINAL
+
+
+def test_original_returns_the_raw_image(service: PageRenderService) -> None:
+    """Original では raw 画像をそのまま返す（複製を持たない）。"""
+    render_page(service)
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is service.raw_image_for(0, A4_AT_72DPI, 1.0)
+    assert len(service.display_cache) == 0
+
+
+def test_invert_transforms_the_page_image(service: PageRenderService) -> None:
+    """Invert では反転した画像を返す。"""
+    render_page(service)
+
+    service.set_color_mode(PageColorMode.INVERT)
+
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == BLACK
+
+
+def test_the_raw_image_does_not_depend_on_the_color_mode(service: PageRenderService) -> None:
+    """raw 画像は色変換の影響を受けない。
+
+    その場で反転すると、Original へ戻したときに反転済みの絵が残る。
+    """
+    render_page(service)
+
+    service.set_color_mode(PageColorMode.INVERT)
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
+
+    raw = service.raw_image_for(0, A4_AT_72DPI, 1.0)
+    assert raw is not None
+    assert rgba(raw) == (255, 255, 255, 255)
+
+
+def test_changing_the_mode_keeps_the_raw_cache(service: PageRenderService) -> None:
+    """モードを変えても raw 画像は捨てない。"""
+    render_page(service)
+    before = len(service._cache)  # noqa: SLF001
+
+    service.set_color_mode(PageColorMode.INVERT)
+    service.set_color_mode(PageColorMode.ORIGINAL)
+
+    assert len(service._cache) == before  # noqa: SLF001
+    assert service.raw_image_for(0, A4_AT_72DPI, 1.0) is not None
+
+
+def test_changing_the_mode_does_not_request_a_new_render(service: PageRenderService) -> None:
+    """モードを変えても `QPdfPageRenderer` へ要求し直さない。
+
+    往復しても、レンダリング待ちの白紙には戻らない。
+    """
+    render_page(service)
+    generation = service.generation
+
+    for mode in (PageColorMode.INVERT, PageColorMode.ORIGINAL, PageColorMode.INVERT):
+        service.set_color_mode(mode)
+        service.flush()
+
+    assert service.outstanding_count == 0
+    assert service.generation == generation
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
+
+
+def test_going_back_to_original_restores_the_original_pixels(service: PageRenderService) -> None:
+    """Invert から Original へ戻すと元の画素に戻る。"""
+    render_page(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
+
+    service.set_color_mode(PageColorMode.ORIGINAL)
+
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == (255, 255, 255, 255)
+
+
+def test_the_same_display_image_is_not_transformed_twice(
+    service: PageRenderService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同じ鍵の表示用画像を何度取得しても変換は1回だけ。
+
+    描き直しのたびに変換していると、スクロール中ずっと CPU を使う。
+    """
+    render_page(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    calls = count_transforms(monkeypatch)
+
+    for _ in range(5):
+        assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
+
+    assert calls == [PageColorMode.INVERT]
+
+
+def test_returning_to_a_mode_transforms_again(
+    service: PageRenderService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """モードを戻すと、表示用画像は作り直す（raw は作り直さない）。
+
+    使えない画像でメモリを占めないよう、切り替え時に表示用は捨てる。
+    """
+    render_page(service)
+    calls = count_transforms(monkeypatch)
+
+    service.set_color_mode(PageColorMode.INVERT)
+    service.image_for(0, A4_AT_72DPI, 1.0)
+    service.set_color_mode(PageColorMode.ORIGINAL)
+    service.set_color_mode(PageColorMode.INVERT)
+    service.image_for(0, A4_AT_72DPI, 1.0)
+
+    assert calls == [PageColorMode.INVERT, PageColorMode.INVERT]
+    assert len(service._cache) == 1  # noqa: SLF001
+
+
+def test_setting_the_same_mode_keeps_the_display_cache(service: PageRenderService) -> None:
+    """同じモードを選び直しても表示用画像は捨てない（連打で作り直さない）。"""
+    render_page(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+
+    service.set_color_mode(PageColorMode.INVERT)
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is image
+
+
+def test_the_placeholder_is_transformed_too(service: PageRenderService) -> None:
+    """仮表示も現在のモードで変換して返す。
+
+    変換前の絵を先に見せると、切り替えた瞬間に元の色が一瞬見える。
+    """
+    render_page(service, size=QSize(297, 421))
+    service.set_color_mode(PageColorMode.INVERT)
+
+    placeholder = service.placeholder_for(0, QSize(1190, 1684))
+
+    assert placeholder is not None
+    assert placeholder.width() == 297
+    assert rgba(placeholder) == BLACK
+
+
+def test_the_display_cache_is_bounded() -> None:
+    """表示用キャッシュにも上限があり、超えた分は追い出される。"""
+    image_bytes = QImage(595, 842, QImage.Format.Format_ARGB32).sizeInBytes()
+    service = PageRenderService(RenderCache(), display_max_bytes=image_bytes * 2)
+    service.set_color_mode(PageColorMode.INVERT)
+    for page in range(4):
+        service._cache.put(  # noqa: SLF001
+            RenderKey(page, 595, 842, 1.0), QImage(595, 842, QImage.Format.Format_ARGB32)
+        )
+
+    for page in range(4):
+        assert service.image_for(page, A4_AT_72DPI, 1.0) is not None
+        assert service.display_cache.total_bytes <= service.display_cache.max_bytes
+
+    assert len(service.display_cache) == 2
+
+
+def test_reset_drops_the_display_images_too(service: PageRenderService) -> None:
+    """ドキュメントを入れ替えると、raw も表示用も前の PDF の画像が残らない。"""
+    render_page(service)
+    service.set_color_mode(PageColorMode.INVERT)
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
+
+    service.reset()
+
+    assert len(service.display_cache) == 0
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+
+
+def test_reset_keeps_the_color_mode(service: PageRenderService) -> None:
+    """ページの色はアプリ全体の設定なので、ドキュメントを替えても保つ。"""
+    service.set_color_mode(PageColorMode.INVERT)
+
+    service.reset()
+
+    assert service.color_mode is PageColorMode.INVERT
+
+
+def test_a_stale_result_does_not_reach_the_display_cache(service: PageRenderService) -> None:
+    """世代の合わない結果は表示用画像にもならない。"""
+    service.set_color_mode(PageColorMode.INVERT)
+    service.request_pages(requests_for(range(0, 1)))
+    service.flush()
+    old_id = next(iter(service._outstanding))  # noqa: SLF001
+
+    service.reset()
+    deliver_filled(service, old_id)
+
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
+    assert len(service.display_cache) == 0
+
+
+def test_the_render_size_fits_both_caches() -> None:
+    """1枚の要求サイズは、raw と表示用のどちらの上限にも収まる。
+
+    表示用画像は raw と同じ画素数になるので、片方にしか入らない大きさを
+    要求すると、そのモードでは永久に表示できない。
+    """
+    service = PageRenderService(
+        RenderCache(max_bytes=8 * 1024 * 1024),
+        max_render_bytes=64 * 1024 * 1024,
+        display_max_bytes=2 * 1024 * 1024,
+    )
+
+    key = service._key_for(0, QSize(4000, 5000), 1.0)  # noqa: SLF001
+
+    assert key.width_px * key.height_px * 4 <= 2 * 1024 * 1024

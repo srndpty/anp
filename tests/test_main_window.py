@@ -11,10 +11,11 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QByteArray, QSettings, Qt
-from PySide6.QtWidgets import QApplication, QLabel, QSpinBox
+from PySide6.QtWidgets import QApplication, QLabel, QMenu, QSpinBox
 from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
+from anp.pdf.color import PageColorMode
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import ZOOM_STEP, ZoomMode
 
@@ -593,7 +594,126 @@ def test_a_single_page_pdf_disables_both_page_actions(
     assert page_input(window).maximum() == 1
 
 
+# ------------------------------------------------------------------ ページの色
+def menu_titled(window: MainWindow, title: str) -> QMenu:
+    """タイトルでメニューを引く。
+
+    `QAction.menu()` は使わない。取り出した `QAction` の Python 側の参照が
+    先に消えると、PySide がメニューの C++ オブジェクトを解放してしまう。
+    """
+    menus = [menu for menu in window.findChildren(QMenu) if menu.title() == title]
+    assert len(menus) == 1, title
+    return menus[0]
+
+
+def test_the_page_color_menu_exists(window: MainWindow) -> None:
+    """表示メニューの中に「ページの色」がある。"""
+    submenu = menu_titled(window, "ページの色(&C)")
+
+    assert [action.text() for action in submenu.actions()] == ["オリジナル(&O)", "反転(&I)"]
+    assert submenu.menuAction() in menu_titled(window, "表示(&V)").actions()
+
+
+def test_original_is_checked_at_startup(window: MainWindow) -> None:
+    """既定ではオリジナルが選択されている。"""
+    assert window.reader_actions.page_color_original.isChecked()
+    assert not window.reader_actions.page_color_invert.isChecked()
+    assert window.view.page_color_mode is PageColorMode.ORIGINAL
+
+
+def test_the_menu_switches_to_invert(opened: MainWindow) -> None:
+    """メニューから反転へ切り替えられる。"""
+    opened.reader_actions.page_color_invert.trigger()
+
+    assert opened.view.page_color_mode is PageColorMode.INVERT
+
+
+def test_the_menu_switches_back_to_original(opened: MainWindow) -> None:
+    """メニューからオリジナルへ戻せる。"""
+    opened.reader_actions.page_color_invert.trigger()
+
+    opened.reader_actions.page_color_original.trigger()
+
+    assert opened.view.page_color_mode is PageColorMode.ORIGINAL
+
+
+def test_the_page_color_choices_are_exclusive(opened: MainWindow) -> None:
+    """チェックは常にどちらか一方だけ。"""
+    actions = opened.reader_actions
+
+    actions.page_color_invert.trigger()
+    assert actions.page_color_invert.isChecked()
+    assert not actions.page_color_original.isChecked()
+
+    actions.page_color_original.trigger()
+    assert actions.page_color_original.isChecked()
+    assert not actions.page_color_invert.isChecked()
+
+
+def test_the_page_color_can_be_chosen_without_a_document(window: MainWindow) -> None:
+    """PDF を開いていなくても選べる。"""
+    assert window.reader_actions.page_color_invert.isEnabled()
+
+    window.reader_actions.page_color_invert.trigger()
+
+    assert window.view.page_color_mode is PageColorMode.INVERT
+
+
+def test_the_page_color_survives_opening_another_pdf(
+    window: MainWindow, sample_pdf: Path, two_page_pdf: Path
+) -> None:
+    """PDF を切り替えてもページの色は維持される（PDF ごとの設定ではない）。"""
+    window.open_path(sample_pdf)
+    window.reader_actions.page_color_invert.trigger()
+
+    window.open_path(two_page_pdf)
+
+    assert window.view.page_color_mode is PageColorMode.INVERT
+    assert window.reader_actions.page_color_invert.isChecked()
+
+
+def test_a_pdf_opened_later_uses_the_chosen_mode(window: MainWindow, sample_pdf: Path) -> None:
+    """ドキュメントが無いうちに選んだモードで、次に開く PDF が表示される。"""
+    window.reader_actions.page_color_invert.trigger()
+
+    window.open_path(sample_pdf)
+
+    assert window.view.page_color_mode is PageColorMode.INVERT
+
+
 # ------------------------------------------------------------------ 設定
+def test_the_page_color_mode_round_trips(qapp: QApplication, tmp_path: Path) -> None:
+    """ページの色が次回起動時に復元される。"""
+    ini = str(tmp_path / "settings.ini")
+
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first.reader_actions.page_color_invert.trigger()
+    first.close()
+    first.deleteLater()
+
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    try:
+        assert second.view.page_color_mode is PageColorMode.INVERT
+        assert second.reader_actions.page_color_invert.isChecked()
+    finally:
+        second.deleteLater()
+
+
+def test_an_unknown_page_color_mode_falls_back_to_original(
+    qapp: QApplication, tmp_path: Path
+) -> None:
+    """知らないページの色が保存されていたらオリジナルで起動する。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("view/page_color_mode", "smart_dark")
+
+    window = MainWindow(Settings(backend))
+    try:
+        assert window.view.page_color_mode is PageColorMode.ORIGINAL
+        assert window.reader_actions.page_color_original.isChecked()
+    finally:
+        window.deleteLater()
+
+
 def test_the_zoom_mode_round_trips(qapp: QApplication, tmp_path: Path) -> None:
     """倍率モードが次回起動時に復元される。"""
     ini = str(tmp_path / "settings.ini")

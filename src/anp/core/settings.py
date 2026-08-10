@@ -18,9 +18,11 @@ _KEY_WINDOW_STATE = "window/state"
 _KEY_LAST_DIRECTORY = "files/last_directory"
 _KEY_ZOOM_MODE = "view/zoom_mode"
 _KEY_FREE_ZOOM = "view/free_zoom"
+_KEY_PAGE_COLOR_MODE = "view/page_color_mode"
 
 DEFAULT_ZOOM_MODE = "free"
 DEFAULT_FREE_ZOOM = 1.0
+DEFAULT_PAGE_COLOR_MODE = "original"
 
 # 保存された倍率として受け付ける範囲。UI 側の上下限とは独立に、壊れた値を
 # ここで弾く。`core` は表示の都合を知らないので、緩めの健全性チェックに留める。
@@ -99,6 +101,20 @@ class Settings:
     @free_zoom.setter
     def free_zoom(self, value: float) -> None:
         self._backend.setValue(_KEY_FREE_ZOOM, value)
+
+    @property
+    def page_color_mode(self) -> str:
+        """保存されたページ色変換の名前。未保存や不正な型なら既定値。
+
+        `zoom_mode` と同じく、どのモードが存在するかは UI 層が判断する。
+        `core` は文字列であることだけを保証する。
+        """
+        value = self._backend.value(_KEY_PAGE_COLOR_MODE, DEFAULT_PAGE_COLOR_MODE)
+        return value if isinstance(value, str) and value else DEFAULT_PAGE_COLOR_MODE
+
+    @page_color_mode.setter
+    def page_color_mode(self, value: str) -> None:
+        self._backend.setValue(_KEY_PAGE_COLOR_MODE, value)
 
     # -------------------------------------------------- 内部
     def sync(self) -> None:

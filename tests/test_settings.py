@@ -74,6 +74,29 @@ def test_broken_zoom_mode_falls_back(tmp_path: Path) -> None:
     assert Settings(backend).zoom_mode == "free"
 
 
+def test_unset_page_color_mode_returns_the_default(settings: Settings) -> None:
+    """ページの色の設定が無ければ既定値。"""
+    assert settings.page_color_mode == "original"
+
+
+def test_the_page_color_mode_round_trips(tmp_path: Path) -> None:
+    """ページの色を読み戻せる。"""
+    ini = str(tmp_path / "settings.ini")
+    first = Settings(QSettings(ini, QSettings.Format.IniFormat))
+    first.page_color_mode = "invert"
+    first.sync()
+
+    assert Settings(QSettings(ini, QSettings.Format.IniFormat)).page_color_mode == "invert"
+
+
+def test_a_broken_page_color_mode_falls_back(tmp_path: Path) -> None:
+    """文字列でないページの色は既定値へ落とす。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("view/page_color_mode", QByteArray(b"\x00\x01"))
+
+    assert Settings(backend).page_color_mode == "original"
+
+
 def test_sync_failure_is_logged_but_not_raised(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
