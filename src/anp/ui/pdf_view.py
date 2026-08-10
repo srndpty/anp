@@ -38,7 +38,15 @@ from dataclasses import dataclass
 from enum import Enum
 
 from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, QSizeF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPaintEvent, QResizeEvent, QWheelEvent
+from PySide6.QtGui import (
+    QColor,
+    QContextMenuEvent,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+    QResizeEvent,
+    QWheelEvent,
+)
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
@@ -47,7 +55,13 @@ from anp.pdf.layout import PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
 from anp.storage.study_mark import StudyMark, validate_position
 from anp.ui.appearance import CanvasTheme, canvas_color
-from anp.ui.study_marks import PagePosition, StudyMarkIndex, badge_path, draw_badge
+from anp.ui.study_marks import (
+    PagePosition,
+    StudyMarkIndex,
+    StudyMarkTarget,
+    badge_path,
+    draw_badge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +110,11 @@ _SCROLL_EPSILON = 1e-6
 
 # ドキュメントが無いときの現在ページ。
 NO_PAGE = -1
+
+# 学習マークを操作する修飾キー。**完全一致で見る**（`Ctrl+Shift` や
+# `Ctrl+Alt` では発火しない）。修飾キーの組み合わせを将来の操作へ割り当てる
+# 余地を残すため、「Ctrl を含んでいれば」では判定しない。
+STUDY_MARK_MODIFIER = Qt.KeyboardModifier.ControlModifier
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +180,21 @@ class PdfView(QAbstractScrollArea):
 
     canvas_theme_changed = Signal()
     """キャンバスの色が変わった。メニューの選択表示はこれを見て合わせる。"""
+
+    study_mark_activated = Signal(object)
+    """Ctrl + 左クリックで学習マークの操作が要求された（`StudyMarkTarget`）。
+
+    ビューは「どこが押されたか」までしか決めない。作成なのか回数を増やすのかを
+    保存へ結び付けるのは受け取った側（`StudyMarkInteraction`）。ページの外を
+    押したときは出さない。
+    """
+
+    study_mark_menu_requested = Signal(object, object)
+    """右クリックされた（`StudyMarkTarget`, グローバル座標の `QPoint`）。
+
+    メニューの中身はビューの関心ではないので、ここでは組み立てない。
+    ページの外を押したときは出さない。
+    """
 
     def __init__(self, render_service: PageRenderService, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -637,6 +671,21 @@ class PdfView(QAbstractScrollArea):
         hits.reverse()
         return hits
 
+    def study_mark_target_at(self, viewport_pos: QPointF) -> StudyMarkTarget:
+        """その点を押したときの学習マークの操作対象。
+
+        **判定の順序が契約**。まず `study_marks_at()`、ヒットが無ければ
+        `page_position_at()` を見る。逆にすると、ページの端からはみ出した
+        バッジを押したときに、既存のマークではなく新しいマークが増える。
+
+        重なっているマークは **いちばん上の1件だけ** を対象にする
+        （`study_marks_at()` の先頭）。まとめて操作したり、選択させたりしない。
+        """
+        hits = self.study_marks_at(viewport_pos)
+        if hits:
+            return StudyMarkTarget(mark=hits[0])
+        return StudyMarkTarget(position=self.page_position_at(viewport_pos))
+
     # -------------------------------------------------- スクロールバー
     def _update_scrollbars(self) -> None:
         """コンテンツとビューポートの大きさから可動域を決める。"""
@@ -718,6 +767,64 @@ class PdfView(QAbstractScrollArea):
             ZoomMode.FREE,
             self._pointer_anchor(event.position()),
         )
+        event.accept()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt の命名規則)
+        """Ctrl + 左クリックで学習マークを操作する。
+
+        **修飾なしの左クリックは学習マークに使わない。** 誤って印が増えるのを
+        避けるためと、選択やパンといった後の操作と取り合いにならないため。
+        `Shift` や `Alt` を伴う場合も同じで、ここは通り抜ける。
+        """
+        if not self._handle_study_mark_click(event):
+            super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt の命名規則)
+        """2度目の押下も1回の操作として扱う。
+
+        Qt は速い連打の2回目を `MouseButtonPress` ではなく
+        `MouseButtonDblClick` として送る。ここで拾わないと、素早く
+        Ctrl クリックしたときに1回おきに取りこぼす（1 → 2 → 3 と数えたい
+        のに 1 → 2 で止まる）。**押した回数だけ数える** のが契約なので、
+        押下の2つの入口を同じ扱いにする。
+        """
+        if not self._handle_study_mark_click(event):
+            super().mouseDoubleClickEvent(event)
+
+    def _handle_study_mark_click(self, event: QMouseEvent) -> bool:
+        """学習マークの操作として扱えたか。
+
+        ページの外を押したときは何も起きない（シグナルも出さない）。判定と
+        優先順位は `study_mark_target_at()` にある。ここが持つのは
+        「どの入力が学習マークの操作か」だけで、保存には触らない。
+        """
+        if (
+            event.button() is not Qt.MouseButton.LeftButton
+            or event.modifiers() != STUDY_MARK_MODIFIER
+        ):
+            return False
+
+        target = self.study_mark_target_at(event.position())
+        if target.is_empty:
+            return False
+
+        self.study_mark_activated.emit(target)
+        event.accept()
+        return True
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802 (Qt の命名規則)
+        """右クリックの対象を決めて知らせる。メニューはここでは作らない。
+
+        対象の決め方は Ctrl + 左クリックと同じ `study_mark_target_at()`。
+        バッジの上なら既存のマーク、ページの上なら新規作成、ページの外なら
+        学習マークのメニューを出さない。
+        """
+        target = self.study_mark_target_at(QPointF(event.pos()))
+        if target.is_empty:
+            super().contextMenuEvent(event)
+            return
+
+        self.study_mark_menu_requested.emit(target, event.globalPos())
         event.accept()
 
     def event(self, event: QEvent) -> bool:

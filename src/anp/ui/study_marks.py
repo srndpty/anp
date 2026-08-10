@@ -7,6 +7,7 @@
 ここが受け持つのは次の3つ。
 
 - `PagePosition`: 「どのページのどこか」を表す最小の値
+- `StudyMarkTarget`: マウス操作が指した対象（既存のマーク / ページ上の位置 / どちらでもない）
 - `StudyMarkIndex`: 呼び出し側のコレクションを写し取った不変のスナップショットと、
   ページ番号ごとの索引
 - バッジの形（`badge_path()`）と描画（`draw_badge()`）
@@ -42,6 +43,32 @@ class PagePosition:
     page_index: int
     x_norm: float
     y_norm: float
+
+
+@dataclass(frozen=True, slots=True)
+class StudyMarkTarget:
+    """マウスの1点が指した学習マークの操作対象。
+
+    取りうる状態は3つで、この順に優先する。
+
+    - `mark` がある: バッジの上。既存のマークへの操作
+    - `position` がある: バッジは無いがページの上。新規作成の候補
+    - どちらも無い: ページの外。学習マークとしては何もしない
+
+    **バッジの判定が先**（`PdfView.study_mark_target_at()`）。バッジが
+    ページの端からはみ出していても、押されたのがバッジならそちらを採る。
+
+    右クリックメニューはこの値を捕まえたまま開く。アクションが発火する頃に
+    カーソルがどこにあっても、対象はメニューを開いた時点のもの。
+    """
+
+    mark: StudyMark | None = None
+    position: PagePosition | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        """ページの外を指しているか（学習マークとしては何もしない）。"""
+        return self.mark is None and self.position is None
 
 
 # バッジの高さ（論理ピクセル）。丸みの半径もここから決まる。
