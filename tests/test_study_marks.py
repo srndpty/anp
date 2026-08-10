@@ -477,6 +477,38 @@ def test_database_rejects_invalid_rows(
         )
 
 
+@pytest.mark.parametrize(("column", "value"), [("page_index", 0.5), ("mistake_count", 1.5)])
+def test_database_rejects_fractional_integers(
+    connection: sqlite3.Connection,
+    column: str,
+    value: float,
+) -> None:
+    """SQLite の INTEGER 宣言は型を強制しないので、typeof の CHECK で弾く。
+
+    小数が入ると、後でリポジトリから読むときに StudyMark の生成で失敗する。
+    """
+    values = {"page_index": 0, "mistake_count": 1, column: value}
+
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO study_marks"
+            " (document_key, page_index, x_norm, y_norm, mistake_count)"
+            " VALUES ('doc', ?, 0.5, 0.5, ?)",
+            (values["page_index"], values["mistake_count"]),
+        )
+
+
+@pytest.mark.parametrize("mark_id", [0, -1, 1.5])
+def test_database_rejects_invalid_id(connection: sqlite3.Connection, mark_id: float) -> None:
+    """id を明示した INSERT でも 0 / 負数 / 小数は入らない。"""
+    with pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "INSERT INTO study_marks (id, document_key, page_index, x_norm, y_norm)"
+            " VALUES (?, 'doc', 0, 0.5, 0.5)",
+            (mark_id,),
+        )
+
+
 def test_database_rejects_empty_document_key(connection: sqlite3.Connection) -> None:
     """空のドキュメント識別子も CHECK 制約で弾かれる。"""
     with pytest.raises(sqlite3.IntegrityError):

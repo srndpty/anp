@@ -30,6 +30,10 @@ def _create_study_marks(connection: sqlite3.Connection) -> None:
     Python 側の検証とは別に CHECK 制約も置く。リポジトリを通さない
     将来のマイグレーションやスクリプトから不正な行が入るのを防ぎ、
     不変条件をスキーマ自身に記録するため、二重化は意図的。
+
+    整数の列には `typeof()` の CHECK も付ける。SQLite の型は列の宣言では
+    決まらず値ごとに持つため、`INTEGER` と宣言しただけでは
+    `page_index = 0.5` のような値をそのまま保存できてしまう。
     """
     connection.execute("""
         CREATE TABLE study_marks (
@@ -41,15 +45,17 @@ def _create_study_marks(connection: sqlite3.Connection) -> None:
             mistake_count INTEGER NOT NULL DEFAULT 1,
             note          TEXT    NULL,
 
+            CHECK (typeof(id) = 'integer' AND id > 0),
             CHECK (document_key <> ''),
-            CHECK (page_index >= 0),
+            CHECK (typeof(page_index) = 'integer' AND page_index >= 0),
             CHECK (x_norm >= 0.0 AND x_norm <= 1.0),
             CHECK (y_norm >= 0.0 AND y_norm <= 1.0),
-            CHECK (mistake_count >= 1)
+            CHECK (typeof(mistake_count) = 'integer' AND mistake_count >= 1)
         )
     """)
-    # 現在の唯一の検索は「ある PDF の学習マークを取り出す」。並び順
-    # （page_index, id）まで含めると取得がインデックスだけで済む。
+    # 現在の唯一の検索は「ある PDF の学習マークを取り出す」。document_key での
+    # 絞り込みと ORDER BY page_index, id をこのインデックスだけで賄える
+    # （x_norm 等も取り出すので covering index ではない）。
     connection.execute(
         "CREATE INDEX study_marks_by_document ON study_marks (document_key, page_index, id)"
     )
