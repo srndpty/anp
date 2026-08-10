@@ -11,8 +11,13 @@ import pytest
 from PySide6.QtCore import QSettings
 from PySide6.QtGui import QGuiApplication, QPageSize, QPainter, QPdfWriter
 from PySide6.QtWidgets import QApplication
+from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
+from anp.pdf.cache import RenderCache
+from anp.pdf.document import DocumentController
+from anp.ui.pdf_view import PdfView
+from helpers import RecordingService
 
 # QApplication が作られる前にオフスクリーンを指定し、ローカルと CI で挙動を揃える。
 # PySide6 の import 自体はプラットフォームプラグインを読み込まないため、
@@ -203,6 +208,54 @@ def _write_encrypted_pdf(path: Path, user_password: str, owner_password: str) ->
 def encrypted_pdf(qapp: QApplication, tmp_path: Path) -> Path:
     """開くのにユーザパスワードが要る PDF。"""
     return _write_encrypted_pdf(tmp_path / "encrypted.pdf", "secret", "owner")
+
+
+# ---------------------------------------------------------------- PdfView
+# `PdfView` を使うテストが共有するフィクスチャ。実体（記録用サービスや
+# 描画の取り出し）は `helpers.py` にある。
+VIEWPORT = (400, 600)
+
+
+@pytest.fixture
+def controller(sample_pdf: Path) -> Iterator[DocumentController]:
+    """開いた状態の3ページ PDF（A4 / 595x842pt）。"""
+    controller = DocumentController()
+    controller.open(sample_pdf)
+    yield controller
+    controller.close()
+
+
+@pytest.fixture
+def cache() -> RenderCache:
+    """ビューが参照するキャッシュ。テストから画像を仕込むために取っておく。"""
+    return RenderCache()
+
+
+@pytest.fixture
+def service(cache: RenderCache) -> RecordingService:
+    """要求を記録するレンダリングサービス。"""
+    return RecordingService(cache)
+
+
+@pytest.fixture
+def view(qtbot: QtBot, service: RecordingService) -> PdfView:
+    """ドキュメント未設定のビュー。
+
+    ビューポートの大きさは表示されるまで確定しないので、表示してから返す。
+    """
+    view = PdfView(service)
+    qtbot.addWidget(view)
+    view.resize(*VIEWPORT)
+    with qtbot.waitExposed(view):
+        view.show()
+    return view
+
+
+@pytest.fixture
+def loaded_view(view: PdfView, controller: DocumentController) -> PdfView:
+    """3ページ PDF を設定済みのビュー。"""
+    view.set_document(controller.document, controller.page_sizes())
+    return view
 
 
 @pytest.fixture

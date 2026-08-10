@@ -7,143 +7,29 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSizeF, Qt
-from PySide6.QtGui import QColor, QImage, QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, QSizeF, Qt
+from PySide6.QtGui import QColor, QWheelEvent
 from PySide6.QtWidgets import QApplication
-from pytestqt.qtbot import QtBot
 
-from anp.pdf import render as render_module
-from anp.pdf.cache import RenderCache, RenderKey
+from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController
 from anp.pdf.layout import LayoutMetrics, PageLayout
-from anp.pdf.render import PageRenderService, PageRequest
 from anp.ui.appearance import CanvasTheme
 from anp.ui.pdf_view import MAX_ZOOM, MIN_ZOOM, NO_PAGE, ZOOM_STEP, PdfView, ZoomMode
-from helpers import ManualTransforms
-
-VIEWPORT = (400, 600)
+from helpers import RecordingService, UpdateSpy, count_transforms, put_image, render_view
 
 # ビューが既定で使う配置寸法。フィット倍率の検算に使う。
 MARGIN = LayoutMetrics().margin
-
-
-class RecordingService(PageRenderService):
-    """要求されたページを記録するレンダリングサービス。
-
-    実際の `requestPage()` は出さない。本物のレンダリングが途中で完了すると
-    キャッシュの中身がテストの仕込みと入れ替わり、結果がタイミング依存に
-    なるため。要求の中身とキャッシュの読み出しはそのまま検証できる。
-
-    色変換も本物のワーカーには流さない。既定では投入と同時に完了させる
-    （`transforms.immediate`）。ビューの関心は「引き当てた画像をどう描くか」
-    なので、変換の完了タイミングを見たいテストだけが手動へ切り替える。
-    """
-
-    def __init__(self, cache: RenderCache) -> None:
-        super().__init__(cache)
-        self.requests: list[list[PageRequest]] = []
-        self.transforms = ManualTransforms(self, immediate=True)
-
-    def request_pages(self, requests: Sequence[PageRequest]) -> None:
-        self.requests.append(list(requests))
-        super().request_pages(requests)
-
-    def flush(self) -> None:
-        pass
-
-    @property
-    def last_pages(self) -> list[int]:
-        """直近の要求のページ番号（優先度順）。"""
-        return [request.page_index for request in self.requests[-1]]
-
-    def repeat_last_request(self) -> None:
-        """直前と同じページ集合を宣言し直す。
-
-        表示用画像はレンダリング完了時・モード変更時・必要なページが
-        変わったときに用意される。キャッシュへ直接仕込んだ画像を、
-        3番目の経路で反映させるために使う。記録は増やさない。
-        """
-        PageRenderService.request_pages(self, self.requests[-1])
-
-
-# ------------------------------------------------------------------ フィクスチャ
-@pytest.fixture
-def controller(sample_pdf: Path) -> Iterator[DocumentController]:
-    """開いた状態の3ページ PDF（A4 / 595x842pt）。"""
-    controller = DocumentController()
-    controller.open(sample_pdf)
-    yield controller
-    controller.close()
-
-
-@pytest.fixture
-def cache() -> RenderCache:
-    """ビューが参照するキャッシュ。テストから画像を仕込むために取っておく。"""
-    return RenderCache()
-
-
-@pytest.fixture
-def service(cache: RenderCache) -> RecordingService:
-    """要求を記録するレンダリングサービス。"""
-    return RecordingService(cache)
-
-
-@pytest.fixture
-def view(qtbot: QtBot, service: RecordingService) -> PdfView:
-    """ドキュメント未設定のビュー。
-
-    ビューポートの大きさは表示されるまで確定しないので、表示してから返す。
-    """
-    view = PdfView(service)
-    qtbot.addWidget(view)
-    view.resize(*VIEWPORT)
-    with qtbot.waitExposed(view):
-        view.show()
-    return view
-
-
-@pytest.fixture
-def loaded_view(view: PdfView, controller: DocumentController) -> PdfView:
-    """3ページ PDF を設定済みのビュー。"""
-    view.set_document(controller.document, controller.page_sizes())
-    return view
 
 
 # ------------------------------------------------------------------ 補助
 def layout_of(controller: DocumentController) -> PageLayout:
     """ビューが内部で作るのと同じレイアウト。"""
     return PageLayout(controller.page_sizes())
-
-
-def put_image(
-    cache: RenderCache, view: PdfView, page: int, color: Qt.GlobalColor, *, scale: float = 1.0
-) -> None:
-    """指定ページの画像をキャッシュに仕込む。
-
-    `scale` を 1.0 以外にすると、表示に必要な解像度とは違う画像になり、
-    仮表示（placeholder）としてだけ使える。
-    """
-    rect = view.page_viewport_rect(page)
-    assert rect is not None
-    dpr = view.devicePixelRatioF()
-    width = max(round(rect.width() * dpr * scale), 1)
-    height = max(round(rect.height() * dpr * scale), 1)
-    image = QImage(width, height, QImage.Format.Format_ARGB32)
-    image.fill(color)
-    cache.put(RenderKey(page, width, height, dpr), image)
-
-
-def render_view(view: PdfView) -> QImage:
-    """ビューポートを描画した結果を取り出す。"""
-    image = QImage(view.viewport().size(), QImage.Format.Format_ARGB32)
-    image.fill(Qt.GlobalColor.black)
-    view.viewport().render(image)
-    return image
 
 
 def page_center_color(view: PdfView, page: int) -> QColor:
@@ -164,22 +50,6 @@ def canvas_color(view: PdfView) -> QColor:
     rect = view.page_viewport_rect(0)
     assert rect is None or not rect.contains(QPointF(point))
     return QColor(render_view(view).pixelColor(point))
-
-
-class UpdateSpy:
-    """`viewport().update()` の呼び出しを記録する。"""
-
-    def __init__(self, view: PdfView) -> None:
-        self.rects: list[QRect | None] = []
-        self._original = view.viewport().update
-        view.viewport().update = self  # type: ignore[assignment]
-
-    def __call__(self, rect: QRect | None = None) -> None:
-        self.rects.append(rect)
-        if rect is None:
-            self._original()
-        else:
-            self._original(rect)
 
 
 # ------------------------------------------------------------------ レイアウトとスクロール
@@ -1368,19 +1238,6 @@ def test_the_mode_can_be_set_without_a_document(view: PdfView) -> None:
     view.set_page_color_mode(PageColorMode.INVERT)
 
     assert view.page_color_mode is PageColorMode.INVERT
-
-
-def count_transforms(monkeypatch: pytest.MonkeyPatch) -> list[PageColorMode]:
-    """色変換が呼ばれるたびに記録するリストを返す。"""
-    calls: list[PageColorMode] = []
-    original = render_module.transform_page
-
-    def counting(image: QImage, mode: PageColorMode) -> QImage:
-        calls.append(mode)
-        return original(image, mode)
-
-    monkeypatch.setattr(render_module, "transform_page", counting)
-    return calls
 
 
 def test_painting_never_transforms(
