@@ -54,6 +54,15 @@ class RecordingService(PageRenderService):
         """直近の要求のページ番号（優先度順）。"""
         return [request.page_index for request in self.requests[-1]]
 
+    def repeat_last_request(self) -> None:
+        """直前と同じページ集合を宣言し直す。
+
+        表示用画像はレンダリング完了時・モード変更時・必要なページが
+        変わったときに用意される。キャッシュへ直接仕込んだ画像を、
+        3番目の経路で反映させるために使う。記録は増やさない。
+        """
+        PageRenderService.request_pages(self, self.requests[-1])
+
 
 # ------------------------------------------------------------------ フィクスチャ
 @pytest.fixture
@@ -1227,12 +1236,16 @@ def test_original_paints_the_rendered_pixels(loaded_view: PdfView, cache: Render
 
 
 def test_invert_paints_the_inverted_pixels(loaded_view: PdfView, cache: RenderCache) -> None:
-    """反転ではページ画像だけが反転して描かれる。"""
-    put_image(cache, loaded_view, 0, Qt.GlobalColor.white)
+    """反転ではページ画像だけが反転して描かれる。
+
+    白ではなく赤を使うのは、反転の結果（cyan）と、画像が無いときの
+    ページ下地（黒）を取り違えないため。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
 
     loaded_view.set_page_color_mode(PageColorMode.INVERT)
 
-    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
 
 
 def test_the_canvas_is_not_inverted(loaded_view: PdfView, cache: RenderCache) -> None:
@@ -1240,7 +1253,7 @@ def test_the_canvas_is_not_inverted(loaded_view: PdfView, cache: RenderCache) ->
 
     これが Windows 全体の色反転ではなく、ページだけを反転する目的そのもの。
     """
-    put_image(cache, loaded_view, 0, Qt.GlobalColor.white)
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
     before = canvas_color(loaded_view)
 
     loaded_view.set_page_color_mode(PageColorMode.INVERT)
@@ -1265,24 +1278,24 @@ def test_the_placeholder_is_inverted_too(loaded_view: PdfView, cache: RenderCach
 
     一瞬だけ元の色が見えてから反転へ切り替わる、という状態を避ける。
     """
-    put_image(cache, loaded_view, 0, Qt.GlobalColor.white, scale=0.5)
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red, scale=0.5)
 
     loaded_view.set_page_color_mode(PageColorMode.INVERT)
 
-    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
 
 
 def test_the_old_mode_image_is_not_painted_after_a_switch(
     loaded_view: PdfView, cache: RenderCache
 ) -> None:
     """切り替えた直後に旧モードの画像を描かない。"""
-    put_image(cache, loaded_view, 0, Qt.GlobalColor.white)
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
     loaded_view.set_page_color_mode(PageColorMode.INVERT)
-    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
 
     loaded_view.set_page_color_mode(PageColorMode.ORIGINAL)
 
-    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.white)
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.red)
 
 
 def test_a_mode_switch_repaints_the_viewport(loaded_view: PdfView) -> None:
@@ -1327,16 +1340,20 @@ def test_a_mode_switch_keeps_the_zoom_and_the_position(loaded_view: PdfView) -> 
 
 
 def test_the_mode_survives_a_document_switch(
-    loaded_view: PdfView, controller: DocumentController, cache: RenderCache
+    loaded_view: PdfView,
+    controller: DocumentController,
+    cache: RenderCache,
+    service: RecordingService,
 ) -> None:
-    """ドキュメントを替えてもモードは維持される（PDF ごとの設定ではない）。"""
+    """ドキュメントを替えてもモードは維持され、新しい PDF も反転で描かれる。"""
     loaded_view.set_page_color_mode(PageColorMode.INVERT)
 
     loaded_view.set_document(controller.document, controller.page_sizes())
 
     assert loaded_view.page_color_mode is PageColorMode.INVERT
-    put_image(cache, loaded_view, 0, Qt.GlobalColor.white)
-    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.black)
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    service.repeat_last_request()
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
 
 
 def test_the_mode_can_be_set_without_a_document(view: PdfView) -> None:
@@ -1346,13 +1363,8 @@ def test_the_mode_can_be_set_without_a_document(view: PdfView) -> None:
     assert view.page_color_mode is PageColorMode.INVERT
 
 
-def test_scrolling_does_not_retransform_the_same_image(
-    loaded_view: PdfView, cache: RenderCache, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """スクロール中の描き直しで同じ画像を何度も変換し直さない。"""
-    put_image(cache, loaded_view, 0, Qt.GlobalColor.white)
-    loaded_view.set_page_color_mode(PageColorMode.INVERT)
-
+def count_transforms(monkeypatch: pytest.MonkeyPatch) -> list[PageColorMode]:
+    """色変換が呼ばれるたびに記録するリストを返す。"""
     calls: list[PageColorMode] = []
     original = render_module.transform_page
 
@@ -1361,10 +1373,40 @@ def test_scrolling_does_not_retransform_the_same_image(
         return original(image, mode)
 
     monkeypatch.setattr(render_module, "transform_page", counting)
+    return calls
+
+
+def test_painting_never_transforms(
+    loaded_view: PdfView, cache: RenderCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """描画では色変換を一切行わない。
+
+    `paintEvent` は「引き当てて `drawImage()`」だけ。変換が描画経路に
+    入ると、スクロール中ずっと CPU を使い、Smart Dark でさらに悪化する。
+    """
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+    calls = count_transforms(monkeypatch)
+
     for _ in range(5):
         render_view(loaded_view)
+    loaded_view.verticalScrollBar().setValue(200)
+    render_view(loaded_view)
+
+    assert calls == []
+
+
+def test_the_transform_happens_once_when_the_mode_changes(
+    loaded_view: PdfView, cache: RenderCache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """変換はモードを変えた時点で1回だけ済ませる。"""
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    calls = count_transforms(monkeypatch)
+
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
 
     assert calls == [PageColorMode.INVERT]
+    assert page_center_color(loaded_view, 0) == QColor(Qt.GlobalColor.cyan)
 
 
 # ------------------------------------------------------------------ ページ移動

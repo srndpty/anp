@@ -26,9 +26,17 @@ from anp.pdf.color import PageColorMode
 
 logger = logging.getLogger(__name__)
 
-# raw 画像と表示用画像の上限。合計は Phase 1 の 256 MiB のままにしてある。
+# raw 画像と表示用画像の**定常保持上限**。合計は Phase 1 の 256 MiB のまま。
 # 表示用画像は変換が要るモード（Invert など）でしか作らず、必要なのは
 # 描画対象のページだけなので、raw 側に多く配分する。
+#
+# 「定常」と断るのは、LRU が「入れてから溢れた分を追い出す」構造だから。
+# 32 MiB の画像を1枚入れる瞬間は上限を超え、追い出しはその直後に起きる。
+# レンダリング中の画像や Qt 内部の待ち行列もこの予算の外側にある。
+#
+# 配分は固定。ORIGINAL で使っている間は表示用の 96 MiB が空いていても raw
+# は借りられないので、Phase 1 より raw のヒット率は下がりうる。共有予算に
+# するかどうかは、実 PDF での追い出し状況を測ってから決める。
 DEFAULT_MAX_BYTES = 160 * 1024 * 1024
 DEFAULT_DISPLAY_MAX_BYTES = 96 * 1024 * 1024
 

@@ -78,6 +78,7 @@ class MainWindow(QMainWindow):
 
         self._view.current_page_changed.connect(self._on_current_page_changed)
         self._view.zoom_changed.connect(self._sync_zoom_ui)
+        self._view.page_color_mode_changed.connect(self._sync_page_color_ui)
 
         self._install_escape_shortcut()
         self._restore_window_state()
@@ -133,11 +134,14 @@ class MainWindow(QMainWindow):
         self._actions.fit_page.triggered.connect(lambda: self._apply_fit(ZoomMode.FIT_PAGE))
         self._actions.full_screen.triggered.connect(self._set_full_screen)
 
+        # 選択表示はビューの `page_color_mode_changed` から取り直すので、
+        # ここでは切り替えを伝えるだけ。ビュー側の API を直接使う経路でも
+        # メニューの表示がずれない。
         self._actions.page_color_original.triggered.connect(
-            lambda: self._set_page_color_mode(PageColorMode.ORIGINAL)
+            lambda: self._view.set_page_color_mode(PageColorMode.ORIGINAL)
         )
         self._actions.page_color_invert.triggered.connect(
-            lambda: self._set_page_color_mode(PageColorMode.INVERT)
+            lambda: self._view.set_page_color_mode(PageColorMode.INVERT)
         )
 
         self._actions.previous_page.triggered.connect(
@@ -159,15 +163,6 @@ class MainWindow(QMainWindow):
         else:
             self._view.fit_page()
         self._sync_zoom_ui()
-
-    def _set_page_color_mode(self, mode: PageColorMode) -> None:
-        """ページの色を切り替え、選択表示を取り直す。
-
-        ドキュメントが開かれていなくても切り替えられる。設定はアプリ全体の
-        ものなので、次に開いた PDF がそのモードで表示される。
-        """
-        self._view.set_page_color_mode(mode)
-        self._sync_page_color_ui()
 
     def _install_escape_shortcut(self) -> None:
         """Esc で全画面を抜ける。通常表示中は何もしない。"""

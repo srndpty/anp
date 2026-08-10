@@ -133,6 +133,27 @@ def test_premultiplied_alpha_is_not_inverted_as_is() -> None:
     assert rgba(result) == (0, 255, 255, 255)
 
 
+def test_half_transparent_premultiplied_input_is_unpremultiplied_first() -> None:
+    """半透明の乗算済みアルファを、非乗算に直してから反転する。
+
+    ここが形式を正規化する理由そのもの。alpha=128 の赤は乗算済みでは
+    (128, 0, 0) として格納されている。そのまま引くと 255-128 = 127 に
+    なり、非乗算の赤（255）を反転した 0 と食い違う。
+    """
+    source = solid(0x80FF0000).convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    # 前提の確認。乗算済みでは R が alpha 分だけ減った値で格納されている。
+    assert source.constBits()[2] != 0xFF  # BGRA 並びの R
+
+    result = transform_page(source, PageColorMode.INVERT)
+
+    # 丸め誤差の分だけ 1 ずれうるので、破綻していないことを見る。
+    red, green, blue, alpha = rgba(result)
+    assert alpha == 0x80
+    assert red <= 2
+    assert green >= 253
+    assert blue >= 253
+
+
 # ------------------------------------------------------------------ Original
 def test_original_does_not_alter_the_pixels() -> None:
     """`ORIGINAL` では画素を変えない。"""

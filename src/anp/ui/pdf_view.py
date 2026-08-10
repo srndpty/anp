@@ -154,6 +154,9 @@ class PdfView(QAbstractScrollArea):
     zoom_changed = Signal()
     """表示倍率か倍率モードが変わった。表示の更新は受け取った側で行う。"""
 
+    page_color_mode_changed = Signal()
+    """ページ色変換が変わった。メニューの選択表示はこれを見て合わせる。"""
+
     def __init__(self, render_service: PageRenderService, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._render = render_service
@@ -259,6 +262,7 @@ class PdfView(QAbstractScrollArea):
             return
         self._render.set_color_mode(mode)
         self.viewport().update()
+        self.page_color_mode_changed.emit()
 
     # -------------------------------------------------- 表示倍率
     @property

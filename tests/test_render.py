@@ -604,21 +604,58 @@ def test_going_back_to_original_restores_the_original_pixels(service: PageRender
     assert rgba(image) == (255, 255, 255, 255)
 
 
-def test_the_same_display_image_is_not_transformed_twice(
+def test_the_display_image_is_prepared_before_it_is_asked_for(
     service: PageRenderService, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """同じ鍵の表示用画像を何度取得しても変換は1回だけ。
+    """変換はモードを変えた時点で済ませ、取得時には行わない。
 
-    描き直しのたびに変換していると、スクロール中ずっと CPU を使う。
+    `image_for()` は `paintEvent` から呼ばれる。ここで変換すると、
+    描画経路に画素処理が入り込む。
     """
     render_page(service)
-    service.set_color_mode(PageColorMode.INVERT)
     calls = count_transforms(monkeypatch)
+
+    service.set_color_mode(PageColorMode.INVERT)
+    assert calls == [PageColorMode.INVERT], "モード変更の時点で用意されていない"
 
     for _ in range(5):
         assert service.image_for(0, A4_AT_72DPI, 1.0) is not None
 
+    assert calls == [PageColorMode.INVERT], "取得のたびに変換している"
+
+
+def test_the_display_image_is_prepared_when_the_render_completes(
+    service: PageRenderService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """レンダリングが終わった時点で表示用画像も用意しておく。"""
+    service.set_color_mode(PageColorMode.INVERT)
+    calls = count_transforms(monkeypatch)
+
+    render_page(service)
+
     assert calls == [PageColorMode.INVERT]
+    image = service.image_for(0, A4_AT_72DPI, 1.0)
+    assert image is not None
+    assert rgba(image) == BLACK
+
+
+def test_the_display_image_is_prepared_when_the_pages_change(
+    service: PageRenderService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """必要なページの集合が変わったときにも用意し直す。
+
+    仮表示に使う別解像度の分も含める。倍率を変えた直後、目的の解像度が
+    届くまでのあいだも変換済みの絵を描けるようにするため。
+    """
+    render_page(service, size=QSize(297, 421))
+    service.set_color_mode(PageColorMode.INVERT)
+    calls = count_transforms(monkeypatch)
+
+    # 倍率が上がって、まだ無い解像度が必要になった。
+    service.request_pages([PageRequest(page_index=0, size_px=QSize(1190, 1684), dpr=1.0)])
+
+    assert calls == []  # 既に用意済みの仮表示を使い回すので、変換は起きない
+    assert service.placeholder_for(0, QSize(1190, 1684)) is not None
 
 
 def test_returning_to_a_mode_transforms_again(
@@ -632,10 +669,8 @@ def test_returning_to_a_mode_transforms_again(
     calls = count_transforms(monkeypatch)
 
     service.set_color_mode(PageColorMode.INVERT)
-    service.image_for(0, A4_AT_72DPI, 1.0)
     service.set_color_mode(PageColorMode.ORIGINAL)
     service.set_color_mode(PageColorMode.INVERT)
-    service.image_for(0, A4_AT_72DPI, 1.0)
 
     assert calls == [PageColorMode.INVERT, PageColorMode.INVERT]
     assert len(service._cache) == 1  # noqa: SLF001
@@ -677,11 +712,13 @@ def test_the_display_cache_is_bounded() -> None:
             RenderKey(page, 595, 842, 1.0), QImage(595, 842, QImage.Format.Format_ARGB32)
         )
 
-    for page in range(4):
-        assert service.image_for(page, A4_AT_72DPI, 1.0) is not None
-        assert service.display_cache.total_bytes <= service.display_cache.max_bytes
+    service.request_pages(requests_for(range(0, 4)))
 
+    assert service.display_cache.total_bytes <= service.display_cache.max_bytes
     assert len(service.display_cache) == 2
+    # 残るのは最後に用意した2ページ分。
+    assert service.image_for(3, A4_AT_72DPI, 1.0) is not None
+    assert service.image_for(0, A4_AT_72DPI, 1.0) is None
 
 
 def test_reset_drops_the_display_images_too(service: PageRenderService) -> None:
