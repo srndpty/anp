@@ -16,6 +16,8 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from anp.core.logging import setup_logging
 from anp.core.paths import AppPaths
 from anp.core.settings import Settings
+from anp.storage import database
+from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
@@ -59,10 +61,22 @@ def main() -> int:
 
     _install_excepthook()
 
-    settings = Settings(QSettings())
-    window = MainWindow(settings)
-    window.show()
+    # SQLite の接続はアプリケーションが所有する。ウィンドウやリポジトリより
+    # 寿命が長く、閉じるのはここだけ（`__del__` には頼らない）。学習マークの
+    # 操作ごとに開き直さないよう、接続は1本を起動から終了まで使い回す。
+    #
+    # 接続やマイグレーションに失敗したらここで落ちる。学習マークが保存
+    # されない状態でリーダーだけ動かすと、記録できているつもりの学習が
+    # 失われるため、握り潰さずに未捕捉例外の経路（ログ＋ダイアログ）へ渡す。
+    connection = database.connect(paths.database_file)
+    try:
+        settings = Settings(QSettings())
+        window = MainWindow(settings, StudyMarkRepository(connection))
+        window.show()
 
-    exit_code = app.exec()
+        exit_code = app.exec()
+    finally:
+        connection.close()
+
     logger.info("anp exited with code %d", exit_code)
     return exit_code
