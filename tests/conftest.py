@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from collections.abc import Iterator
+from contextlib import closing
 from hashlib import md5
 from pathlib import Path
 
@@ -16,6 +18,8 @@ from pytestqt.qtbot import QtBot
 from anp.core.settings import Settings
 from anp.pdf.cache import RenderCache
 from anp.pdf.document import DocumentController
+from anp.storage import database
+from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.pdf_view import PdfView
 from helpers import RecordingService
 
@@ -256,6 +260,24 @@ def loaded_view(view: PdfView, controller: DocumentController) -> PdfView:
     """3ページ PDF を設定済みのビュー。"""
     view.set_document(controller.document, controller.page_sizes())
     return view
+
+
+# ---------------------------------------------------------------- 学習マーク
+@pytest.fixture
+def study_mark_connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    """一時ディレクトリ上の DB への接続。
+
+    **実行環境の `%LOCALAPPDATA%` には触らない。** 本番のパスを使うのは
+    `AppPaths` の組み立てを見るテストだけ。
+    """
+    with closing(database.connect(tmp_path / "anp.sqlite3")) as connection:
+        yield connection
+
+
+@pytest.fixture
+def study_marks(study_mark_connection: sqlite3.Connection) -> StudyMarkRepository:
+    """一時 DB を使う学習マークのリポジトリ。"""
+    return StudyMarkRepository(study_mark_connection)
 
 
 @pytest.fixture

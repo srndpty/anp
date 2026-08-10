@@ -17,18 +17,21 @@ from pytestqt.qtbot import QtBot
 from anp.core.settings import Settings
 from anp.pdf.color import PageColorMode
 from anp.pdf.render import PageRenderService, PageRequest
+from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.appearance import CanvasTheme, UiTheme
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import ZOOM_STEP, ZoomMode
 
 
 @pytest.fixture
-def window(qtbot: QtBot, settings: Settings) -> Iterator[MainWindow]:
+def window(
+    qtbot: QtBot, settings: Settings, study_marks: StudyMarkRepository
+) -> Iterator[MainWindow]:
     """表示済みのメインウィンドウ。
 
     ビューポートの大きさは表示されるまで確定しないので、表示してから返す。
     """
-    window = MainWindow(settings)
+    window = MainWindow(settings, study_marks)
     qtbot.addWidget(window)
     with qtbot.waitExposed(window):
         window.show()
@@ -84,9 +87,11 @@ def test_the_pdf_view_is_the_central_widget(window: MainWindow) -> None:
     assert window.centralWidget() is window.view
 
 
-def test_default_size_when_no_saved_geometry(qapp: QApplication, settings: Settings) -> None:
+def test_default_size_when_no_saved_geometry(
+    qapp: QApplication, settings: Settings, study_marks: StudyMarkRepository
+) -> None:
     """未保存なら既定サイズで開く。"""
-    window = MainWindow(settings)
+    window = MainWindow(settings, study_marks)
     try:
         assert window.size().width() == 1000
         assert window.size().height() == 800
@@ -94,9 +99,11 @@ def test_default_size_when_no_saved_geometry(qapp: QApplication, settings: Setti
         window.deleteLater()
 
 
-def test_geometry_is_saved_on_close(qapp: QApplication, settings: Settings) -> None:
+def test_geometry_is_saved_on_close(
+    qapp: QApplication, settings: Settings, study_marks: StudyMarkRepository
+) -> None:
     """閉じるときにジオメトリと状態が保存される。"""
-    window = MainWindow(settings)
+    window = MainWindow(settings, study_marks)
     window.resize(640, 480)
 
     window.close()
@@ -108,7 +115,9 @@ def test_geometry_is_saved_on_close(qapp: QApplication, settings: Settings) -> N
     window.deleteLater()
 
 
-def test_saved_geometry_is_restored(qapp: QApplication, settings: Settings) -> None:
+def test_saved_geometry_is_restored(
+    qapp: QApplication, settings: Settings, study_marks: StudyMarkRepository
+) -> None:
     """保存されたジオメトリが次回起動時に復元される。
 
     **論理サイズを直接書かない。** `restoreGeometry()` は保存時と復元時の
@@ -118,7 +127,7 @@ def test_saved_geometry_is_restored(qapp: QApplication, settings: Settings) -> N
     （保存したジオメトリを使っている。既定サイズに落ちていない）だけが
     残り、テストが実行環境のスケーリングに左右されなくなる。
     """
-    first = MainWindow(settings)
+    first = MainWindow(settings, study_marks)
     first.resize(720, 540)
     first.close()
     first.deleteLater()
@@ -131,7 +140,7 @@ def test_saved_geometry_is_restored(qapp: QApplication, settings: Settings) -> N
         # 既定サイズと区別できなければ、この検証は何も言っていない。
         assert reference.size() != QSize(1000, 800), "テストの前提が崩れている"
 
-        second = MainWindow(settings)
+        second = MainWindow(settings, study_marks)
         try:
             assert second.size() == reference.size()
         finally:
@@ -717,16 +726,18 @@ def test_a_pdf_opened_later_uses_the_chosen_mode(window: MainWindow, sample_pdf:
 
 
 # ------------------------------------------------------------------ 設定
-def test_the_page_color_mode_round_trips(qapp: QApplication, tmp_path: Path) -> None:
+def test_the_page_color_mode_round_trips(
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
+) -> None:
     """ページの色が次回起動時に復元される。"""
     ini = str(tmp_path / "settings.ini")
 
-    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     first.reader_actions.page_color_invert.trigger()
     first.close()
     first.deleteLater()
 
-    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     try:
         assert second.view.page_color_mode is PageColorMode.INVERT
         assert second.reader_actions.page_color_invert.isChecked()
@@ -734,11 +745,13 @@ def test_the_page_color_mode_round_trips(qapp: QApplication, tmp_path: Path) -> 
         second.deleteLater()
 
 
-def test_smart_dark_round_trips(qapp: QApplication, tmp_path: Path) -> None:
+def test_smart_dark_round_trips(
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
+) -> None:
     """スマートダークも保存され、次回起動時に復元される。"""
     ini = str(tmp_path / "settings.ini")
 
-    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     first.reader_actions.page_color_smart_dark.trigger()
     first.close()
     first.deleteLater()
@@ -746,7 +759,7 @@ def test_smart_dark_round_trips(qapp: QApplication, tmp_path: Path) -> None:
     stored = QSettings(ini, QSettings.Format.IniFormat).value("view/page_color_mode")
     assert stored == "smart_dark"
 
-    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     try:
         assert second.view.page_color_mode is PageColorMode.SMART_DARK
         assert second.reader_actions.page_color_smart_dark.isChecked()
@@ -756,7 +769,7 @@ def test_smart_dark_round_trips(qapp: QApplication, tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("stored", ["solarized", "unknown", "sepia"])
 def test_an_unknown_page_color_mode_falls_back_to_original(
-    qapp: QApplication, tmp_path: Path, stored: str
+    qapp: QApplication, tmp_path: Path, stored: str, study_marks: StudyMarkRepository
 ) -> None:
     """知らないページの色が保存されていたらオリジナルで起動する。
 
@@ -765,7 +778,7 @@ def test_an_unknown_page_color_mode_falls_back_to_original(
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     backend.setValue("view/page_color_mode", stored)
 
-    window = MainWindow(Settings(backend))
+    window = MainWindow(Settings(backend), study_marks)
     try:
         assert window.view.page_color_mode is PageColorMode.ORIGINAL
         assert window.reader_actions.page_color_original.isChecked()
@@ -773,33 +786,37 @@ def test_an_unknown_page_color_mode_falls_back_to_original(
         window.deleteLater()
 
 
-def test_the_zoom_mode_round_trips(qapp: QApplication, tmp_path: Path) -> None:
+def test_the_zoom_mode_round_trips(
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
+) -> None:
     """倍率モードが次回起動時に復元される。"""
     ini = str(tmp_path / "settings.ini")
 
-    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     # ドキュメントが無いとフィットのアクションは無効なので、ビューへ直接指示する。
     first.view.fit_page()
     first.close()
     first.deleteLater()
 
-    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     try:
         assert second.view.zoom_mode is ZoomMode.FIT_PAGE
     finally:
         second.deleteLater()
 
 
-def test_the_free_zoom_round_trips(qapp: QApplication, tmp_path: Path) -> None:
+def test_the_free_zoom_round_trips(
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
+) -> None:
     """手動指定の倍率が次回起動時に復元される。"""
     ini = str(tmp_path / "settings.ini")
 
-    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     first.view.set_zoom(2.0)
     first.close()
     first.deleteLater()
 
-    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     try:
         assert second.view.zoom == pytest.approx(2.0)
         assert second.view.zoom_mode is ZoomMode.FREE
@@ -807,7 +824,9 @@ def test_the_free_zoom_round_trips(qapp: QApplication, tmp_path: Path) -> None:
         second.deleteLater()
 
 
-def test_the_free_zoom_survives_quitting_in_a_fit_mode(qapp: QApplication, tmp_path: Path) -> None:
+def test_the_free_zoom_survives_quitting_in_a_fit_mode(
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
+) -> None:
     """フィット中に終了しても、最後に手で指定した倍率が残る。
 
     保存する倍率を「終了時の倍率」にすると、フィット中に終了したときに
@@ -815,13 +834,13 @@ def test_the_free_zoom_survives_quitting_in_a_fit_mode(qapp: QApplication, tmp_p
     """
     ini = str(tmp_path / "settings.ini")
 
-    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     first.view.set_zoom(2.0)
     first.view.fit_page()
     first.close()
     first.deleteLater()
 
-    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     try:
         assert second.view.zoom_mode is ZoomMode.FIT_PAGE
         assert second.view.last_free_zoom == pytest.approx(2.0)
@@ -829,12 +848,14 @@ def test_the_free_zoom_survives_quitting_in_a_fit_mode(qapp: QApplication, tmp_p
         second.deleteLater()
 
 
-def test_an_unknown_zoom_mode_falls_back_to_free(qapp: QApplication, tmp_path: Path) -> None:
+def test_an_unknown_zoom_mode_falls_back_to_free(
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
+) -> None:
     """知らない倍率モードが保存されていたら FREE で起動する。"""
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     backend.setValue("view/zoom_mode", "fit_diagonal")
 
-    window = MainWindow(Settings(backend))
+    window = MainWindow(Settings(backend), study_marks)
     try:
         assert window.view.zoom_mode is ZoomMode.FREE
     finally:
@@ -990,18 +1011,20 @@ def test_the_appearance_survives_opening_another_pdf(
     assert window.reader_actions.ui_theme_dark.isChecked()
 
 
-def test_the_appearance_round_trips(qapp: QApplication, tmp_path: Path) -> None:
+def test_the_appearance_round_trips(
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
+) -> None:
     """外観の3つの軸が次回起動時に復元される。"""
     ini = str(tmp_path / "settings.ini")
 
-    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    first = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     first.reader_actions.canvas_white.trigger()
     first.reader_actions.ui_theme_dark.trigger()
     first.reader_actions.page_color_invert.trigger()
     first.close()
     first.deleteLater()
 
-    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)))
+    second = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), study_marks)
     try:
         assert second.view.canvas_theme is CanvasTheme.WHITE
         assert second.view.page_color_mode is PageColorMode.INVERT
@@ -1013,13 +1036,13 @@ def test_the_appearance_round_trips(qapp: QApplication, tmp_path: Path) -> None:
 
 
 def test_an_unknown_canvas_theme_falls_back_to_dark_gray(
-    qapp: QApplication, tmp_path: Path
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
 ) -> None:
     """知らないキャンバスの色が保存されていたらダークグレーで起動する。"""
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     backend.setValue("view/canvas_theme", "sepia")
 
-    window = MainWindow(Settings(backend))
+    window = MainWindow(Settings(backend), study_marks)
     try:
         assert window.view.canvas_theme is CanvasTheme.DARK_GRAY
         assert window.reader_actions.canvas_dark_gray.isChecked()
@@ -1027,12 +1050,14 @@ def test_an_unknown_canvas_theme_falls_back_to_dark_gray(
         window.deleteLater()
 
 
-def test_an_unknown_ui_theme_falls_back_to_system(qapp: QApplication, tmp_path: Path) -> None:
+def test_an_unknown_ui_theme_falls_back_to_system(
+    qapp: QApplication, tmp_path: Path, study_marks: StudyMarkRepository
+) -> None:
     """知らない UI テーマが保存されていたらシステムで起動する。"""
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     backend.setValue("ui/theme", "solarized")
 
-    window = MainWindow(Settings(backend))
+    window = MainWindow(Settings(backend), study_marks)
     try:
         assert window.ui_theme is UiTheme.SYSTEM
         assert window.reader_actions.ui_theme_system.isChecked()

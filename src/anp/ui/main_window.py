@@ -9,6 +9,11 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 閉じている。ここが知ってよいのは、開いているパス・倍率とそのモード・
 現在ページ・ページ数・全画面かどうかだけ。
 
+**学習マークの永続化にもここから触らない。** SQLite の接続はアプリケーション
+層が持ち、ここが受け取るのは `StudyMarkRepository` だけ。どの PDF のマークを
+表示するかは `StudyMarkController` が決める。ここの仕事は「PDF が開けた」
+「表示が空になった」を伝えることまで。
+
 外観のうち **UI テーマだけ**をここが持つ。アプリ全体のウィジェットの
 配色はビューの責務ではないため。キャンバスの色は `PdfView`、ページの
 色変換は `PageRenderService` が持ち、3つは互いに連動しない。
@@ -37,9 +42,11 @@ from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController, DocumentError
 from anp.pdf.render import PageRenderService
+from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.pdf_view import PdfView, ZoomMode
+from anp.ui.study_mark_controller import StudyMarkController
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +64,12 @@ _ZOOM_MODE_LABELS = {
 class MainWindow(QMainWindow):
     """アプリケーションのメインウィンドウ。"""
 
-    def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        study_marks: StudyMarkRepository,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._settings = settings
 
@@ -84,6 +96,11 @@ class MainWindow(QMainWindow):
 
         self._view = PdfView(self._render, self)
         self.setCentralWidget(self._view)
+
+        # 学習マークはこのコントローラ越しにだけ触る。ここに
+        # `document_key()` や SQL を持ち込まない。DB 接続はアプリケーション
+        # 層が持ち、ここはリポジトリを受け取るだけ。
+        self._study_marks = StudyMarkController(study_marks, self._view)
 
         self.setWindowTitle("anp")
         populate_menus(self.menuBar(), self._actions)
@@ -248,20 +265,48 @@ class MainWindow(QMainWindow):
 
         `DocumentController.open()` は失敗時に前のドキュメントも閉じるので、
         表示だけ古い PDF のまま残すと、見えている内容と実体がずれる。
+        学習マークも同じ理由で、失敗時は表示対象ごと解除する。
+
+        学習マークを読み込むのは **表示が新しい PDF に確定した後**。
+        `set_document()` より前に読み込むと、ドキュメントの差し替えで
+        そのまま捨てられる。
+
+        学習マークを読み込めなかった場合は、その PDF を開いた状態にも
+        しない（fail-closed）。読み込めていないまま読み進められると、
+        利用者からは「マークが消えた」ようにしか見えず、そのうえ
+        P3-3B 以降の追加・更新が実体の分からない PDF に対して行われる。
+        後始末は開くのに失敗したときと同じ「PDF なし」の状態まで戻し、
+        原因は握り潰さずに送出する。
         """
         try:
             self._controller.open(path)
         except DocumentError as error:
-            self._view.clear_document()
-            self._sync_document_ui()
+            self._clear_document()
             QMessageBox.warning(self, "PDF を開けません", f"{path.name}\n\n{error.message}")
             return
 
         self._settings.last_directory = str(path.parent)
         self._view.set_document(self._controller.document, self._controller.page_sizes())
+        try:
+            self._study_marks.activate_document(path)
+        except Exception:
+            self._clear_document()
+            self._controller.close()
+            raise
+
         self.setWindowTitle(f"{path.name} - anp")
         self._sync_document_ui()
         self.statusBar().showMessage(str(path))
+
+    def _clear_document(self) -> None:
+        """表示を「PDF なし」の状態へ戻す。
+
+        開くのに失敗したときと、学習マークを読み込めなかったときの後始末は
+        同じ。学習マークだけ別の後始末を作らない。
+        """
+        self._view.clear_document()
+        self._study_marks.clear_document()
+        self._sync_document_ui()
 
     # -------------------------------------------------- 表示の同期
     def _sync_document_ui(self) -> None:
@@ -461,6 +506,7 @@ class MainWindow(QMainWindow):
         self._settings.sync()
 
         self._view.clear_document()
+        self._study_marks.clear_document()
         self._controller.close()
         logger.info("main window closed")
         super().closeEvent(event)
@@ -475,3 +521,8 @@ class MainWindow(QMainWindow):
     def view(self) -> PdfView:
         """中央の PDF ビュー。"""
         return self._view
+
+    @property
+    def study_marks(self) -> StudyMarkController:
+        """学習マークのコントローラ。"""
+        return self._study_marks
