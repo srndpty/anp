@@ -7,7 +7,15 @@ import logging
 import pytest
 from PySide6.QtGui import QImage
 
-from anp.pdf.cache import RenderCache, RenderKey
+from anp.pdf.cache import (
+    DEFAULT_DISPLAY_MAX_BYTES,
+    DEFAULT_MAX_BYTES,
+    DisplayCache,
+    DisplayKey,
+    RenderCache,
+    RenderKey,
+)
+from anp.pdf.color import PageColorMode
 
 
 def make_image(width: int, height: int) -> QImage:
@@ -115,26 +123,58 @@ def test_clear_empties_everything() -> None:
 
 
 # ------------------------------------------------------------------ 仮表示用
-def test_nearest_picks_closest_width_on_same_page() -> None:
-    """同じページで、要求幅にいちばん近い画像を返す。"""
+def test_nearest_key_picks_closest_width_on_same_page() -> None:
+    """同じページで、要求幅にいちばん近い画像の鍵を返す。"""
     cache = RenderCache()
     cache.put(make_key(0, width=100, height=200), make_image(100, 200))
     cache.put(make_key(0, width=400, height=800), make_image(400, 800))
 
-    result = cache.nearest(0, width_px=380)
+    result = cache.nearest_key(0, width_px=380)
 
     assert result is not None
-    assert result.width() == 400
+    assert result.width_px == 400
 
 
-def test_nearest_ignores_other_pages() -> None:
+def test_nearest_key_ignores_other_pages() -> None:
     """他のページの画像は返さない。"""
     cache = RenderCache()
     cache.put(make_key(1, width=100), make_image(100, 200))
 
-    assert cache.nearest(0, width_px=100) is None
+    assert cache.nearest_key(0, width_px=100) is None
 
 
-def test_nearest_returns_none_when_empty() -> None:
+def test_nearest_key_returns_none_when_empty() -> None:
     """候補が無ければ None。"""
-    assert RenderCache().nearest(0, width_px=100) is None
+    assert RenderCache().nearest_key(0, width_px=100) is None
+
+
+# ------------------------------------------------------------------ 表示用キャッシュ
+def test_display_key_separates_the_color_modes() -> None:
+    """同じ raw 画像でも、色変換が違えば別のエントリになる。
+
+    色変換はレンダリング条件ではないので `RenderKey` には混ぜない。
+    表示用の同一性は「どの raw に、どの変換をかけたか」で決まる。
+    """
+    cache = DisplayCache()
+    render_key = make_key(0)
+    cache.put(DisplayKey(render_key, PageColorMode.ORIGINAL), make_image(100, 200))
+    cache.put(DisplayKey(render_key, PageColorMode.INVERT), make_image(100, 200))
+
+    assert len(cache) == 2
+
+
+def test_display_cache_has_its_own_bound() -> None:
+    """表示用キャッシュにも合計バイト数の上限がある。"""
+    one_image_bytes = make_image(100, 100).sizeInBytes()
+    cache = DisplayCache(max_bytes=one_image_bytes * 2)
+
+    for page in range(5):
+        cache.put(DisplayKey(make_key(page), PageColorMode.INVERT), make_image(100, 100))
+        assert cache.total_bytes <= cache.max_bytes
+
+    assert len(cache) == 2
+
+
+def test_the_two_budgets_do_not_exceed_the_phase_1_total() -> None:
+    """raw と表示用を足しても Phase 1 の上限（256 MiB）を超えない。"""
+    assert DEFAULT_MAX_BYTES + DEFAULT_DISPLAY_MAX_BYTES == 256 * 1024 * 1024

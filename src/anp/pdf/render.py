@@ -20,6 +20,14 @@
 （実機確認済み）。そのため未処理の要求の台帳は `reset()` でも消さない。
 消してしまうと、再利用された ID の古い結果を新しい世代のものとして
 受け入れてしまう。
+
+レンダリングの結果（raw 画像）と、それに色変換をかけた表示用画像は
+別々に持つ。`PageColorMode` はレンダリング要求の条件ではないので、
+色を変えても `QPdfPageRenderer` へ再要求しない。
+
+表示用画像は `_prepare_display_images()` で **描画より前に** 作る。
+`image_for()` / `placeholder_for()` は `paintEvent` から呼ばれるので、
+引き当てだけを行い画素には触らない。
 """
 
 from __future__ import annotations
@@ -33,7 +41,14 @@ from PySide6.QtCore import QObject, QSize, QTimer, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtPdf import QPdfDocument, QPdfDocumentRenderOptions, QPdfPageRenderer
 
-from anp.pdf.cache import RenderCache, RenderKey
+from anp.pdf.cache import (
+    DEFAULT_DISPLAY_MAX_BYTES,
+    DisplayCache,
+    DisplayKey,
+    RenderCache,
+    RenderKey,
+)
+from anp.pdf.color import PageColorMode, transform_page
 
 logger = logging.getLogger(__name__)
 
@@ -118,14 +133,18 @@ class PageRenderService(QObject):
         cache: RenderCache,
         *,
         max_render_bytes: int = DEFAULT_MAX_RENDER_BYTES,
+        display_max_bytes: int = DEFAULT_DISPLAY_MAX_BYTES,
         max_inflight: int = DEFAULT_MAX_INFLIGHT,
         debounce_ms: int = DEFAULT_DEBOUNCE_MS,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self._cache = cache
-        # キャッシュに入らない大きさを要求しても捨てるしかないので、上限を揃える。
-        self._max_render_bytes = min(max_render_bytes, cache.max_bytes)
+        self._display_cache = DisplayCache(display_max_bytes)
+        self._color_mode = PageColorMode.ORIGINAL
+        # どちらのキャッシュにも入らない大きさを要求しても捨てるしかないので、
+        # 上限を揃える。表示用画像は raw と同じ画素数になる。
+        self._max_render_bytes = min(max_render_bytes, cache.max_bytes, display_max_bytes)
         self._max_inflight = max_inflight
         self._debounce_ms = debounce_ms
 
@@ -172,20 +191,94 @@ class PageRenderService(QObject):
         self._desired.clear()
         self._dispatch_timer.stop()
         self._cache.clear()
+        self._display_cache.clear()
         logger.info("render state reset (generation %d)", self._generation)
 
-    # -------------------------------------------------- 取得
+    # -------------------------------------------------- ページの色
+    @property
+    def color_mode(self) -> PageColorMode:
+        """ページ画像に適用している色変換。"""
+        return self._color_mode
+
+    def set_color_mode(self, mode: PageColorMode) -> None:
+        """色変換を切り替える。**raw 画像は捨てない。**
+
+        捨てるのは表示用画像だけ。`QPdfPageRenderer` への再要求は起きないので、
+        Original ⇄ Invert を往復してもレンダリング待ちの白紙には戻らない。
+
+        `DisplayKey` はモードを含むので、古いモードの画像が返ることは
+        鍵の上でも起こらない。ここで捨てるのは、二度と引き当てられない
+        画像でメモリを占めないため。
+        """
+        if mode is self._color_mode:
+            return
+        self._color_mode = mode
+        self._display_cache.clear()
+        self._prepare_display_images()
+
+    # -------------------------------------------------- 取得（描画経路）
+    # ここは `paintEvent` から呼ばれる。**引き当てだけを行い、変換はしない。**
+    # 必要な表示用画像は `_prepare_display_images()` が先に作っておく。
     def image_for(self, page_index: int, size_px: QSize, dpr: float) -> QImage | None:
-        """要求どおりの画像があれば返す。"""
-        return self._cache.get(self._key_for(page_index, size_px, dpr))
+        """要求どおりの解像度の表示用画像があれば返す。"""
+        return self._display_lookup(self._key_for(page_index, size_px, dpr))
 
     def placeholder_for(self, page_index: int, size_px: QSize) -> QImage | None:
         """目的の解像度が揃うまでの仮表示に使う画像。
 
         同じページの別解像度があればそれを返す。呼び出し側が目標の矩形へ
-        拡大縮小して描く。
+        拡大縮小して描く。仮表示も **現在のモードのもの** を返す。
+        変換前の絵を先に見せると、切り替えた瞬間に元の色が一瞬見える。
         """
-        return self._cache.nearest(page_index, clamp_render_size(size_px).width())
+        key = self._cache.nearest_key(page_index, clamp_render_size(size_px).width())
+        return self._display_lookup(key) if key is not None else None
+
+    def raw_image_for(self, page_index: int, size_px: QSize, dpr: float) -> QImage | None:
+        """色変換をかける前の画像。検査用。"""
+        return self._cache.get(self._key_for(page_index, size_px, dpr))
+
+    def _display_lookup(self, key: RenderKey) -> QImage | None:
+        """描画に使う画像を引き当てる。ここでは画素に触らない。"""
+        if self._color_mode is PageColorMode.ORIGINAL:
+            # ORIGINAL は raw をそのまま表示する。同じ絵を二重に持たない。
+            return self._cache.get(key)
+        return self._display_cache.get(DisplayKey(render_key=key, color_mode=self._color_mode))
+
+    # -------------------------------------------------- 表示用画像の用意
+    def _prepare_display_images(self) -> None:
+        """いま必要なページの表示用画像を、描画より前に作っておく。
+
+        呼ばれるのは次の3か所だけ。どれも描画の外側にある。
+
+        1. raw のレンダリングが終わったとき
+        2. 色変換のモードが変わったとき
+        3. 必要なページの集合が変わったとき（`request_pages()`）
+
+        **変換を描画経路へ持ち込まないための境界がここ。** Invert は
+        A4 の 400% でも 7ms 程度なので、いまは GUI スレッドでそのまま
+        変換している。重い変換（Smart Dark）が要るようになったら、
+        差し替えるのはこのメソッドの中だけで済む。
+        """
+        if self._color_mode is PageColorMode.ORIGINAL:
+            # 変換が不要なので作るものが無い。raw の LRU は描画時の
+            # 引き当てで更新される。
+            return
+
+        for page_index, key in self._desired.items():
+            # 目的の解像度がまだ無いページには、仮表示に使う別解像度を用意する。
+            raw_key = (
+                key if key in self._cache else self._cache.nearest_key(page_index, key.width_px)
+            )
+            # raw 側の LRU もここで更新する。描画時の引き当ては表示用しか見ないので、
+            # ここで触らないと、表示用が残っているのに元の raw が追い出されてしまう。
+            raw = self._cache.get(raw_key) if raw_key is not None else None
+            if raw_key is None or raw is None:
+                # そのページには使える画像がまだ1枚も無い。
+                continue
+
+            display_key = DisplayKey(render_key=raw_key, color_mode=self._color_mode)
+            if display_key not in self._display_cache:
+                self._display_cache.put(display_key, transform_page(raw, self._color_mode))
 
     # -------------------------------------------------- 要求
     def request_pages(self, requests: Sequence[PageRequest]) -> None:
@@ -207,6 +300,7 @@ class PageRenderService(QObject):
             for page, key in desired.items()
         )
         self._desired = desired
+        self._prepare_display_images()
         self._schedule(scale_changed=scale_changed)
 
     def flush(self) -> None:
@@ -269,6 +363,11 @@ class PageRenderService(QObject):
         """現在の世代。"""
         return self._generation
 
+    @property
+    def display_cache(self) -> DisplayCache:
+        """表示用画像のキャッシュ。中身と上限を確かめるために公開している。"""
+        return self._display_cache
+
     # -------------------------------------------------- 内部
     def _key_for(self, page_index: int, size_px: QSize, dpr: float) -> RenderKey:
         clamped = clamp_render_size(size_px, self._max_render_bytes)
@@ -307,13 +406,20 @@ class PageRenderService(QObject):
         if request.generation != self._generation:
             logger.debug("discarding stale render for page %d", request.qt_key.page_index)
         else:
+            ready: list[int] = []
             for key in request.render_keys:
                 # Qt が返す画像の devicePixelRatio は常に 1.0 なので、ここで設定する。
                 # 相乗りした条件と共有しないよう複製してから設定する。
                 page_image = image.copy() if len(request.render_keys) > 1 else image
                 page_image.setDevicePixelRatio(key.dpr)
                 if self._cache.put(key, page_image):
-                    self.page_ready.emit(key.page_index)
+                    ready.append(key.page_index)
+
+            # 通知より先に表示用画像を用意する。受け取った側は再描画するので、
+            # 順序を逆にすると変換が描画経路に入り込む。
+            self._prepare_display_images()
+            for page_index in ready:
+                self.page_ready.emit(page_index)
 
         # 枠が空いたので、いま必要な分の続きを発行する。
         self.flush()

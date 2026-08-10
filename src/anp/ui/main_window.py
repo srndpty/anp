@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from anp import __version__
 from anp.core.settings import Settings
 from anp.pdf.cache import RenderCache
+from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController, DocumentError
 from anp.pdf.render import PageRenderService
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
@@ -77,10 +78,12 @@ class MainWindow(QMainWindow):
 
         self._view.current_page_changed.connect(self._on_current_page_changed)
         self._view.zoom_changed.connect(self._sync_zoom_ui)
+        self._view.page_color_mode_changed.connect(self._sync_page_color_ui)
 
         self._install_escape_shortcut()
         self._restore_window_state()
         self._restore_zoom()
+        self._restore_page_color_mode()
         self._sync_document_ui()
 
     # -------------------------------------------------- 構築
@@ -130,6 +133,16 @@ class MainWindow(QMainWindow):
         self._actions.fit_width.triggered.connect(lambda: self._apply_fit(ZoomMode.FIT_WIDTH))
         self._actions.fit_page.triggered.connect(lambda: self._apply_fit(ZoomMode.FIT_PAGE))
         self._actions.full_screen.triggered.connect(self._set_full_screen)
+
+        # 選択表示はビューの `page_color_mode_changed` から取り直すので、
+        # ここでは切り替えを伝えるだけ。ビュー側の API を直接使う経路でも
+        # メニューの表示がずれない。
+        self._actions.page_color_original.triggered.connect(
+            lambda: self._view.set_page_color_mode(PageColorMode.ORIGINAL)
+        )
+        self._actions.page_color_invert.triggered.connect(
+            lambda: self._view.set_page_color_mode(PageColorMode.INVERT)
+        )
 
         self._actions.previous_page.triggered.connect(
             lambda: self._view.go_to_page(self._view.current_page - 1)
@@ -211,6 +224,7 @@ class MainWindow(QMainWindow):
 
         self._sync_page_ui()
         self._sync_zoom_ui()
+        self._sync_page_color_ui()
 
     def _sync_page_ui(self) -> None:
         """現在ページに合わせてページ入力と前/次を揃える。
@@ -236,6 +250,12 @@ class MainWindow(QMainWindow):
         self._zoom_label.setText(_ZOOM_MODE_LABELS.get(mode, f"{round(self._view.zoom * 100)}%"))
         self._actions.fit_width.setChecked(mode is ZoomMode.FIT_WIDTH)
         self._actions.fit_page.setChecked(mode is ZoomMode.FIT_PAGE)
+
+    def _sync_page_color_ui(self) -> None:
+        """ページの色の選択表示を、ビューの状態に合わせる。"""
+        mode = self._view.page_color_mode
+        self._actions.page_color_original.setChecked(mode is PageColorMode.ORIGINAL)
+        self._actions.page_color_invert.setChecked(mode is PageColorMode.INVERT)
 
     def _on_current_page_changed(self, _page: int) -> None:
         """ビューの現在ページが変わったときだけ UI を更新する。
@@ -309,6 +329,16 @@ class MainWindow(QMainWindow):
         elif mode is ZoomMode.FIT_PAGE:
             self._view.fit_page()
 
+    def _restore_page_color_mode(self) -> None:
+        """保存されたページの色を復元する。知らない名前なら Original。"""
+        name = self._settings.page_color_mode
+        try:
+            mode = PageColorMode(name)
+        except ValueError:
+            logger.warning("unknown page color mode in settings: %r", name)
+            return
+        self._view.set_page_color_mode(mode)
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt の命名規則)
         """終了時にウィンドウの位置と状態、倍率を保存し、PDF を解放する。
 
@@ -327,6 +357,7 @@ class MainWindow(QMainWindow):
         # 現在の倍率を使うと、フィット中に終了したときにビューポート依存の
         # 値が焼き付いてしまい、手で選んだ倍率も失われる。
         self._settings.free_zoom = self._view.last_free_zoom
+        self._settings.page_color_mode = self._view.page_color_mode.value
         self._settings.sync()
 
         self._view.clear_document()
