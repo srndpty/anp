@@ -261,6 +261,33 @@ def test_a_dpr_change_requests_the_new_resolution(
     assert len(service.requests) == count + 1
 
 
+def test_a_dpr_change_keeps_the_zoom_and_the_mode(loaded_view: PdfView) -> None:
+    """DPR が変わっても倍率とモードは動かさない。
+
+    要求する解像度だけが変わる。倍率まで動くと、モニタ間の移動で表示の
+    大きさが変わってしまう。
+    """
+    loaded_view.fit_width()
+    zoom = loaded_view.zoom
+
+    QApplication.sendEvent(loaded_view, QEvent(QEvent.Type.DevicePixelRatioChange))
+
+    assert loaded_view.zoom == pytest.approx(zoom)
+    assert loaded_view.zoom_mode is ZoomMode.FIT_WIDTH
+
+
+def test_a_dpr_change_keeps_the_scroll_position(loaded_view: PdfView) -> None:
+    """DPR が変わってもスクロール位置と現在ページは動かさない。"""
+    loaded_view.verticalScrollBar().setValue(1000)
+    position = loaded_view.verticalScrollBar().value()
+    page = loaded_view.current_page
+
+    QApplication.sendEvent(loaded_view, QEvent(QEvent.Type.DevicePixelRatioChange))
+
+    assert loaded_view.verticalScrollBar().value() == position
+    assert loaded_view.current_page == page
+
+
 def test_zoom_requests_only_once(loaded_view: PdfView, service: RecordingService) -> None:
     """ズームの途中経過でレンダリング要求を出さない。
 
@@ -839,6 +866,237 @@ def test_fit_without_a_document_only_records_the_mode(view: PdfView) -> None:
 
     assert view.zoom_mode is ZoomMode.FIT_WIDTH
     assert view.zoom == pytest.approx(1.0)
+
+
+# ------------------------------------------------------------------ フィットとスクロールバー
+def settle(view: PdfView, *, rounds: int = 8) -> list[float]:
+    """保留中のレイアウトを流し切りながら、各回の倍率を記録する。
+
+    スクロールバーの出し入れは `QAbstractScrollArea` が遅延して行うので、
+    イベントを流さないと最終状態にならない。待ち時間ではなくイベントの
+    処理回数で回すので、実行環境の速さに依存しない。
+    """
+    zooms: list[float] = []
+    for _ in range(rounds):
+        QApplication.processEvents()
+        zooms.append(view.zoom)
+    return zooms
+
+
+def single_page_view(view: PdfView, path: Path, size: QSizeF | None = None) -> PdfView:
+    """1ページ PDF を設定したビュー。`size` を渡すと寸法を差し替える。"""
+    controller = DocumentController()
+    controller.open(path)
+    try:
+        view.set_document(controller.document, [size] if size else controller.page_sizes())
+    finally:
+        controller.close()
+    return view
+
+
+def test_the_vertical_scrollbar_appears_when_a_document_is_set(loaded_view: PdfView) -> None:
+    """PDF を設定した時点で縦スクロールバーが出る。
+
+    可動域の変化はバーを出し入れする合図でもあるので、更新中に
+    `blockSignals()` で黙らせると、リサイズするまでバーが出ないままになる。
+    """
+    settle(loaded_view)
+
+    assert loaded_view.verticalScrollBar().isVisible()
+    assert loaded_view.verticalScrollBar().maximum() > 0
+
+
+def test_the_scrollbars_disappear_when_the_document_is_cleared(loaded_view: PdfView) -> None:
+    """クリアするとバーも消える。"""
+    settle(loaded_view)
+
+    loaded_view.clear_document()
+    settle(loaded_view)
+
+    assert not loaded_view.verticalScrollBar().isVisible()
+    assert not loaded_view.horizontalScrollBar().isVisible()
+
+
+@pytest.mark.parametrize("height", range(540, 620, 4))
+def test_fit_width_settles_when_the_scrollbar_toggles(
+    view: PdfView, single_page_pdf: Path, height: int
+) -> None:
+    """幅フィットが縦スクロールバーの出入りで振動しない。
+
+    バーが出るとビューポートが狭まり、幅フィットの倍率が下がり、ページが
+    縦に縮んでバーが要らなくなる…という往復が起こりうる大きさがある
+    （1ページの A4 で実際に再現した）。倍率をバーの有無から決めないので、
+    同じウィンドウサイズなら必ず同じ倍率に落ち着く。
+
+    リサイズイベントの回数ではなく、最終状態が動かなくなることを見る。
+    """
+    single_page_view(view, single_page_pdf)
+    view.fit_width()
+
+    view.resize(410, height)
+    zooms = settle(view, rounds=10)
+
+    assert zooms[-4:] == pytest.approx([zooms[-1]] * 4)
+    assert view.zoom_mode is ZoomMode.FIT_WIDTH
+
+
+@pytest.mark.parametrize("height", range(540, 620, 4))
+def test_fit_width_leaves_no_horizontal_scrollbar(
+    view: PdfView, single_page_pdf: Path, height: int
+) -> None:
+    """収束後、ページ幅がビューポートに収まっていて横バーが出ない。
+
+    振動を「バーを出したまま」で止めても、ページが横にはみ出していては
+    収束したとは言えない。
+    """
+    single_page_view(view, single_page_pdf)
+    view.fit_width()
+
+    view.resize(410, height)
+    settle(view, rounds=10)
+
+    rect = view.page_viewport_rect(0)
+    assert rect is not None
+    assert rect.width() <= view.viewport().width()
+    assert view.horizontalScrollBar().maximum() == 0
+
+
+@pytest.mark.parametrize("width", range(360, 720, 6))
+def test_fit_width_never_needs_horizontal_scrolling(
+    view: PdfView, single_page_pdf: Path, width: int
+) -> None:
+    """どの幅でも、幅フィットの後に横スクロールが残らない。
+
+    ページ幅はビューポート幅ちょうどに合わせるので、可動域を素直に
+    切り上げると浮動小数点の誤差が「1px 分の横スクロール」に化ける。
+    """
+    single_page_view(view, single_page_pdf)
+    view.fit_width()
+
+    view.resize(width, 600)
+    settle(view, rounds=10)
+
+    assert view.horizontalScrollBar().maximum() == 0
+    assert not view.horizontalScrollBar().isVisible()
+
+
+def test_fit_page_settles_when_the_scrollbar_toggles(view: PdfView, single_page_pdf: Path) -> None:
+    """ページフィットでも同じ大きさなら同じ倍率に落ち着く。"""
+    single_page_view(view, single_page_pdf)
+    view.fit_page()
+
+    for height in range(540, 620, 4):
+        view.resize(410, height)
+        zooms = settle(view, rounds=10)
+        assert zooms[-4:] == pytest.approx([zooms[-1]] * 4), f"height={height}"
+
+
+def test_the_same_size_gives_the_same_fit_zoom(view: PdfView, single_page_pdf: Path) -> None:
+    """行き来しても、同じウィンドウサイズなら同じ倍率に戻る。
+
+    倍率が「いまバーが出ているか」に依存すると、同じ大きさでも直前の
+    経路によって違う倍率になる。
+    """
+    single_page_view(view, single_page_pdf)
+    view.fit_width()
+
+    view.resize(410, 560)
+    settle(view)
+    first = view.zoom
+
+    view.resize(800, 300)
+    settle(view)
+    view.resize(410, 560)
+    settle(view)
+
+    assert view.zoom == pytest.approx(first)
+
+
+# ------------------------------------------------------------------ 極端なページ
+@pytest.mark.parametrize(
+    ("width", "height"),
+    [(2000.0, 100.0), (100.0, 5000.0), (10.0, 10.0), (5000.0, 5000.0)],
+)
+def test_extreme_aspect_ratios_fit_within_the_limits(
+    view: PdfView, single_page_pdf: Path, width: float, height: float
+) -> None:
+    """極端な縦横比でも倍率は上下限に収まり、状態が落ち着く。"""
+    single_page_view(view, single_page_pdf, QSizeF(width, height))
+
+    for apply_fit in (view.fit_width, view.fit_page):
+        apply_fit()
+        zooms = settle(view, rounds=10)
+
+        assert MIN_ZOOM <= view.zoom <= MAX_ZOOM
+        assert zooms[-4:] == pytest.approx([zooms[-1]] * 4)
+
+
+def test_a_wide_page_fits_the_width(view: PdfView, single_page_pdf: Path) -> None:
+    """横長のページでも、下限に達しない範囲なら幅フィットは幅に収まる。"""
+    single_page_view(view, single_page_pdf, QSizeF(1000.0, 100.0))
+
+    view.fit_width()
+    settle(view)
+
+    rect = view.page_viewport_rect(0)
+    assert rect is not None
+    assert rect.width() <= view.viewport().width()
+
+
+def test_a_tall_page_fits_the_page(view: PdfView, single_page_pdf: Path) -> None:
+    """縦長のページでも、下限に達しない範囲ならページフィットは収まる。"""
+    single_page_view(view, single_page_pdf, QSizeF(300.0, 1000.0))
+
+    view.fit_page()
+    settle(view)
+
+    rect = view.page_viewport_rect(0)
+    assert rect is not None
+    assert rect.height() <= view.viewport().height()
+    assert rect.width() <= view.viewport().width()
+
+
+def test_a_page_too_large_to_fit_stops_at_the_minimum_zoom(
+    view: PdfView, single_page_pdf: Path
+) -> None:
+    """下限より小さくしないと収まらないページは、下限で止めてスクロールに任せる。
+
+    フィットのために `MIN_ZOOM` を割ると、読めない大きさまで縮んでしまう。
+    """
+    single_page_view(view, single_page_pdf, QSizeF(2000.0, 100.0))
+
+    view.fit_width()
+    settle(view)
+
+    assert view.zoom == MIN_ZOOM
+    rect = view.page_viewport_rect(0)
+    assert rect is not None
+    assert rect.width() > view.viewport().width()
+    # 収まらない分は横スクロールで届く。
+    assert view.horizontalScrollBar().maximum() > 0
+
+
+def test_a_single_page_document_has_no_next_page(view: PdfView, single_page_pdf: Path) -> None:
+    """1ページの PDF では移動しても現在ページは 0 のまま。"""
+    single_page_view(view, single_page_pdf)
+
+    view.go_to_page(1)
+
+    assert view.page_count == 1
+    assert view.current_page == 0
+    assert list(view.visible_pages()) == [0]
+
+
+def test_min_and_max_zoom_still_paint(view: PdfView, single_page_pdf: Path) -> None:
+    """上下限の倍率でも描画とレンダリング要求が成立する。"""
+    single_page_view(view, single_page_pdf)
+
+    for zoom in (MIN_ZOOM, MAX_ZOOM):
+        view.set_zoom(zoom)
+        settle(view)
+
+        assert view.zoom == pytest.approx(zoom)
+        assert page_center_color(view, 0) == QColor(Qt.GlobalColor.white)
 
 
 # ------------------------------------------------------------------ Ctrl+ホイール

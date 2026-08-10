@@ -310,7 +310,16 @@ class MainWindow(QMainWindow):
             self._view.fit_page()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt の命名規則)
-        """終了時にウィンドウの位置と状態、倍率を保存する。"""
+        """終了時にウィンドウの位置と状態、倍率を保存し、PDF を解放する。
+
+        解放の順序は「表示 → ドキュメント」。`clear_document()` が世代を
+        進めてキャッシュと要求を捨ててから、ドキュメントを閉じる。逆に
+        すると、閉じた後のドキュメントに対する要求が残る。
+
+        ここで閉じるのは、閉じたウィンドウがレンダリング結果とキャッシュを
+        抱えたままにならないようにするため。なお `QPdfDocument.close()` は
+        ファイルハンドルまでは手放さない（それは破棄時）。
+        """
         self._settings.window_geometry = self.saveGeometry()
         self._settings.window_state = self.saveState()
         self._settings.zoom_mode = self._view.zoom_mode.value
@@ -319,6 +328,9 @@ class MainWindow(QMainWindow):
         # 値が焼き付いてしまい、手で選んだ倍率も失われる。
         self._settings.free_zoom = self._view.last_free_zoom
         self._settings.sync()
+
+        self._view.clear_document()
+        self._controller.close()
         logger.info("main window closed")
         super().closeEvent(event)
 

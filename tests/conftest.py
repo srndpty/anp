@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from hashlib import md5
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,129 @@ def broken_pdf(tmp_path: Path) -> Path:
     path = tmp_path / "broken.pdf"
     path.write_text("これは PDF ではありません", encoding="utf-8")
     return path
+
+
+@pytest.fixture
+def empty_pdf(tmp_path: Path) -> Path:
+    """中身が0バイトのファイル。"""
+    path = tmp_path / "empty.pdf"
+    path.write_bytes(b"")
+    return path
+
+
+@pytest.fixture
+def directory_pdf(tmp_path: Path) -> Path:
+    """PDF のような名前のディレクトリ。開けないパスの代表として使う。"""
+    path = tmp_path / "directory.pdf"
+    path.mkdir()
+    return path
+
+
+def _write_pdf_objects(path: Path, objects: list[bytes], trailer_extra: str = "") -> Path:
+    """番号付きオブジェクトと xref を並べた PDF を書き出す。
+
+    `QPdfWriter` では作れない PDF（ページが無い、暗号化されている）を
+    テストのために組み立てる。
+    """
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R{trailer_extra} >>\n"
+        f"startxref\n{xref}\n%%EOF\n"
+    ).encode()
+
+    path.write_bytes(bytes(out))
+    return path
+
+
+@pytest.fixture
+def pageless_pdf(qapp: QApplication, tmp_path: Path) -> Path:
+    """PDF としては読めるが、ページが1つも無いファイル。"""
+    return _write_pdf_objects(
+        tmp_path / "pageless.pdf",
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [] /Count 0 >>",
+        ],
+    )
+
+
+# ---------------------------------------------------------------- 暗号化 PDF
+# パスワードが要る PDF を作るライブラリを増やしたくないので、最小の
+# RC4 40bit（/V 1 /R 2）暗号化 PDF をここで組み立てる。PDF 1.4 の
+# Algorithm 2〜5 をそのまま実装したもので、pdfium は空パスワードでの
+# 認証に失敗し `IncorrectPassword` を返す。
+_PASSWORD_PAD = bytes.fromhex("28bf4e5e4e758a4164004e56fffa01082e2e00b6d0683e802f0ca9fe6453697a")
+
+
+def _rc4(key: bytes, data: bytes) -> bytes:
+    state = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + state[i] + key[i % len(key)]) % 256
+        state[i], state[j] = state[j], state[i]
+    out = bytearray()
+    i = j = 0
+    for byte in data:
+        i = (i + 1) % 256
+        j = (j + state[i]) % 256
+        state[i], state[j] = state[j], state[i]
+        out.append(byte ^ state[(state[i] + state[j]) % 256])
+    return bytes(out)
+
+
+def _write_encrypted_pdf(path: Path, user_password: str, owner_password: str) -> Path:
+    """RC4 40bit で暗号化した1ページの PDF を書き出す。"""
+    file_id = bytes(range(16))
+    permissions = -1
+
+    owner_key = md5((owner_password.encode() + _PASSWORD_PAD)[:32]).digest()[:5]
+    owner_value = _rc4(owner_key, (user_password.encode() + _PASSWORD_PAD)[:32])
+
+    digest = md5((user_password.encode() + _PASSWORD_PAD)[:32])
+    digest.update(owner_value)
+    digest.update(permissions.to_bytes(4, "little", signed=True))
+    digest.update(file_id)
+    user_value = _rc4(digest.digest()[:5], _PASSWORD_PAD)
+
+    def literal(data: bytes) -> bytes:
+        escaped = data.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+        return b"(" + escaped + b")"
+
+    # 内容のないページなので、暗号化が要るストリームは無い。
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>",
+        b"<< /Filter /Standard /V 1 /R 2 /O "
+        + literal(owner_value)
+        + b" /U "
+        + literal(user_value)
+        + b" /P "
+        + str(permissions).encode()
+        + b" >>",
+    ]
+
+    return _write_pdf_objects(
+        path,
+        objects,
+        f" /Encrypt {len(objects)} 0 R /ID [<{file_id.hex()}> <{file_id.hex()}>]",
+    )
+
+
+@pytest.fixture
+def encrypted_pdf(qapp: QApplication, tmp_path: Path) -> Path:
+    """開くのにユーザパスワードが要る PDF。"""
+    return _write_encrypted_pdf(tmp_path / "encrypted.pdf", "secret", "owner")
 
 
 @pytest.fixture

@@ -79,6 +79,12 @@ _CANVAS_COLOR = QColor(0x52, 0x56, 0x59)
 # システムの「1度に送る行数」倍だけ動く。
 _SCROLL_STEP = 30
 
+# 可動域を切り上げるときに無視する、はみ出しの端数（論理ピクセル）。
+# 幅フィットではページ幅をビューポート幅ちょうどに合わせるが、
+# 倍率を掛け直す過程で 1e-13 程度の誤差が残る。切り上げると、この誤差が
+# 「1px 分スクロールできる」に化けて横スクロールバーが出てしまう。
+_SCROLL_EPSILON = 1e-6
+
 # ドキュメントが無いときの現在ページ。
 NO_PAGE = -1
 
@@ -120,6 +126,16 @@ def _anchor_ratio(
     return min(max((center - page_start) / length, 0.0), 1.0)
 
 
+def _fit_zoom_of(layout: PageLayout, mode: ZoomMode, page: int, size: QSizeF) -> float:
+    """与えたビューポートの大きさに対するフィット倍率。
+
+    上下限への丸めは行わない（`PageLayout` と同じく範囲を知らない）。
+    """
+    if mode is ZoomMode.FIT_WIDTH:
+        return layout.fit_width_zoom(page, size.width())
+    return layout.fit_page_zoom(page, size)
+
+
 class PdfView(QAbstractScrollArea):
     """PDF を縦に連続スクロールして表示するビュー。
 
@@ -141,6 +157,9 @@ class PdfView(QAbstractScrollArea):
         self._zoom_mode = ZoomMode.FREE
         self._last_free_zoom = 1.0
         self._current_page = NO_PAGE
+
+        # 可動域と位置をまとめて更新している間だけ立てる。`_quiet_scrollbars()` を参照。
+        self._scroll_updates_suppressed = False
 
         self.viewport().setAutoFillBackground(False)
         self._update_scrollbars()
@@ -273,12 +292,34 @@ class PdfView(QAbstractScrollArea):
         `PageLayout` は表示倍率の許容範囲を知らないので 0.0 を返しうる。
         `_set_zoom_state()` が下限へ丸める。
         """
-        if self._layout is None or mode is ZoomMode.FREE:
+        layout = self._layout
+        if layout is None or mode is ZoomMode.FREE:
             return self._zoom
-        size = QSizeF(self.viewport().size())
-        if mode is ZoomMode.FIT_WIDTH:
-            return self._layout.fit_width_zoom(page, size.width())
-        return self._layout.fit_page_zoom(page, size)
+        return _fit_zoom_of(layout, mode, page, self._fit_viewport_size(layout, mode, page))
+
+    def _fit_viewport_size(self, layout: PageLayout, mode: ZoomMode, page: int) -> QSizeF:
+        """フィット倍率の基準にするビューポートの大きさ。
+
+        **いま縦スクロールバーが出ているかどうかで決めてはならない。**
+        バーの出入りはビューポートを狭め、`resizeEvent` を通じてフィット
+        倍率を変え、それがまたバーの出入りを変える。境界付近の文書では
+        「バーが出る ⇄ 引っ込む」が止まらなくなる。
+
+        そこでバーが無いときの大きさ（`maximumViewportSize()`）だけを
+        入力にして、「その倍率で縦スクロールが要るならバーの幅を引く」と
+        一意に決める。現在の表示状態が入らないので、同じウィンドウサイズ
+        なら常に同じ倍率になり、1〜2回の追随で必ず止まる。
+
+        境界付近では、結果的にバーが引っ込んでも幅を引いたままになる
+        （数ピクセル小さく表示される）。デバウンスで振動を隠すのではなく、
+        決定的に収束する側を選んだ結果。
+        """
+        full = QSizeF(self.maximumViewportSize())
+        zoom = min(max(_fit_zoom_of(layout, mode, page, full), MIN_ZOOM), MAX_ZOOM)
+        if layout.content_size(zoom).height() <= full.height():
+            return full
+        extent = self.verticalScrollBar().sizeHint().width()
+        return QSizeF(max(full.width() - extent, 0.0), full.height())
 
     def _resolved_zoom(self, page: int) -> float:
         """いまのモードで page を基準にしたときの倍率（範囲内に丸め済み）。"""
@@ -447,7 +488,8 @@ class PdfView(QAbstractScrollArea):
             (self.verticalScrollBar(), content.height(), viewport_size.height()),
         ):
             # 端が切れないよう切り上げる。整数への丸めはここだけで行う。
-            bar.setRange(0, max(math.ceil(content_length - viewport_length), 0))
+            overflow = content_length - viewport_length - _SCROLL_EPSILON
+            bar.setRange(0, max(math.ceil(overflow), 0))
             bar.setPageStep(viewport_length)
             bar.setSingleStep(_SCROLL_STEP)
 
@@ -458,14 +500,18 @@ class PdfView(QAbstractScrollArea):
         更新の途中でスクロールバーが値を切り詰めるたびに追随すると、中間状態
         での再描画・レンダリング要求・`current_page_changed` が出てしまう。
         呼び出し側は抜けたあとに一度だけまとめて行う。
+
+        **`blockSignals()` は使わない。** 可動域の変化は
+        `QAbstractScrollArea` がバーを出し入れする合図でもあるので、
+        黙らせると PDF を開いてもスクロールバーが出ないままになる。
+        止めたいのは自分の追随だけなので、フラグで自分だけを止める。
         """
-        bars = (self.horizontalScrollBar(), self.verticalScrollBar())
-        blocked = [bar.blockSignals(True) for bar in bars]
+        previous = self._scroll_updates_suppressed
+        self._scroll_updates_suppressed = True
         try:
             yield
         finally:
-            for bar, previous in zip(bars, blocked, strict=True):
-                bar.blockSignals(previous)
+            self._scroll_updates_suppressed = previous
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802 (Qt の命名規則)
         """スクロール位置が変わったときの追随。
@@ -474,6 +520,8 @@ class PdfView(QAbstractScrollArea):
         シグナルが再帰することはない。
         """
         super().scrollContentsBy(dx, dy)
+        if self._scroll_updates_suppressed:
+            return
         self.viewport().update()
         self._request_render()
         self._refresh_current_page()
