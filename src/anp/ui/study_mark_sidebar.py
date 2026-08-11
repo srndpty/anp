@@ -62,6 +62,14 @@ DOCK_OBJECT_NAME = "studyMarksDock"
 
 _COLUMNS = ("ページ", "回数", "メモ")
 
+# 一覧の1行に出すメモの上限（文字数）。長いメモで列が際限なく広がるのを
+# 防ぐためだけの **表示上の** 制限で、保存されている文字列には触らない。
+# 省略した分はツールチップで全文を読める。
+MAX_NOTE_PREVIEW = 120
+
+# 省略したことを示す記号。1文字なので、切り詰めた行の長さは上限 + 1。
+_ELLIPSIS = "…"
+
 _FILTER_LABELS = {
     "all": "すべて",
     "exact": "回数を指定",
@@ -126,12 +134,19 @@ class MarkFilter:
 def note_preview(note: str | None) -> str:
     """一覧の1行に収まる形のメモ。
 
-    改行を空白へ置き換えるだけの **表示上の加工**。保存されている文字列は
-    変えないし、加工した値をドメインへ書き戻すこともしない。
+    改行を空白へ置き換え、長すぎる分を省略する **表示上の加工**。保存されて
+    いる文字列は変えないし、加工した値をドメインへ書き戻すこともしない。
+    全文はツールチップで読める（`_row_item()`）。
+
+    切り詰めは Python の文字列として数える。日本語・絵文字・数式記号を
+    バイト単位で切って壊さないため。
     """
     if note is None:
         return ""
-    return note.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    flat = note.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    if len(flat) <= MAX_NOTE_PREVIEW:
+        return flat
+    return flat[:MAX_NOTE_PREVIEW] + _ELLIPSIS
 
 
 class StudyMarkSidebar(QDockWidget):

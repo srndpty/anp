@@ -33,6 +33,7 @@ from anp.ui.pdf_view import NO_PAGE, PdfView, ZoomMode
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_mark_sidebar import (
     DOCK_OBJECT_NAME,
+    MAX_NOTE_PREVIEW,
     FilterMode,
     MarkFilter,
     StudyMarkSidebar,
@@ -366,8 +367,64 @@ def test_an_exact_count_below_one_is_refused(count: int) -> None:
     ],
 )
 def test_the_note_preview_only_flattens_newlines(note: str | None, expected: str) -> None:
-    """一覧のメモは改行を空白へ直すだけ。前後の空白も内容も削らない。"""
+    """上限までのメモは改行を空白へ直すだけ。前後の空白も内容も削らない。"""
     assert note_preview(note) == expected
+
+
+def test_a_note_at_the_limit_is_not_truncated() -> None:
+    """ちょうど上限の長さなら省略しない（境界）。"""
+    note = "あ" * MAX_NOTE_PREVIEW
+
+    assert note_preview(note) == note
+
+
+def test_a_long_note_is_truncated_for_display() -> None:
+    """長すぎるメモは列が広がらないよう省略する。"""
+    note = "あ" * (MAX_NOTE_PREVIEW + 50)
+
+    preview = note_preview(note)
+
+    assert preview.startswith("あ" * MAX_NOTE_PREVIEW)
+    assert preview == "あ" * MAX_NOTE_PREVIEW + "…"
+    assert len(preview) == MAX_NOTE_PREVIEW + 1
+
+
+@pytest.mark.parametrize("filler", ["🎓", "√", "π", "あ"])
+def test_truncation_counts_characters_not_bytes(filler: str) -> None:
+    """絵文字や数式記号をバイト単位で切って壊さない。"""
+    note = filler * (MAX_NOTE_PREVIEW + 10)
+
+    preview = note_preview(note)
+
+    assert preview == filler * MAX_NOTE_PREVIEW + "…"
+
+
+def test_truncation_happens_after_flattening_newlines() -> None:
+    """改行を空白へ直した後の長さで数える。"""
+    note = "\n".join("行" * 10 for _ in range(30))
+
+    preview = note_preview(note)
+
+    assert "\n" not in preview
+    assert len(preview) == MAX_NOTE_PREVIEW + 1
+
+
+def test_a_long_note_row_keeps_the_full_text_in_the_tooltip(
+    window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
+) -> None:
+    """省略しても全文はツールチップで読める。保存値も変えない。"""
+    note = "長いメモ。" * 200
+    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5, note=note)
+    window.open_path(sample_pdf)
+
+    item = window.study_mark_sidebar.tree.topLevelItem(0)
+    assert item is not None
+    assert item.text(NOTE_COLUMN) == note_preview(note)
+    assert len(item.text(NOTE_COLUMN)) < len(note)
+    assert item.toolTip(NOTE_COLUMN) == note
+    # 表示上の加工なので、保存されている値には触っていない。
+    assert study_marks.get(mark.id) is not None
+    assert study_marks.get(mark.id).note == note  # type: ignore[union-attr]
 
 
 def _mark(
@@ -1070,6 +1127,28 @@ def test_clicking_a_stale_row_is_safe(
     assert window.view.verticalScrollBar().value() == scroll
     assert study_marks.get(stale.id) == stale
     assert "現在の PDF にありません" in window.statusBar().currentMessage()
+
+
+def test_a_stale_message_does_not_hide_the_document_path(
+    window: MainWindow, study_marks: StudyMarkRepository, single_page_pdf: Path
+) -> None:
+    """一時メッセージが出ている間も、開いている PDF のパスは見えたまま。
+
+    パスを `showMessage()` で出していると、5秒後にメッセージが消えた
+    ときに一緒に消えてしまう。常設ウィジェットなのでそうならない。
+    """
+    study_marks.create(single_page_pdf, 7, 0.5, 0.5)
+    window.open_path(single_page_pdf)
+    assert window.document_status_text == str(single_page_pdf)
+
+    click_row(window.study_mark_sidebar, 0)
+
+    assert window.statusBar().currentMessage() != ""
+    assert window.document_status_text == str(single_page_pdf)
+
+    # 一時メッセージが消えた後もパスは残る（実時間は待たずに消す）。
+    window.statusBar().clearMessage()
+    assert window.document_status_text == str(single_page_pdf)
 
 
 def test_clicking_a_row_does_not_discard_the_rendering_state(

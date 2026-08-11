@@ -118,6 +118,24 @@ STUDY_MARK_MODIFIER = Qt.KeyboardModifier.ControlModifier
 
 
 @dataclass(frozen=True, slots=True)
+class ReadingPosition:
+    """いま読んでいる位置（ページ番号 + ページ内の縦位置）。
+
+    ビューポート上端に来ているページ内の縦位置を 0.0〜1.0 で持つ。
+    スクロールバーのピクセル値も倍率も含まないので、ウィンドウの
+    大きさ・DPI・倍率モードが変わっても意味が変わらない。
+
+    `StudyMark` の `PagePosition` とは別の型にする。学習マークは
+    「利用者が印を付けた点」で横位置も意味を持つが、こちらは
+    「どこまで読んだか」で縦方向しか使わない（P5-1 の契約）。
+    同じ型にすると、使わない `x_norm` に意味のない値を入れることになる。
+    """
+
+    page_index: int
+    y_norm: float
+
+
+@dataclass(frozen=True, slots=True)
 class _ZoomAnchor:
     """倍率を変えても動かさない点。
 
@@ -571,6 +589,59 @@ class PdfView(QAbstractScrollArea):
         with self._quiet_scrollbars():
             self.verticalScrollBar().setValue(round(max(top, anchor.y() - size.height() / 2)))
             self.horizontalScrollBar().setValue(round(anchor.x() - size.width() / 2))
+
+        self.viewport().update()
+        self._request_render()
+        self._refresh_current_page()
+        return True
+
+    # -------------------------------------------------- 読書位置
+    def current_reading_position(self) -> ReadingPosition | None:
+        """いま読んでいる位置。ドキュメントが無ければ None。
+
+        ビューポートの上端が現在ページのどこに当たるかを正規化座標で返す。
+        セッションの保存に使う値なので、**スクロールバーの値も倍率も
+        含めない**（ウィンドウの大きさや DPI が変わると意味を失うため）。
+
+        上端が現在ページより手前（余白や前のページ）にある場合は 0.0 に
+        丸める。ページの外を指す読書位置は作らない。
+        """
+        layout = self._layout
+        if layout is None or self._current_page < 0:
+            return None
+
+        rect = layout.page_rect(self._current_page, self._zoom)
+        height = rect.height()
+        top = self.content_viewport_rect().top()
+        y_norm = (top - rect.top()) / height if height > 0 else 0.0
+        return ReadingPosition(page_index=self._current_page, y_norm=_clamp_unit(y_norm))
+
+    def restore_reading_position(self, position: ReadingPosition) -> bool:
+        """読書位置まで戻る。戻れたかを返す。
+
+        `current_reading_position()` の逆変換で、その位置がビューポートの
+        上端に来るようスクロールする。**倍率も倍率モードも触らない**ので、
+        Fit Width / Fit Page のまま呼んでも FREE に落ちない。呼ぶのは
+        倍率が決まった後（順序を逆にすると、フィットの計算がここで決めた
+        スクロール位置を動かす）。
+
+        いま開いているドキュメントに無いページなら `False` を返して何も
+        しない。**最終ページへ丸めない**（`reveal_page_position()` と同じ
+        方針。差し替えでページ数が減った PDF で、関係のない場所へ飛ばない）。
+
+        文書の端で可動域が足りない場合は、行けるところまでで止まる
+        （スクロールバーの切り詰めをそのまま受け入れる）。
+        """
+        validate_position(position.page_index, 0.0, position.y_norm)
+        layout = self._layout
+        if layout is None or position.page_index >= layout.page_count:
+            return False
+
+        top = layout.from_normalized(
+            position.page_index, QPointF(0.0, position.y_norm), self._zoom
+        ).y()
+        with self._quiet_scrollbars():
+            self.verticalScrollBar().setValue(round(top))
 
         self.viewport().update()
         self._request_render()

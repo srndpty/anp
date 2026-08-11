@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Sequence
 
 from PySide6.QtCore import QByteArray, QSettings
 
@@ -16,17 +18,25 @@ logger = logging.getLogger(__name__)
 _KEY_GEOMETRY = "window/geometry"
 _KEY_WINDOW_STATE = "window/state"
 _KEY_LAST_DIRECTORY = "files/last_directory"
+_KEY_RECENT_FILES = "files/recent"
 _KEY_ZOOM_MODE = "view/zoom_mode"
 _KEY_FREE_ZOOM = "view/free_zoom"
 _KEY_PAGE_COLOR_MODE = "view/page_color_mode"
 _KEY_CANVAS_THEME = "view/canvas_theme"
 _KEY_UI_THEME = "ui/theme"
+_KEY_SESSION_DOCUMENT = "session/document"
+_KEY_SESSION_PAGE_INDEX = "session/page_index"
+_KEY_SESSION_Y_NORM = "session/y_norm"
 
 DEFAULT_ZOOM_MODE = "free"
 DEFAULT_FREE_ZOOM = 1.0
 DEFAULT_PAGE_COLOR_MODE = "original"
 DEFAULT_CANVAS_THEME = "dark_gray"
 DEFAULT_UI_THEME = "system"
+
+# 前回の読書位置が読めなかったときに戻る場所。文書の先頭。
+DEFAULT_SESSION_PAGE_INDEX = 0
+DEFAULT_SESSION_Y_NORM = 0.0
 
 # 保存された倍率として受け付ける範囲。UI 側の上下限とは独立に、壊れた値を
 # ここで弾く。`core` は表示の都合を知らないので、緩めの健全性チェックに留める。
@@ -69,6 +79,90 @@ class Settings:
     @last_directory.setter
     def last_directory(self, value: str) -> None:
         self._backend.setValue(_KEY_LAST_DIRECTORY, value)
+
+    @property
+    def recent_files(self) -> tuple[str, ...]:
+        """最近開いた PDF のパス（新しい順）。未保存なら空。
+
+        並び順と重複の除去は呼び出し側（`anp.ui.recent_files`）の契約で、
+        ここは文字列の列として読み書きするだけ。INI へ1件だけ書くと
+        素の文字列で返ってくるので、そこだけ吸収する。空文字や文字列で
+        ない要素は落とす（**壊れた1件で一覧全体を捨てはしない**）。
+        """
+        value = self._backend.value(_KEY_RECENT_FILES)
+        if isinstance(value, str):
+            items: list[object] = [value]
+        elif isinstance(value, list):
+            items = list(value)
+        else:
+            return ()
+        return tuple(item for item in items if isinstance(item, str) and item)
+
+    @recent_files.setter
+    def recent_files(self, value: Sequence[str]) -> None:
+        self._backend.setValue(_KEY_RECENT_FILES, list(value))
+
+    # -------------------------------------------------- 前回のセッション
+    @property
+    def last_document(self) -> str:
+        """前回終了時に開いていた PDF のパス。無ければ空文字。
+
+        **最近開いたファイルの先頭とは別物。** 「最後に読んでいた PDF」と
+        「利用者が明示的に開いた履歴」は意味が違うので、同じ値から導かない。
+        """
+        value = self._backend.value(_KEY_SESSION_DOCUMENT, "")
+        return value if isinstance(value, str) else ""
+
+    @property
+    def last_page_index(self) -> int:
+        """前回終了時に読んでいたページ（0 始まり）。読めなければ先頭。"""
+        value = self._backend.value(_KEY_SESSION_PAGE_INDEX, DEFAULT_SESSION_PAGE_INDEX)
+        try:
+            page = int(value)  # type: ignore[call-overload]
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("ignoring invalid session page index: %r", value)
+            return DEFAULT_SESSION_PAGE_INDEX
+        if page < 0:
+            logger.warning("ignoring out-of-range session page index: %r", page)
+            return DEFAULT_SESSION_PAGE_INDEX
+        return page
+
+    @property
+    def last_y_norm(self) -> float:
+        """前回終了時のページ内の縦位置（0.0〜1.0）。読めなければページ先頭。
+
+        ビューポートのピクセル座標は保存しない。ウィンドウの大きさ・DPI・
+        倍率が変わっても意味が変わらない値だけを持つ。
+        """
+        value = self._backend.value(_KEY_SESSION_Y_NORM, DEFAULT_SESSION_Y_NORM)
+        try:
+            y_norm = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            logger.warning("ignoring invalid session position: %r", value)
+            return DEFAULT_SESSION_Y_NORM
+        if not math.isfinite(y_norm) or not 0.0 <= y_norm <= 1.0:
+            logger.warning("ignoring out-of-range session position: %r", y_norm)
+            return DEFAULT_SESSION_Y_NORM
+        return y_norm
+
+    def set_last_session(self, document: str, page_index: int, y_norm: float) -> None:
+        """前回のセッションを丸ごと保存する。
+
+        3つの値を別々の setter にしないのは、パスだけ新しくてページが古い
+        ような中途半端な組み合わせを作れないようにするため。
+        """
+        self._backend.setValue(_KEY_SESSION_DOCUMENT, document)
+        self._backend.setValue(_KEY_SESSION_PAGE_INDEX, page_index)
+        self._backend.setValue(_KEY_SESSION_Y_NORM, y_norm)
+
+    def clear_last_session(self) -> None:
+        """前回のセッションを忘れる。
+
+        PDF を開いていない状態で終了したときと、復元に失敗したときに呼ぶ。
+        後者で消しておかないと、起動のたびに同じ失敗を繰り返す。
+        """
+        for key in (_KEY_SESSION_DOCUMENT, _KEY_SESSION_PAGE_INDEX, _KEY_SESSION_Y_NORM):
+            self._backend.remove(key)
 
     # -------------------------------------------------- 表示
     @property
