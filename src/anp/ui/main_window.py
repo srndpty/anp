@@ -13,7 +13,12 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 層が持ち、ここが受け取るのは `StudyMarkRepository` だけ。どの PDF のマークを
 表示するかは `StudyMarkController` が決める。ここの仕事は「PDF が開けた」
 「表示が空になった」を伝えることまで。マークの追加・更新・削除の操作は
-`StudyMarkInteraction` が受け持つので、ここには接続しかない。
+`StudyMarkInteraction` が受け持ち、一覧・絞り込み・移動の要求は
+`StudyMarkSidebar` が受け持つので、ここには接続しかない。
+
+一覧へマークを渡すのも `StudyMarkController` の通知経由だけ。ここから
+`PdfView` とサイドバーを別々に更新しない（オーバーレイと一覧が食い違う
+状態を作れないようにするため）。
 
 外観のうち **UI テーマだけ**をここが持つ。アプリ全体のウィジェットの
 配色はビューの責務ではないため。キャンバスの色は `PdfView`、ページの
@@ -43,12 +48,14 @@ from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController, DocumentError
 from anp.pdf.render import PageRenderService
+from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.pdf_view import PdfView, ZoomMode
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_mark_interaction import StudyMarkInteraction
+from anp.ui.study_mark_sidebar import StudyMarkSidebar
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +72,11 @@ _MARK_LOAD_ERROR = (
     "この PDF の学習マークを読み込めなかったため、開くのを中止しました。\n"
     "記録は削除されていません。ログを確認してください。"
 )
+
+# 一覧から移動できなかったときの知らせ方。読み進めるのを妨げないよう、
+# ダイアログではなくステータスバーへ一時的に出す。
+_STALE_MARK_MESSAGE = "このマークのページは現在の PDF にありません"
+_STALE_MARK_MESSAGE_MS = 5000
 
 # 倍率モードの表示名。FREE はパーセント表示なのでここには無い。
 _ZOOM_MODE_LABELS = {
@@ -118,8 +130,10 @@ class MainWindow(QMainWindow):
         # （PDF を開く・ズーム・ページ移動）と混ぜない。
         self._study_mark_interaction = StudyMarkInteraction(self._view, self._study_marks, self)
 
+        self._create_study_mark_sidebar()
+
         self.setWindowTitle("anp")
-        populate_menus(self.menuBar(), self._actions)
+        populate_menus(self.menuBar(), self._actions, self._marks_sidebar.toggleViewAction())
         self._create_toolbar()
         self._connect_actions()
 
@@ -138,6 +152,39 @@ class MainWindow(QMainWindow):
         self._sync_document_ui()
 
     # -------------------------------------------------- 構築
+    def _create_study_mark_sidebar(self) -> None:
+        """学習マークの一覧を右のドックへ入れて配線する。
+
+        ここが書くのは配線だけ。絞り込みも行の組み立ても移動の計算も
+        持たない（それぞれ `StudyMarkSidebar` と `PdfView` にある）。
+
+        **初期状態は非表示。** PDF を読む領域を今までどおり広く保ち、
+        必要な人が「表示 → 学習マーク」から開ける形にする。保存済みの
+        ウィンドウ状態があれば `restoreState()` が表示/非表示ごと復元する
+        ので、サイドバー専用の設定キーは作らない。
+
+        一覧へマークを渡すのはコントローラの通知だけ。ここから
+        `set_marks()` を直接呼ぶのは、通知の届かない起動時の1回に限る。
+        """
+        self._marks_sidebar = StudyMarkSidebar(self)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._marks_sidebar)
+        self._marks_sidebar.hide()
+
+        self._study_marks.marks_changed.connect(self._marks_sidebar.set_marks)
+        self._marks_sidebar.jump_requested.connect(self._jump_to_mark)
+        self._marks_sidebar.set_marks(self._study_marks.study_marks)
+
+    def _jump_to_mark(self, mark: StudyMark) -> None:
+        """一覧で選ばれたマークの位置まで移動する。
+
+        現在の PDF に無いページを指すマーク（ページ数の減った PDF に
+        差し替えられた場合）では、`reveal_page_position()` が `False` を
+        返す。行は消さず、警告ダイアログも出さず、ステータスバーで
+        知らせるだけにする。移動できなかっただけで、記録は残っている。
+        """
+        if not self._view.reveal_page_position(mark.page_index, mark.x_norm, mark.y_norm):
+            self.statusBar().showMessage(_STALE_MARK_MESSAGE, _STALE_MARK_MESSAGE_MS)
+
     def _create_toolbar(self) -> None:
         """ズームとページ移動のツールバー。見た目には凝らない。"""
         toolbar = QToolBar("ツールバー", self)
@@ -564,3 +611,8 @@ class MainWindow(QMainWindow):
     def study_mark_interaction(self) -> StudyMarkInteraction:
         """学習マークのマウス操作とメニュー。"""
         return self._study_mark_interaction
+
+    @property
+    def study_mark_sidebar(self) -> StudyMarkSidebar:
+        """学習マークの一覧ドック。"""
+        return self._marks_sidebar

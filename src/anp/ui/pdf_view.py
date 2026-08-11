@@ -534,8 +534,56 @@ class PdfView(QAbstractScrollArea):
         if self._layout is None:
             return
         index = min(max(page_index, 0), self._layout.page_count - 1)
-        top = self._layout.page_rect(index, self._zoom).top() - self._layout.metrics.margin
-        self.verticalScrollBar().setValue(round(top))
+        self.verticalScrollBar().setValue(round(self._page_top_offset(self._layout, index)))
+
+    def reveal_page_position(self, page_index: int, x_norm: float, y_norm: float) -> bool:
+        """ページ内の正規化座標が見えるところまで移動する。見せられたか返す。
+
+        サイドバーから学習マークへ飛ぶための入口。**移動の計算はここに置く**。
+        呼び出し側にページ配置の算術を書かせない。座標は正規化されたページ
+        座標だけで、`devicePixelRatio` も物理ピクセルも使わない。
+
+        いま開いているドキュメントに無いページなら `False` を返して何もしない。
+        **最終ページへ丸めたりはしない**（ページ数の減った PDF に差し替えられた
+        場合、丸めると関係のない場所へ飛ぶ）。
+
+        見せ方は「そのページの先頭まで移動し、必要ならアンカーが中央に来る
+        ところまでさらに送る」。ページの先頭より手前へは戻さないので、
+        現在ページは `go_to_page()` と同じく指定したページになる。文書の端や
+        可動域の都合で中央に置けない場合はスクロールバーの丸めを受け入れる
+        （アンカーがビューポート内に入っていればよい）。
+
+        **倍率と倍率モードは触らない。** Fit Width / Fit Page のまま飛んでも
+        FREE へ落ちない。レンダリングもスクロールと同じ経路でしか起こさない
+        （キャッシュも世代も色変換も触らない）。
+        """
+        validate_position(page_index, x_norm, y_norm)
+        layout = self._layout
+        if layout is None or page_index >= layout.page_count:
+            return False
+
+        anchor = layout.from_normalized(page_index, QPointF(x_norm, y_norm), self._zoom)
+        size = self.viewport().size()
+        top = self._page_top_offset(layout, page_index)
+
+        # 可動域の切り詰めはスクロールバーに任せる。まとめて動かしてから
+        # 1回だけ追随する（`_commit_zoom()` と同じ形）。
+        with self._quiet_scrollbars():
+            self.verticalScrollBar().setValue(round(max(top, anchor.y() - size.height() / 2)))
+            self.horizontalScrollBar().setValue(round(anchor.x() - size.width() / 2))
+
+        self.viewport().update()
+        self._request_render()
+        self._refresh_current_page()
+        return True
+
+    def _page_top_offset(self, layout: PageLayout, index: int) -> float:
+        """そのページの上端をビューポート上端へ持ってくるスクロール量。
+
+        `go_to_page()` と `reveal_page_position()` で同じ値を使うために
+        分けてある。ページ配置の算術を2箇所に書かない。
+        """
+        return layout.page_rect(index, self._zoom).top() - layout.metrics.margin
 
     def _refresh_current_page(self) -> None:
         """現在ページを取り直し、変わっていれば通知する。"""

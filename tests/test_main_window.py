@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QByteArray, QSettings, QSize, Qt
-from PySide6.QtWidgets import QApplication, QLabel, QMenu, QSpinBox, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QMenu, QSpinBox, QToolBar, QWidget
 from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
@@ -61,16 +61,27 @@ def warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return messages
 
 
+def toolbar(window: MainWindow) -> QToolBar:
+    """ズームとページ移動のツールバー。
+
+    学習マークのサイドバーにも入力欄やラベルがあるので、ウィンドウ全体
+    ではなくツールバーの中だけを探す。
+    """
+    bars = window.findChildren(QToolBar)
+    assert len(bars) == 1
+    return bars[0]
+
+
 def page_input(window: MainWindow) -> QSpinBox:
     """ページ番号の入力欄。ツールバー上の唯一のスピンボックス。"""
-    boxes = window.findChildren(QSpinBox)
+    boxes = toolbar(window).findChildren(QSpinBox)
     assert len(boxes) == 1
     return boxes[0]
 
 
 def zoom_label_text(window: MainWindow) -> str:
     """倍率表示のラベル。ページ数のラベルと区別するため、末尾が `/ n` でない方。"""
-    texts = [label.text() for label in window.findChildren(QLabel)]
+    texts = [label.text() for label in toolbar(window).findChildren(QLabel)]
     return next(text for text in texts if not text.startswith("/"))
 
 

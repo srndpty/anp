@@ -9,7 +9,14 @@
 `document_key()` や SQL を持ち込まないため。追加・更新・削除も同じで、
 ウィジェットからリポジトリを直接呼ばない。
 
-Qt の signal/slot を使わないので `QObject` にはしない。呼び出しは
+**表示中のスナップショットの唯一の公開点がここ**（P4-1）。表示先が
+`PdfView` と `StudyMarkSidebar` の2つになったので、どちらへも
+`_publish_marks()` の1経路からしか届かないようにする。呼び出し側が
+ビューとサイドバーを別々に更新できてしまうと、オーバーレイの内容と
+一覧の内容が食い違う状態を作れてしまう。
+
+通知が要るようになったので `QObject` にして `marks_changed` を1本だけ
+持つ。汎用のイベントバスや observable の仕組みは作らない。呼び出しは
 すべて同期で、DB の読み取りも GUI スレッドで行う（学習マークの件数は
 1つの PDF あたり多くても数千件で、1回の SELECT で足りる）。
 
@@ -28,10 +35,13 @@ Qt の signal/slot を使わないので `QObject` にはしない。呼び出�
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
 
-from anp.storage.study_mark import document_key
+from PySide6.QtCore import QObject, Signal
+
+from anp.storage.study_mark import StudyMark, document_key
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_marks import PagePosition
@@ -62,18 +72,42 @@ class StudyMarkLoadError(RuntimeError):
     """
 
 
-class StudyMarkController:
-    """表示中のドキュメントの学習マークを `PdfView` へ載せる。"""
+class StudyMarkController(QObject):
+    """表示中のドキュメントの学習マークを、表示側へ配る。"""
 
-    def __init__(self, repository: StudyMarkRepository, view: PdfView) -> None:
+    marks_changed = Signal(object)
+    """表示中の学習マークが差し替わった（`tuple[StudyMark, ...]`）。
+
+    通知はこの1本だけ。「1件増えた」「1件消えた」のような差分は出さない。
+    更新は常に「DB を変えてから読み直す」の一方向で、受け取った側は
+    渡されたスナップショットから作り直すだけでよい。
+    """
+
+    def __init__(
+        self,
+        repository: StudyMarkRepository,
+        view: PdfView,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
         self._repository = repository
         self._view = view
         self._active_path: Path | None = None
+        self._marks: tuple[StudyMark, ...] = ()
 
     @property
     def active_document_path(self) -> Path | None:
         """いま学習マークを表示している PDF のパス。無ければ None。"""
         return self._active_path
+
+    @property
+    def study_marks(self) -> tuple[StudyMark, ...]:
+        """いま表示している学習マーク（`page_index`・`id` の昇順）。
+
+        タプルなので呼び出し側から書き換えられない。表示に使うコレクションを
+        外から継ぎ当てられると、DB を source of truth にする契約が崩れる。
+        """
+        return self._marks
 
     def activate_document(self, path: Path) -> None:
         """この PDF の学習マークを読み込んで表示する。
@@ -99,7 +133,7 @@ class StudyMarkController:
         原因は `__cause__` に残すので調査の情報は失われない。
         """
         self._active_path = None
-        self._view.set_study_marks(())
+        self._publish_marks(())
 
         try:
             marks = self._repository.list_for_document(Path(path))
@@ -109,12 +143,12 @@ class StudyMarkController:
             raise StudyMarkLoadError(msg) from error
 
         self._active_path = Path(path)
-        self._view.set_study_marks(marks)
+        self._publish_marks(marks)
 
     def clear_document(self) -> None:
-        """表示対象を解除し、ビューの学習マークを空にする。"""
+        """表示対象を解除し、表示中の学習マークを空にする。"""
         self._active_path = None
-        self._view.set_study_marks(())
+        self._publish_marks(())
 
     def refresh(self) -> None:
         """表示中のマークを、保存されている内容で丸ごと置き換える。
@@ -130,10 +164,10 @@ class StudyMarkController:
         別の PDF のマークが残ることはない）。
         """
         if self._active_path is None:
-            self._view.set_study_marks(())
+            self._publish_marks(())
             return
 
-        self._view.set_study_marks(self._repository.list_for_document(self._active_path))
+        self._publish_marks(self._repository.list_for_document(self._active_path))
 
     # -------------------------------------------------- 追加・更新・削除
     def create_mark(self, position: PagePosition, *, expected_document: Path | None) -> None:
@@ -243,5 +277,19 @@ class StudyMarkController:
         try:
             self.refresh()
         except Exception:
-            self._view.set_study_marks(())
+            self._publish_marks(())
             raise
+
+    def _publish_marks(self, marks: Sequence[StudyMark]) -> None:
+        """表示中のスナップショットを差し替え、表示側へ配る唯一の経路。
+
+        **ビューとサイドバーを別々に更新しない。** ここを通さない更新を
+        許すと、オーバーレイと一覧が違うものを見せる状態が作れてしまう。
+
+        受け取った並びは変えない（`page_index`・`id` の昇順というリポジトリの
+        契約をそのまま引き継ぐ）。件数の丸めも重複の除去も行わない。
+        """
+        snapshot = tuple(marks)
+        self._marks = snapshot
+        self._view.set_study_marks(snapshot)
+        self.marks_changed.emit(snapshot)

@@ -1,8 +1,9 @@
 """ビューのテストで共有する道具。
 
-前半は色変換ワーカーを決定的に扱うための仕掛け、後半は `PdfView` を
+前半は色変換ワーカーを決定的に扱うための仕掛け、次が `PdfView` を
 使うテスト（`test_pdf_view.py` / `test_study_mark_overlay.py`）が共有する
-サービス・描画・スパイ。フィクスチャ本体は `conftest.py` にある。
+サービス・描画・スパイ、最後が学習マークのリポジトリの差し替え。
+フィクスチャ本体は `conftest.py` にある。
 
 --- 色変換ワーカー ---
 
@@ -17,7 +18,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QRect, Qt
@@ -27,6 +30,8 @@ from anp.pdf import render as render_module
 from anp.pdf.cache import RenderCache, RenderKey
 from anp.pdf.color import PageColorMode
 from anp.pdf.render import PageRenderService, PageRequest, _TransformJob, _TransformResult
+from anp.storage.study_mark import StudyMark
+from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.pdf_view import PdfView
 
 
@@ -167,6 +172,67 @@ class UpdateSpy:
             self._original()
         else:
             self._original(rect)
+
+
+# ---------------------------------------------------------------- 学習マーク
+class RecordingRepository(StudyMarkRepository):
+    """問い合わせ先を記録するリポジトリ。
+
+    「この操作では DB を読まない」を固定するために使う（絞り込みなど）。
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        super().__init__(connection)
+        self.queried: list[str] = []
+
+    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
+        self.queried.append(str(document_path))
+        return super().list_for_document(document_path)
+
+
+class BrokenRepository(StudyMarkRepository):
+    """指定した操作だけが失敗するリポジトリ。
+
+    「DB は生きているが、この1操作だけ失敗した」状況を決定的に作る。
+    `failing` は後から差し替えられるので、「更新は通ったのに読み直しが
+    失敗した」という2段階の失敗も再現できる。
+    """
+
+    def __init__(self, connection: sqlite3.Connection, failing: str = "") -> None:
+        super().__init__(connection)
+        self.failing = failing
+
+    def _fail_if(self, name: str) -> None:
+        if name == self.failing:
+            msg = f"{name} failed"
+            raise sqlite3.OperationalError(msg)
+
+    def create(
+        self,
+        document_path: Path | str,
+        page_index: int,
+        x_norm: float,
+        y_norm: float,
+        note: str | None = None,
+    ) -> StudyMark:
+        self._fail_if("create")
+        return super().create(document_path, page_index, x_norm, y_norm, note)
+
+    def increment_mistake_count(self, mark_id: int) -> StudyMark | None:
+        self._fail_if("increment")
+        return super().increment_mistake_count(mark_id)
+
+    def update_note(self, mark_id: int, note: str | None) -> StudyMark | None:
+        self._fail_if("update_note")
+        return super().update_note(mark_id, note)
+
+    def delete(self, mark_id: int) -> bool:
+        self._fail_if("delete")
+        return super().delete(mark_id)
+
+    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
+        self._fail_if("list")
+        return super().list_for_document(document_path)
 
 
 def count_transforms(monkeypatch: pytest.MonkeyPatch) -> list[PageColorMode]:
