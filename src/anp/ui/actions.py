@@ -151,13 +151,14 @@ def populate_menus(
     menu_bar: QMenuBar,
     actions: ReaderActions,
     study_marks_toggle: QAction,
+    toc_toggle: QAction,
     recent_menu: QMenu,
 ) -> None:
     """メニューバーを組み立てる。
 
-    `study_marks_toggle` は学習マークのドックの `toggleViewAction()`。
-    表示/非表示の状態はドック自身が持つので、`ReaderActions` には入れず
-    受け取ったものをそのまま並べる。
+    `study_marks_toggle` と `toc_toggle` はそれぞれのドックの
+    `toggleViewAction()`。表示/非表示の状態はドック自身が持つので、
+    `ReaderActions` には入れず受け取ったものをそのまま並べる。
 
     `recent_menu` も同じ扱い。中身は履歴が変わるたびに作り直されるので、
     ここでは場所を決めるだけで項目には触らない。
@@ -170,6 +171,7 @@ def populate_menus(
 
     view_menu = menu_bar.addMenu("表示(&V)")
     view_menu.addAction(study_marks_toggle)
+    view_menu.addAction(toc_toggle)
     view_menu.addSeparator()
     view_menu.addAction(actions.zoom_in)
     view_menu.addAction(actions.zoom_out)

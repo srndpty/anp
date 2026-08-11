@@ -20,6 +20,11 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 `PdfView` とサイドバーを別々に更新しない（オーバーレイと一覧が食い違う
 状態を作れないようにするため）。
 
+**PDF の目次にもここから触らない。** outline を読むのは `TocSidebar` が
+持つ `QPdfBookmarkModel` で、移動先からスクロール位置を決めるのは
+`PdfView`。ここの仕事は「この PDF の目次を出せ」と伝えることと、
+移動の要求をビューへ渡すことまで。
+
 外観のうち **UI テーマだけ**をここが持つ。アプリ全体のウィジェットの
 配色はビューの責務ではないため。キャンバスの色は `PdfView`、ページの
 色変換は `PageRenderService` が持ち、3つは互いに連動しない。
@@ -53,6 +58,7 @@ from anp import __version__
 from anp.core.settings import Settings
 from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
+from anp.pdf.destination import PdfDestination
 from anp.pdf.document import DocumentController, DocumentError
 from anp.pdf.render import PageRenderService
 from anp.storage.study_mark import StudyMark
@@ -64,6 +70,7 @@ from anp.ui.recent_files import add_recent, normalize_recent, recent_labels, rem
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_mark_interaction import StudyMarkInteraction
 from anp.ui.study_mark_sidebar import StudyMarkSidebar
+from anp.ui.toc_sidebar import TocSidebar
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +91,11 @@ _MARK_LOAD_ERROR = (
 # 一覧から移動できなかったときの知らせ方。読み進めるのを妨げないよう、
 # ダイアログではなくステータスバーへ一時的に出す。
 _STALE_MARK_MESSAGE = "このマークのページは現在の PDF にありません"
-_STALE_MARK_MESSAGE_MS = 5000
+_TRANSIENT_MESSAGE_MS = 5000
+
+# 目次の項目が現在の PDF に無いページを指していたときの知らせ方。壊れた
+# outline は PDF 側の事情なので、ダイアログではなくステータスバーへ。
+_STALE_DESTINATION_MESSAGE = "この目次の移動先は現在の PDF にありません"
 
 # ステータスバーの常設表示。一時メッセージ（`showMessage()`）が消えた後も
 # 開いている PDF が分かるよう、パスは常設ウィジェットに置く。
@@ -157,6 +168,7 @@ class MainWindow(QMainWindow):
         self._study_mark_interaction = StudyMarkInteraction(self._view, self._study_marks, self)
 
         self._create_study_mark_sidebar()
+        self._create_toc_sidebar()
 
         self.setWindowTitle("anp")
         # 履歴のサブメニューはここが所有する。`addMenu(title)` の戻り値だけを
@@ -166,6 +178,7 @@ class MainWindow(QMainWindow):
             self.menuBar(),
             self._actions,
             self._marks_sidebar.toggleViewAction(),
+            self._toc_sidebar.toggleViewAction(),
             self._recent_menu,
         )
         self._create_toolbar()
@@ -219,7 +232,38 @@ class MainWindow(QMainWindow):
         知らせるだけにする。移動できなかっただけで、記録は残っている。
         """
         if not self._view.reveal_page_position(mark.page_index, mark.x_norm, mark.y_norm):
-            self.statusBar().showMessage(_STALE_MARK_MESSAGE, _STALE_MARK_MESSAGE_MS)
+            self.statusBar().showMessage(_STALE_MARK_MESSAGE, _TRANSIENT_MESSAGE_MS)
+
+    def _create_toc_sidebar(self) -> None:
+        """PDF の目次を左のドックへ入れて配線する。
+
+        ここが書くのは配線だけ。outline の階層も行の組み立ても移動の計算も
+        持たない（それぞれ `TocSidebar` の `QPdfBookmarkModel` と
+        `PdfView` にある）。
+
+        学習マークが右なので、目次は左に置く（Left: 目次 / Center: PDF /
+        Right: 学習マーク）。**初期状態は非表示**で、保存済みのウィンドウ
+        状態があれば `restoreState()` の値が勝つ。学習マークのドックと
+        同じ扱いなので、目次専用の設定キーは作らない。
+        """
+        self._toc_sidebar = TocSidebar(self)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._toc_sidebar)
+        self._toc_sidebar.hide()
+
+        self._toc_sidebar.destination_requested.connect(self._navigate_to_destination)
+
+    def _navigate_to_destination(self, destination: PdfDestination) -> None:
+        """目次で選ばれた移動先まで移動する。
+
+        ここに `location.y` とページ高さの計算やスクロールバーの算術を
+        書かない。ページ配置の変換は `PdfView` に閉じている。
+
+        壊れた outline が現在の PDF に無いページを指していた場合は
+        `False` が返る。最終ページへ丸めず、警告ダイアログも出さず、
+        ステータスバーで知らせるだけにする（学習マークの移動と同じ形）。
+        """
+        if not self._view.navigate_to_pdf_destination(destination):
+            self.statusBar().showMessage(_STALE_DESTINATION_MESSAGE, _TRANSIENT_MESSAGE_MS)
 
     def _create_toolbar(self) -> None:
         """ズームとページ移動のツールバー。見た目には凝らない。"""
@@ -481,6 +525,11 @@ class MainWindow(QMainWindow):
             self._abort_open()
             raise
 
+        # 目次を載せるのは **開く操作が最後まで成功した後**。途中で中止する
+        # 経路（PDF が読めない・学習マークが読めない）はすべて
+        # `_clear_document()` を通るので、古い PDF の目次が残ることはない。
+        self._toc_sidebar.set_document(self._controller.document)
+
         self.setWindowTitle(f"{path.name} - anp")
         self._sync_document_ui()
         return True
@@ -511,9 +560,13 @@ class MainWindow(QMainWindow):
 
         開くのに失敗したときと、学習マークを読み込めなかったときの後始末は
         同じ。学習マークだけ別の後始末を作らない。
+
+        目次も一緒に手放す。「PDF なし」なのに前の PDF の目次が残っている
+        状態を作らないため。
         """
         self._view.clear_document()
         self._study_marks.clear_document()
+        self._toc_sidebar.clear_document()
         self._sync_document_ui()
 
     # -------------------------------------------------- 表示の同期
@@ -801,6 +854,8 @@ class MainWindow(QMainWindow):
 
         self._view.clear_document()
         self._study_marks.clear_document()
+        # 目次のモデルは `QPdfDocument` を指しているので、閉じる前に外す。
+        self._toc_sidebar.clear_document()
         self._controller.close()
         logger.info("main window closed")
         super().closeEvent(event)
@@ -830,6 +885,11 @@ class MainWindow(QMainWindow):
     def study_mark_sidebar(self) -> StudyMarkSidebar:
         """学習マークの一覧ドック。"""
         return self._marks_sidebar
+
+    @property
+    def toc_sidebar(self) -> TocSidebar:
+        """PDF の目次のドック。"""
+        return self._toc_sidebar
 
     @property
     def recent_files(self) -> tuple[Path, ...]:

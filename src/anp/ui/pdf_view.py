@@ -16,6 +16,9 @@
   学習マークはこの座標で持つ
 - **レンダリング画像の物理ピクセル**: 論理サイズ × `devicePixelRatio`。
   `PageRenderService` への要求サイズだけに使う
+- **ページ内の PDF ポイント**: ページ左上を原点とする PDF の寸法単位。
+  目次の移動先（`PdfDestination`）だけがこの座標で来る。コンテンツ座標への
+  変換は `PageLayout.from_page_points()` にあり、ここには書かない
 
 **オーバーレイの位置計算に物理ピクセルを混ぜない。** 学習マークの位置は
 上の3つの論理座標だけで決まり、DPR には依存しない。
@@ -51,6 +54,7 @@ from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
 from anp.pdf.color import PageColorMode, page_background_color
+from anp.pdf.destination import PdfDestination, clamp_to_page
 from anp.pdf.layout import PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
 from anp.storage.study_mark import StudyMark, validate_position
@@ -589,6 +593,49 @@ class PdfView(QAbstractScrollArea):
         with self._quiet_scrollbars():
             self.verticalScrollBar().setValue(round(max(top, anchor.y() - size.height() / 2)))
             self.horizontalScrollBar().setValue(round(anchor.x() - size.width() / 2))
+
+        self.viewport().update()
+        self._request_render()
+        self._refresh_current_page()
+        return True
+
+    def navigate_to_pdf_destination(self, destination: PdfDestination) -> bool:
+        """PDF が指定した移動先を開く。開けたかを返す。
+
+        目次（outline / bookmarks）から飛ぶための入口。**学習マークの
+        `reveal_page_position()` とは目的が違う。** あちらは「印を見つけ
+        やすいところ、できれば中央へ」だが、こちらは「PDF の作者が指定した
+        位置を開く」なので、移動先をビューポートの左上付近へ持ってくる。
+        マークの中央寄せをそのまま流用しない。
+
+        いま開いているドキュメントに無いページ（`0 <= page < page_count`
+        を満たさない）なら `False` を返して何もしない。**最終ページへ
+        丸めない**（`reveal_page_position()` と同じ方針）。
+
+        移動先の座標は外部の PDF metadata なので、`clamp_to_page()` で
+        ページの内側へ収めてから使う。NaN や inf ならそのページの先頭へ
+        落ちる（例外にしない）。移動先が y = 0 のときのスクロール量は
+        `go_to_page()` と一致する。
+
+        **倍率と倍率モードは触らない。** `PdfDestination.zoom_hint` は
+        読まない。Fit Width / Fit Page のまま飛んでも FREE へ落ちず、
+        FREE の倍率も変わらない。レンダリングもスクロールと同じ経路で
+        しか起こさない（世代もキャッシュも色変換も触らない）。
+        """
+        layout = self._layout
+        page = destination.page_index
+        if layout is None or not 0 <= page < layout.page_count:
+            return False
+
+        point = clamp_to_page(destination.location, layout.page_size(page))
+        anchor = layout.from_page_points(page, point, self._zoom)
+        margin = layout.metrics.margin
+
+        # 可動域の切り詰めはスクロールバーに任せる。まとめて動かしてから
+        # 1回だけ追随する（`reveal_page_position()` と同じ形）。
+        with self._quiet_scrollbars():
+            self.verticalScrollBar().setValue(round(anchor.y() - margin))
+            self.horizontalScrollBar().setValue(round(anchor.x() - margin))
 
         self.viewport().update()
         self._request_render()

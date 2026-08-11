@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import closing
+from dataclasses import dataclass
 from hashlib import md5
 from pathlib import Path
 
@@ -131,6 +132,147 @@ def _write_pdf_objects(path: Path, objects: list[bytes], trailer_extra: str = ""
 
     path.write_bytes(bytes(out))
     return path
+
+
+# ---------------------------------------------------------------- 目次つき PDF
+# `QPdfWriter` は outline / bookmarks を書けないので、`_write_pdf_objects()`
+# を使って最小の outline ツリーを組み立てる（PDF を1つリポジトリへ置くより、
+# 期待値がテストのすぐ隣にある方を選んだ）。PDF ライブラリは増やさない。
+#
+# 位置は PDF の座標（ページ左下が原点）で書く。`QPdfBookmarkModel` の
+# Location ロールは、これをページ左上原点へ直した値を返す。
+@dataclass(frozen=True)
+class OutlineItem:
+    """テスト用 PDF に書き込む outline の1項目。"""
+
+    title: str
+    page: int
+    y: float | None = None
+    """PDF 座標（下からの高さ）での移動先。None なら位置を持たない移動先。"""
+
+    zoom: float | None = None
+    children: tuple[OutlineItem, ...] = ()
+
+
+@dataclass(frozen=True)
+class _OutlineEntry:
+    """番号を割り当てた outline 項目（PDF オブジェクトの参照を張るため）。"""
+
+    number: int
+    item: OutlineItem
+    parent: int
+    previous: int | None
+    next: int | None
+    first_child: int | None
+    last_child: int | None
+
+
+def _assign_numbers(
+    items: Sequence[OutlineItem], parent: int, next_number: int, out: list[_OutlineEntry]
+) -> int:
+    """兄弟を連番で並べ、その後ろへ子孫を続ける。次の空き番号を返す。
+
+    兄弟が連続するので、親の /First と /Last は子を書き出す前に決まる。
+    """
+    numbers = list(range(next_number, next_number + len(items)))
+    cursor = next_number + len(items)
+    for position, number in enumerate(numbers):
+        item = items[position]
+        first_child = last_child = None
+        if item.children:
+            first_child = cursor
+            last_child = cursor + len(item.children) - 1
+            cursor = _assign_numbers(item.children, number, cursor, out)
+        out.append(
+            _OutlineEntry(
+                number=number,
+                item=item,
+                parent=parent,
+                previous=numbers[position - 1] if position > 0 else None,
+                next=numbers[position + 1] if position + 1 < len(numbers) else None,
+                first_child=first_child,
+                last_child=last_child,
+            )
+        )
+    return cursor
+
+
+def _outline_body(entry: _OutlineEntry, first_page_number: int) -> bytes:
+    """outline 項目1件の PDF オブジェクト本体。"""
+    item = entry.item
+    page_reference = f"{first_page_number + item.page} 0 R"
+    if item.y is None:
+        destination = f"[{page_reference} /Fit]"
+    else:
+        destination = f"[{page_reference} /XYZ 0 {item.y} {item.zoom or 0}]"
+
+    title = item.title.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    parts = [f"/Title ({title})", f"/Parent {entry.parent} 0 R", f"/Dest {destination}"]
+    if entry.previous is not None:
+        parts.append(f"/Prev {entry.previous} 0 R")
+    if entry.next is not None:
+        parts.append(f"/Next {entry.next} 0 R")
+    if entry.first_child is not None and entry.last_child is not None:
+        parts.append(f"/First {entry.first_child} 0 R")
+        parts.append(f"/Last {entry.last_child} 0 R")
+        parts.append(f"/Count {len(item.children)}")
+    return ("<< " + " ".join(parts) + " >>").encode()
+
+
+def write_outline_pdf(path: Path, pages: int, items: Sequence[OutlineItem]) -> Path:
+    """outline を持つ A4（595x842pt）の PDF を書き出す。"""
+    first_page_number = 3
+    outline_root = first_page_number + pages
+    kids = " ".join(f"{first_page_number + index} 0 R" for index in range(pages))
+
+    entries: list[_OutlineEntry] = []
+    _assign_numbers(items, outline_root, outline_root + 1, entries)
+    entries.sort(key=lambda entry: entry.number)
+
+    objects = [
+        f"<< /Type /Catalog /Pages 2 0 R /Outlines {outline_root} 0 R >>".encode(),
+        f"<< /Type /Pages /Kids [{kids}] /Count {pages} >>".encode(),
+        *[b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] >>"] * pages,
+        (
+            f"<< /Type /Outlines /First {outline_root + 1} 0 R "
+            f"/Last {outline_root + len(items)} 0 R /Count {len(items)} >>"
+        ).encode(),
+        *[_outline_body(entry, first_page_number) for entry in entries],
+    ]
+    return _write_pdf_objects(path, objects)
+
+
+# 章と節を持つ目次。階層が保たれていることと、ページ番号が 0 始まりで
+# 読めていることを見るための最小の形。
+OUTLINE_ITEMS = (
+    OutlineItem(
+        "Chapter 1",
+        0,
+        y=842.0,
+        children=(
+            OutlineItem("Section 1.1", 1, y=600.0),
+            OutlineItem("Section 1.2", 2, y=200.0, zoom=2.5),
+        ),
+    ),
+    OutlineItem("Chapter 2", 3, y=842.0),
+)
+
+# `Section 1.1` の移動先を、ページ左上を原点とする PDF ポイントで表した値。
+SECTION_1_1_TOP_ORIGIN_Y = 842.0 - 600.0
+
+
+@pytest.fixture
+def outline_pdf(qapp: QApplication, tmp_path: Path) -> Path:
+    """入れ子の目次を持つ4ページの PDF。"""
+    return write_outline_pdf(tmp_path / "outline.pdf", 4, OUTLINE_ITEMS)
+
+
+@pytest.fixture
+def other_outline_pdf(qapp: QApplication, tmp_path: Path) -> Path:
+    """別の目次を持つ2ページの PDF。目次の入れ替わりを見るために使う。"""
+    return write_outline_pdf(
+        tmp_path / "other_outline.pdf", 2, (OutlineItem("Section X", 1, y=400.0),)
+    )
 
 
 @pytest.fixture
