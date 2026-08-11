@@ -19,7 +19,7 @@ from PySide6.QtGui import QImage
 from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController
-from anp.storage.study_mark import StudyMark
+from anp.storage.study_mark import StudyMark, validate_position
 from anp.ui.appearance import CanvasTheme
 from anp.ui.pdf_view import MAX_ZOOM, MIN_ZOOM, PdfView, ZoomMode
 from anp.ui.study_marks import BADGE_FILL_COLOR, BADGE_HEIGHT, PagePosition, StudyMarkIndex
@@ -133,7 +133,12 @@ def test_the_page_center_is_the_middle_of_the_page(loaded_view: PdfView) -> None
 def test_the_page_corners_are_the_unit_square(
     loaded_view: PdfView, corner: str, expected: tuple[float, float]
 ) -> None:
-    """4隅がそのまま 0.0 と 1.0 になる。"""
+    """4隅がそのまま 0.0 と 1.0 になる。
+
+    **近似では見ない。** ページの縁では内外の判定と比率の計算が別々の
+    浮動小数点演算になるため、`1.0000000000000004` のような契約外の値が
+    出うる。それを許すと、保存の直前（`validate_position()`）で弾かれる。
+    """
     rect = loaded_view.page_viewport_rect(0)
     assert rect is not None
 
@@ -141,7 +146,34 @@ def test_the_page_corners_are_the_unit_square(
 
     assert position is not None
     assert position.page_index == 0
-    assert (position.x_norm, position.y_norm) == pytest.approx(expected)
+    assert (position.x_norm, position.y_norm) == expected
+
+
+def test_a_position_on_the_page_is_always_storable(loaded_view: PdfView) -> None:
+    """ページ上と判定された点は、そのまま `StudyMark` の座標として通る。
+
+    `page_position_at()` の契約そのもの。UI 側に別の基準を作らないよう、
+    判定には P3-1 の `validate_position()` をそのまま使う。
+
+    倍率を1点ではなく範囲で掃くのは、契約が破れるのがページの縁と倍率の
+    組み合わせ次第だから。内外の判定と比率の計算は別々の浮動小数点演算な
+    ので、深いページの下端では `1.0000000000000002` が出る倍率が実際にある
+    （このフィクスチャでは 0.2544 付近）。1つの倍率だけを見るテストでは
+    見逃す。
+    """
+    steps = 200
+    ratio = (MAX_ZOOM / MIN_ZOOM) ** (1 / (steps - 1))
+
+    for step in range(steps):
+        loaded_view.set_zoom(MIN_ZOOM * ratio**step)
+        for page in range(loaded_view.page_count):
+            rect = loaded_view.page_viewport_rect(page)
+            assert rect is not None
+            for point in (rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()):
+                position = loaded_view.page_position_at(point)
+                if position is None:
+                    continue
+                validate_position(position.page_index, position.x_norm, position.y_norm)
 
 
 def test_a_point_on_the_second_page_reports_that_page(loaded_view: PdfView) -> None:

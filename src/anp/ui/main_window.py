@@ -47,7 +47,7 @@ from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.pdf_view import PdfView, ZoomMode
-from anp.ui.study_mark_controller import StudyMarkController
+from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_mark_interaction import StudyMarkInteraction
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,16 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SIZE = (1000, 800)
 
 _PDF_FILTER = "PDF ファイル (*.pdf)"
+
+_OPEN_ERROR_TITLE = "PDF を開けません"
+
+# 学習マークを読み込めなかったときの知らせ方。開くのを中止した理由と、
+# 記録そのものは消えていないことを書く（利用者がいちばん恐れるのはそこ）。
+_MARK_LOAD_ERROR_TITLE = "学習マークを読み込めません"
+_MARK_LOAD_ERROR = (
+    "この PDF の学習マークを読み込めなかったため、開くのを中止しました。\n"
+    "記録は削除されていません。ログを確認してください。"
+)
 
 # 倍率モードの表示名。FREE はパーセント表示なのでここには無い。
 _ZOOM_MODE_LABELS = {
@@ -281,28 +291,45 @@ class MainWindow(QMainWindow):
         しない（fail-closed）。読み込めていないまま読み進められると、
         利用者からは「マークが消えた」ようにしか見えず、そのうえ
         P3-3B 以降の追加・更新が実体の分からない PDF に対して行われる。
-        後始末は開くのに失敗したときと同じ「PDF なし」の状態まで戻し、
-        原因は握り潰さずに送出する。
+        後始末は開くのに失敗したときと同じ「PDF なし」の状態まで戻す。
+
+        知らせ方も PDF を開けなかったときと揃える。**これは想定された失敗
+        経路** なので、アプリケーション境界の「予期しないエラー」に送らず、
+        ここで日本語の警告にする。包まれていない例外（実装の誤り）は
+        後始末だけして送出し、未捕捉例外として扱う。
         """
         try:
             self._controller.open(path)
         except DocumentError as error:
             self._clear_document()
-            QMessageBox.warning(self, "PDF を開けません", f"{path.name}\n\n{error.message}")
+            QMessageBox.warning(self, _OPEN_ERROR_TITLE, f"{path.name}\n\n{error.message}")
             return
 
         self._settings.last_directory = str(path.parent)
         self._view.set_document(self._controller.document, self._controller.page_sizes())
         try:
             self._study_marks.activate_document(path)
+        except StudyMarkLoadError:
+            self._abort_open()
+            QMessageBox.warning(self, _MARK_LOAD_ERROR_TITLE, f"{path.name}\n\n{_MARK_LOAD_ERROR}")
+            return
         except Exception:
-            self._clear_document()
-            self._controller.close()
+            self._abort_open()
             raise
 
         self.setWindowTitle(f"{path.name} - anp")
         self._sync_document_ui()
         self.statusBar().showMessage(str(path))
+
+    def _abort_open(self) -> None:
+        """開きかけた PDF を手放し、「PDF なし」の状態へ戻す。
+
+        `_clear_document()` との違いはドキュメント自体も閉じること。
+        順序は解放時と同じ「表示 → ドキュメント」で、閉じた後の
+        ドキュメントに対するレンダリング要求を残さない。
+        """
+        self._clear_document()
+        self._controller.close()
 
     def _clear_document(self) -> None:
         """表示を「PDF なし」の状態へ戻す。

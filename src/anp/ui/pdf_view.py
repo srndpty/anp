@@ -569,6 +569,13 @@ class PdfView(QAbstractScrollArea):
 
         戻り値はそのまま `StudyMark` の座標として使える契約
         （`page_index >= 0`、`x_norm` と `y_norm` は 0.0〜1.0）。
+
+        **ページ内と判定できた点に限って** 比率を 0.0〜1.0 に収める。
+        ページの縁ちょうどでは、内外の判定（`page_at()`）と比率の計算
+        （`to_normalized()`）が別々の浮動小数点演算なので、内側と判定された
+        点が 1.0000000000000004 のような値になりうる。これをそのまま返すと
+        契約が破れ、保存の直前で弾かれる。ページの外を近いページへ吸着させ
+        ないという方針とは別の話で、**外は依然として `None`**。
         """
         if self._layout is None:
             return None
@@ -577,7 +584,11 @@ class PdfView(QAbstractScrollArea):
         if page is None:
             return None
         normalized = self._layout.to_normalized(page, content, self._zoom)
-        return PagePosition(page_index=page, x_norm=normalized.x(), y_norm=normalized.y())
+        return PagePosition(
+            page_index=page,
+            x_norm=_clamp_unit(normalized.x()),
+            y_norm=_clamp_unit(normalized.y()),
+        )
 
     def viewport_point_for(self, page_index: int, x_norm: float, y_norm: float) -> QPointF | None:
         """ページ内の正規化座標に対応するビューポート上の点。

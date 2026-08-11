@@ -48,6 +48,20 @@ class StudyMarkError(RuntimeError):
     """
 
 
+class StudyMarkLoadError(RuntimeError):
+    """学習マークを読み込めなかった（`activate_document()`）。
+
+    更新の失敗（`StudyMarkError`）とは扱いが違うので別の型にする。
+    読み込みの失敗は **想定された失敗経路** で、UI は「PDF なし」まで戻して
+    利用者に日本語で知らせる。片や `AttributeError` のような実装の誤りは
+    包まずに素通しし、アプリケーション境界の未捕捉例外として扱う。この
+    境界を作るために、リポジトリの呼び出しだけをこの型へ包む。
+
+    継承関係は作らない。UI での扱いが「開くのを中止する」と「表示は前の
+    まま保つ」で共通点が無く、まとめて捕まえたい場面が無いため。
+    """
+
+
 class StudyMarkController:
     """表示中のドキュメントの学習マークを `PdfView` へ載せる。"""
 
@@ -76,16 +90,23 @@ class StudyMarkController:
         **表示対象を確定するのは読み取りに成功した後だけ**（fail-closed）。
         読めなかった PDF を表示対象のまま残すと、以後の追加・更新が
         「中身を読めていない PDF」に対して行われることになる。失敗した
-        場合は表示対象なしの状態で例外を送出する。
+        場合は表示対象なしの状態で `StudyMarkLoadError` を送出する。
+
+        リポジトリの失敗を1つの型へ包むのは、呼び出し側が「想定された
+        読み込み失敗」と「実装の誤り」を取り違えないようにするため。
+        `sqlite3` の例外も、保存されていた行が契約を満たさなかったときの
+        `ValueError` も、UI から見れば同じ「読み込めなかった」になる。
+        原因は `__cause__` に残すので調査の情報は失われない。
         """
         self._active_path = None
         self._view.set_study_marks(())
 
         try:
             marks = self._repository.list_for_document(Path(path))
-        except Exception:
+        except Exception as error:
             logger.exception("failed to load study marks for %s", path)
-            raise
+            msg = f"failed to load study marks for {path}"
+            raise StudyMarkLoadError(msg) from error
 
         self._active_path = Path(path)
         self._view.set_study_marks(marks)

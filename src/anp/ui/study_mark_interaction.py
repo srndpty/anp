@@ -145,8 +145,18 @@ class StudyMarkInteraction:
         self._run(lambda: self._controller.update_note(mark.id, text))
 
     def _delete(self, mark: StudyMark) -> None:
-        """確認してから消す。学習の記録は取り戻せないため。"""
-        answer = QMessageBox.question(self._parent, _DELETE_TITLE, _DELETE_TEXT)
+        """確認してから消す。学習の記録は取り戻せないため。
+
+        **既定のボタンは「いいえ」**。ボタンを指定しないと Enter で削除が
+        通ってしまう。取り消せない操作なので、何もしない側を既定にする。
+        """
+        answer = QMessageBox.question(
+            self._parent,
+            _DELETE_TITLE,
+            _DELETE_TEXT,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
         if answer is not QMessageBox.StandardButton.Yes:
             return
         self._run(lambda: self._controller.delete_mark(mark.id))

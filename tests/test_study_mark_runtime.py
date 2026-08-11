@@ -25,11 +25,11 @@ from anp.core.paths import AppPaths
 from anp.core.settings import Settings
 from anp.pdf.document import DocumentController
 from anp.storage import database
-from anp.storage.study_mark import StudyMark
+from anp.storage.study_mark import StudyMark, document_key
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
-from anp.ui.study_mark_controller import StudyMarkController
+from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from helpers import RecordingService
 
 
@@ -296,7 +296,7 @@ def test_a_read_failure_leaves_no_active_document(
     assert view.study_marks == (a_mark,)
 
     show(view, doc, two_page_pdf)
-    with pytest.raises(sqlite3.OperationalError):
+    with pytest.raises(StudyMarkLoadError):
         controller.activate_document(two_page_pdf)
 
     assert list(view.study_marks) == []
@@ -310,14 +310,63 @@ def test_a_read_failure_on_a_closed_connection_propagates(
     study_mark_connection: sqlite3.Connection,
     sample_pdf: Path,
 ) -> None:
-    """接続が閉じられていれば `sqlite3` の例外がそのまま出る。"""
+    """接続が閉じられていれば、読み込み失敗として伝わる。"""
     show(view, doc, sample_pdf)
     study_mark_connection.close()
 
-    with pytest.raises(sqlite3.ProgrammingError):
+    with pytest.raises(StudyMarkLoadError):
         study_mark_controller.activate_document(sample_pdf)
 
     assert view.study_marks == ()
+    assert study_mark_controller.active_document_path is None
+
+
+def test_a_read_failure_keeps_the_original_error_as_the_cause(
+    study_mark_controller: StudyMarkController,
+    view: PdfView,
+    doc: DocumentController,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+) -> None:
+    """包んでも原因は失われない。
+
+    利用者に見せるのは日本語の一言だけだが、調査に必要なのは元の例外なので
+    `__cause__` に残す（ログにも stacktrace が出る）。
+    """
+    show(view, doc, sample_pdf)
+    study_mark_connection.close()
+
+    with pytest.raises(StudyMarkLoadError) as error:
+        study_mark_controller.activate_document(sample_pdf)
+
+    assert isinstance(error.value.__cause__, sqlite3.ProgrammingError)
+
+
+def test_a_broken_stored_row_is_a_load_failure(
+    study_mark_controller: StudyMarkController,
+    view: PdfView,
+    doc: DocumentController,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+) -> None:
+    """保存されていた行がドメインの契約を満たさなくても、読み込み失敗として扱う。
+
+    `sqlite3` の例外だけを包むのでは足りない。マイグレーションの取りこぼしや
+    外部からの書き込みで壊れた行があった場合も、利用者から見れば「この PDF の
+    マークを読めなかった」で、扱いは同じ。
+    """
+    show(view, doc, sample_pdf)
+    # CHECK 制約を通る値だけで、ドメインが受け付けない行を作る。TEXT 列でも
+    # BLOB はそのまま入るので、note が文字列でない行になる。
+    study_mark_connection.execute(
+        "INSERT INTO study_marks (document_key, page_index, x_norm, y_norm, note)"
+        " VALUES (?, 0, 0.5, 0.5, x'414243')",
+        (document_key(sample_pdf),),
+    )
+
+    with pytest.raises(StudyMarkLoadError):
+        study_mark_controller.activate_document(sample_pdf)
+
     assert study_mark_controller.active_document_path is None
 
 
@@ -522,6 +571,7 @@ def test_a_repository_failure_leaves_no_document_open(
     study_mark_connection: sqlite3.Connection,
     sample_pdf: Path,
     two_page_pdf: Path,
+    warnings: list[str],
 ) -> None:
     """PDF は開けても学習マークを読めなければ、その PDF も開いた状態にしない。
 
@@ -537,8 +587,7 @@ def test_a_repository_failure_leaves_no_document_open(
     window.open_path(sample_pdf)
     assert window.view.study_marks == (a_mark,)
 
-    with pytest.raises(sqlite3.OperationalError):
-        window.open_path(two_page_pdf)
+    window.open_path(two_page_pdf)
 
     assert window.study_marks.active_document_path is None
     assert list(window.view.study_marks) == []
@@ -548,6 +597,62 @@ def test_a_repository_failure_leaves_no_document_open(
     assert window.statusBar().currentMessage() == "PDF が開かれていません"
     assert not window.reader_actions.next_page.isEnabled()
     assert not window.reader_actions.zoom_in.isEnabled()
+    assert len(warnings) == 1
+    window.close()
+
+
+def test_a_repository_failure_is_reported_as_a_study_mark_failure(
+    qtbot: QtBot,
+    settings: Settings,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+    warnings: list[str],
+) -> None:
+    """学習マークを読めなかったことが、利用者に日本語で伝わる。
+
+    これは **想定された失敗経路** なので、アプリケーション境界の
+    「予期しないエラー」ダイアログには送らない。記録そのものは消えて
+    いないことも伝える（利用者がいちばん気にするのはそこ）。
+    """
+    window = MainWindow(settings, FailingRepository(study_mark_connection))
+    qtbot.addWidget(window)
+
+    window.open_path(sample_pdf)
+
+    assert len(warnings) == 1
+    assert "学習マーク" in warnings[0]
+    assert sample_pdf.name in warnings[0]
+    assert "削除されていません" in warnings[0]
+    window.close()
+
+
+def test_an_unexpected_failure_while_opening_is_not_swallowed(
+    qtbot: QtBot,
+    settings: Settings,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+    warnings: list[str],
+) -> None:
+    """実装の誤りは警告にすり替えず、未捕捉例外として送出する。
+
+    読み込み失敗を1つの型に包むのは、この境界を作るため。後始末だけは
+    読み込み失敗と同じで、開きかけの PDF を残さない。
+    """
+    window = MainWindow(settings, study_marks)
+    qtbot.addWidget(window)
+
+    def boom(_path: Path) -> None:
+        msg = "programming error"
+        raise AttributeError(msg)
+
+    window.study_marks.activate_document = boom  # type: ignore[assignment]
+
+    with pytest.raises(AttributeError):
+        window.open_path(sample_pdf)
+
+    assert not window.view.has_document
+    assert window.study_marks.active_document_path is None
+    assert warnings == []
     window.close()
 
 
