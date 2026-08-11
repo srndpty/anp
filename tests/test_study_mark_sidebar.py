@@ -23,6 +23,8 @@ from PySide6.QtWidgets import QComboBox, QMenu, QSpinBox, QTreeWidgetItem
 from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
+from anp.pdf.cache import RenderCache
+from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController
 from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
@@ -36,7 +38,7 @@ from anp.ui.study_mark_sidebar import (
     StudyMarkSidebar,
     note_preview,
 )
-from helpers import BrokenRepository, RecordingRepository, RecordingService
+from helpers import BrokenRepository, RecordingRepository, RecordingService, put_image
 
 # 列の位置。文言ではなく並びを固定する。
 PAGE_COLUMN, COUNT_COLUMN, NOTE_COLUMN = 0, 1, 2
@@ -686,19 +688,37 @@ def test_revealing_reaches_anywhere_on_the_last_page(loaded_view: PdfView, y_nor
 
 
 def test_revealing_does_not_touch_the_rendering_pipeline(
-    loaded_view: PdfView, service: RecordingService
+    loaded_view: PdfView, cache: RenderCache, service: RecordingService
 ) -> None:
     """移動のためにキャッシュや色変換を作り直さない。
 
-    スクロールに伴う通常のレンダリング要求は起きてよい。
+    スクロールに伴う通常のレンダリング要求は起きてよい。壊してはいけないのは
+    **既に持っている画像**の方で、世代を進めたりキャッシュを捨てたりすると、
+    一覧から問題を見て回るたびに開いている PDF を全ページ描き直すことになる。
+
+    「要求が増えていないこと」では検証にならない（世代を進めても要求は増える
+    方向にしか動かない）。世代そのものと、仕込んだ raw / 表示用の画像が生き
+    残っていることを見る。
     """
-    transforms = len(service.transforms.submitted)
+    put_image(cache, loaded_view, 0, Qt.GlobalColor.red)
+    loaded_view.set_page_color_mode(PageColorMode.INVERT)
+    service.repeat_last_request()
+
+    # 仕込んだ画像は1ページ分だけなので、幅を問わず同じ鍵が返る。
+    raw_key = cache.nearest_key(0, width_px=0)
+    display_key = service.display_cache.nearest_key(0, 0, PageColorMode.INVERT)
+    assert raw_key is not None
+    assert display_key is not None
+
+    generation = service.generation
     color_mode = loaded_view.page_color_mode
 
     loaded_view.reveal_page_position(2, 0.5, 0.5)
 
+    assert service.generation == generation
+    assert raw_key in cache
+    assert display_key in service.display_cache
     assert loaded_view.page_color_mode is color_mode
-    assert len(service.transforms.submitted) >= transforms
 
 
 def test_revealing_refuses_coordinates_outside_the_contract(loaded_view: PdfView) -> None:
@@ -1050,6 +1070,25 @@ def test_clicking_a_stale_row_is_safe(
     assert window.view.verticalScrollBar().value() == scroll
     assert study_marks.get(stale.id) == stale
     assert "現在の PDF にありません" in window.statusBar().currentMessage()
+
+
+def test_clicking_a_row_does_not_discard_the_rendering_state(
+    window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
+) -> None:
+    """一覧から移動しても、レンダリングの世代は進まない。
+
+    `PdfView` 単体だけでなく配線の側でも固定する。移動の前後で
+    `MainWindow` がドキュメントを載せ直せば、ビューが正しくても
+    キャッシュは丸ごと捨てられる。
+    """
+    study_marks.create(sample_pdf, 2, 0.5, 0.8)
+    window.open_path(sample_pdf)
+    render = window.view._render  # noqa: SLF001
+    generation = render.generation
+
+    click_row(window.study_mark_sidebar, 0)
+
+    assert render.generation == generation
 
 
 @pytest.mark.parametrize("mode", ["free_25", "free_100", "free_400", "fit_width", "fit_page"])
