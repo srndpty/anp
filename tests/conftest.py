@@ -275,6 +275,120 @@ def other_outline_pdf(qapp: QApplication, tmp_path: Path) -> Path:
     )
 
 
+# ------------------------------------------------------------ テキスト層つき PDF
+# `QPdfWriter` が書く PDF はフォントを埋め込むだけで ToUnicode を持たないため、
+# pdfium がテキストを取り出せない（`getAllText()` が空になり、検索は必ず 0 件）。
+# 検索のテストには **実際に検索できる PDF** が要るので、`_write_pdf_objects()`
+# を使って base-14 フォント（Helvetica）の content stream を組み立てる。
+# PDF ライブラリは増やさない。
+#
+# 座標は PDF の座標（ページ左下が原点）。`QPdfLink.rectangles()` は、これを
+# ページ左上原点へ直した値を返す。
+_TEXT_FIRST_LINE_Y = 750.0
+_TEXT_LINE_GAP = 50.0
+_TEXT_LEFT_X = 72.0
+_TEXT_FONT_SIZE = 14
+
+
+def write_text_pdf(path: Path, pages: Sequence[Sequence[str]]) -> Path:
+    """1ページに数行ずつテキストを置いた A4（595x842pt）の PDF を書き出す。"""
+    page_count = len(pages)
+    # オブジェクト番号は 1: カタログ、2: ページツリー、以降ページと content が
+    # 交互、最後にフォント。
+    font_number = 3 + page_count * 2
+    kids = " ".join(f"{3 + index * 2} 0 R" for index in range(page_count))
+
+    objects: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        f"<< /Type /Pages /Kids [{kids}] /Count {page_count} >>".encode(),
+    ]
+    for index, lines in enumerate(pages):
+        content_number = 3 + index * 2 + 1
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+                f"/Resources << /Font << /F1 {font_number} 0 R >> >> "
+                f"/Contents {content_number} 0 R >>"
+            ).encode()
+        )
+        body = f"BT /F1 {_TEXT_FONT_SIZE} Tf\n"
+        for line, text in enumerate(lines):
+            y = _TEXT_FIRST_LINE_Y - _TEXT_LINE_GAP * line
+            escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            body += f"1 0 0 1 {_TEXT_LEFT_X} {y} Tm ({escaped}) Tj\n"
+        stream = (body + "ET").encode()
+        objects.append(
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"
+        )
+    objects.append(
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+    )
+    return _write_pdf_objects(path, objects)
+
+
+# 検索のテストが期待値の根拠にする文面。
+#
+# - "target" は **同じページに複数件**（0ページ目・1ページ目）で合計4件
+# - "gamma target" は0ページ目の行をまたぐので、1件の結果が矩形を2つ持つ
+# - 2ページ目は一致しないので、`resultsOnPage()` が空になるページがある
+# - 1ページ目の4件目は **ページのかなり下** にある。ページの先頭まで移動
+#   するだけの実装では見えない位置を作るため
+_FILLER_LINES = ("filler",) * 11
+
+SEARCHABLE_PDF_PAGES = (
+    ("alpha beta target gamma", "target again"),
+    ("something target something", *_FILLER_LINES, "target near the bottom"),
+    ("no match here",),
+)
+
+SEARCH_QUERY = "target"
+SEARCH_QUERY_HITS = 4
+"""`SEARCH_QUERY` の一致件数。0ページ目に2件、1ページ目に2件。"""
+
+SPACED_SEARCH_QUERY = " target"
+SPACED_SEARCH_QUERY_HITS = 2
+"""前後の空白を落とさないことを見る検索語。行頭の "target" には一致しない。"""
+
+WRAPPING_SEARCH_QUERY = "gamma target"
+"""0ページ目の行をまたぐ検索語。1件の結果が複数の矩形を持つ。"""
+
+
+@pytest.fixture
+def searchable_pdf(qapp: QApplication, tmp_path: Path) -> Path:
+    """テキスト層を実際に持つ3ページの PDF。"""
+    return write_text_pdf(tmp_path / "searchable.pdf", SEARCHABLE_PDF_PAGES)
+
+
+@pytest.fixture
+def other_searchable_pdf(qapp: QApplication, tmp_path: Path) -> Path:
+    """別の文面を持つ2ページの PDF。検索状態が PDF を跨がないことを見る。
+
+    `SEARCH_QUERY` は **1件も含まない**。A の結果が B へ残っていれば、
+    件数がそのまま食い違う。
+    """
+    return write_text_pdf(
+        tmp_path / "other_searchable.pdf", (("completely different words",), ("nothing here",))
+    )
+
+
+@pytest.fixture
+def image_only_pdf(qapp: QApplication, tmp_path: Path) -> Path:
+    """図形だけでテキストを持たない PDF（スキャンした本の代わり）。
+
+    OCR はしないので、何を検索しても 0 件になる境界を固定する。
+    """
+    stream = b"0 0 1 rg 100 100 300 400 re f"
+    return _write_pdf_objects(
+        tmp_path / "image_only.pdf",
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R >>",
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        ],
+    )
+
+
 @pytest.fixture
 def pageless_pdf(qapp: QApplication, tmp_path: Path) -> Path:
     """PDF としては読めるが、ページが1つも無いファイル。"""

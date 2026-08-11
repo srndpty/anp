@@ -217,6 +217,21 @@ class PageLayout:
         rect = self.page_rect(index, zoom)
         return QPointF(rect.left() + point.x() * zoom, rect.top() + point.y() * zoom)
 
+    def rect_from_page_points(self, index: int, rect: QRectF, zoom: float) -> QRectF:
+        """ページ内の PDF ポイントの矩形をコンテンツ座標に変換する。
+
+        原点はページの左上で、`from_page_points()` と同じ座標体系。検索結果の
+        矩形（`QPdfLink.rectangles()`）がこの単位で来る。
+
+        左上の変換は `from_page_points()` に任せ、寸法だけを倍率で伸ばす。
+        右下も点として変換すると、余白の加算が2回入るのと同じ式を2箇所に
+        書くことになる。
+        """
+        return QRectF(
+            self.from_page_points(index, rect.topLeft(), zoom),
+            QSizeF(rect.width() * zoom, rect.height() * zoom),
+        )
+
     # -------------------------------------------------- 内部
     def _tops(self, zoom: float) -> list[float]:
         """各ページの上端座標。倍率が変わったときだけ組み立て直す。"""

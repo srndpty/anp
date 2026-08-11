@@ -25,6 +25,11 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 `PdfView`。ここの仕事は「この PDF の目次を出せ」と伝えることと、
 移動の要求をビューへ渡すことまで。
 
+**テキスト検索にもここから触らない。** 検索するのは
+`PdfSearchController` が持つ `QPdfSearchModel`（pdfium）で、ハイライトと
+移動は `PdfView`。ここの仕事は配線と、ドキュメントの着脱を伝えることまで。
+検索の算術も geometry もここには書かない。
+
 外観のうち **UI テーマだけ**をここが持つ。アプリ全体のウィジェットの
 配色はビューの責務ではないため。キャンバスの色は `PdfView`、ページの
 色変換は `PageRenderService` が持ち、3つは互いに連動しない。
@@ -65,8 +70,10 @@ from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
+from anp.ui.pdf_search_controller import PdfSearchController, SearchState
 from anp.ui.pdf_view import PdfView, ReadingPosition, ZoomMode
 from anp.ui.recent_files import add_recent, normalize_recent, recent_labels, remove_recent
+from anp.ui.search_dock import SearchDock
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_mark_interaction import StudyMarkInteraction
 from anp.ui.study_mark_sidebar import StudyMarkSidebar
@@ -169,6 +176,7 @@ class MainWindow(QMainWindow):
 
         self._create_study_mark_sidebar()
         self._create_toc_sidebar()
+        self._create_search_dock()
 
         self.setWindowTitle("anp")
         # 履歴のサブメニューはここが所有する。`addMenu(title)` の戻り値だけを
@@ -179,6 +187,7 @@ class MainWindow(QMainWindow):
             self._actions,
             self._marks_sidebar.toggleViewAction(),
             self._toc_sidebar.toggleViewAction(),
+            self._search_dock.toggleViewAction(),
             self._recent_menu,
         )
         self._create_toolbar()
@@ -264,6 +273,54 @@ class MainWindow(QMainWindow):
         """
         if not self._view.navigate_to_pdf_destination(destination):
             self.statusBar().showMessage(_STALE_DESTINATION_MESSAGE, _TRANSIENT_MESSAGE_MS)
+
+    def _create_search_dock(self) -> None:
+        """テキスト検索のコントローラと UI を作って配線する。
+
+        ここが書くのは配線だけ。検索そのものは `QPdfSearchModel`、
+        ハイライトと移動は `PdfView` にある。
+
+        ドックは下に置く（Left: 目次 / Center: PDF / Right: 学習マーク /
+        Bottom: 検索）。**初期状態は非表示**で、保存済みのウィンドウ状態が
+        あれば `restoreState()` の値が勝つ。他の2つのドックと同じ扱いなので、
+        検索専用の設定キーは作らない。
+
+        検索モデルをビューへ渡すのはここ1回だけ。モデルはコントローラと
+        同じ寿命で、ドキュメントの着脱だけがモデルの内側で起こる。
+        """
+        self._search = PdfSearchController(self)
+        self._search_dock = SearchDock(self)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._search_dock)
+        self._search_dock.hide()
+
+        self._view.set_search_model(self._search.model)
+
+        self._search_dock.query_changed.connect(self._search.set_query)
+        self._search_dock.next_requested.connect(self._search.next_result)
+        self._search_dock.previous_requested.connect(self._search.previous_result)
+
+        self._search.state_changed.connect(self._on_search_state_changed)
+        self._search.result_activated.connect(self._view.reveal_pdf_search_result)
+
+    def _on_search_state_changed(self, state: SearchState) -> None:
+        """検索の状態を、件数表示とハイライトの両方へ配る。
+
+        情報源は `PdfSearchController` の1つだけ。ここから件数を数え直したり、
+        UI とビューを別々に更新したりしない（表示と強調がずれる状態を
+        作れないようにするため）。
+        """
+        self._search_dock.set_state(state)
+        self._view.set_current_search_result(state.current_index)
+
+    def _show_search(self) -> None:
+        """検索ドックを出して入力欄へフォーカスする（Ctrl+F）。
+
+        既に開いていても呼べる。入力欄の既存の検索語は選択状態になるので、
+        続けて打てば置き換わり、そのまま Enter を押せば次の結果へ進む。
+        """
+        self._search_dock.show()
+        self._search_dock.raise_()
+        self._search_dock.focus_query()
 
     def _create_toolbar(self) -> None:
         """ズームとページ移動のツールバー。見た目には凝らない。"""
@@ -401,6 +458,10 @@ class MainWindow(QMainWindow):
             lambda: self._view.go_to_page(self._view.current_page + 1)
         )
 
+        self._actions.find.triggered.connect(self._show_search)
+        self._actions.find_next.triggered.connect(self._search.next_result)
+        self._actions.find_previous.triggered.connect(self._search.previous_result)
+
     def _apply_fit(self, mode: ZoomMode) -> None:
         """フィットを適用し、選択表示を取り直す。
 
@@ -501,7 +562,15 @@ class MainWindow(QMainWindow):
         経路** なので、アプリケーション境界の「予期しないエラー」に送らず、
         ここで日本語の警告にする。包まれていない例外（実装の誤り）は
         後始末だけして送出し、未捕捉例外として扱う。
+
+        **検索は読み込みを始める前に止める。** `DocumentController` は
+        `QPdfDocument` を使い回すので、検索モデルを付けたまま
+        `load()` を呼ぶと、`QPdfSearchModel` がページを走査している最中に
+        対象のページが消える（走査はタイマーで少しずつ進む）。
+        `_clear_document()` の後始末では遅い。
         """
+        self._search_dock.clear_query()
+        self._search.detach_document()
         try:
             self._controller.open(path)
         except DocumentError as error:
@@ -529,6 +598,10 @@ class MainWindow(QMainWindow):
         # 経路（PDF が読めない・学習マークが読めない）はすべて
         # `_clear_document()` を通るので、古い PDF の目次が残ることはない。
         self._toc_sidebar.set_document(self._controller.document)
+        # 検索も目次と同じ扱い。**開く操作が最後まで成功した後**に載せる。
+        # 検索語と入力欄は読み込みの前に空にしてあるので、A の検索語のまま
+        # B の件数が出ることはない。
+        self._search.attach_document(self._controller.document)
 
         self.setWindowTitle(f"{path.name} - anp")
         self._sync_document_ui()
@@ -561,12 +634,14 @@ class MainWindow(QMainWindow):
         開くのに失敗したときと、学習マークを読み込めなかったときの後始末は
         同じ。学習マークだけ別の後始末を作らない。
 
-        目次も一緒に手放す。「PDF なし」なのに前の PDF の目次が残っている
-        状態を作らないため。
+        目次と検索も一緒に手放す。「PDF なし」なのに前の PDF の目次や
+        検索結果が残っている状態を作らないため。
         """
         self._view.clear_document()
         self._study_marks.clear_document()
         self._toc_sidebar.clear_document()
+        self._search_dock.clear_query()
+        self._search.detach_document()
         self._sync_document_ui()
 
     # -------------------------------------------------- 表示の同期
@@ -854,8 +929,9 @@ class MainWindow(QMainWindow):
 
         self._view.clear_document()
         self._study_marks.clear_document()
-        # 目次のモデルは `QPdfDocument` を指しているので、閉じる前に外す。
+        # 目次と検索のモデルは `QPdfDocument` を指しているので、閉じる前に外す。
         self._toc_sidebar.clear_document()
+        self._search.detach_document()
         self._controller.close()
         logger.info("main window closed")
         super().closeEvent(event)
@@ -890,6 +966,16 @@ class MainWindow(QMainWindow):
     def toc_sidebar(self) -> TocSidebar:
         """PDF の目次のドック。"""
         return self._toc_sidebar
+
+    @property
+    def search(self) -> PdfSearchController:
+        """テキスト検索のコントローラ。"""
+        return self._search
+
+    @property
+    def search_dock(self) -> SearchDock:
+        """テキスト検索のドック。"""
+        return self._search_dock
 
     @property
     def recent_files(self) -> tuple[Path, ...]:

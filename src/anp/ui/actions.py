@@ -55,6 +55,21 @@ class ReaderActions:
     previous_page: QAction
     next_page: QAction
 
+    find: QAction
+    """検索ドックを出して入力欄へフォーカスする（Ctrl+F）。"""
+
+    find_next: QAction
+    find_previous: QAction
+    """次/前の検索結果へ移動する（F3 / Shift+F3）。
+
+    P5-4 でショートカットを設定可能にするまでは固定のキーで持つ。
+
+    ドキュメントの有無では切り替えない（`set_document_dependent_enabled()`
+    に入れない）。結果が無ければコントローラ側で何も起きないので、
+    「押せるのに何も起きない」以上の害はなく、有効/無効の情報源を
+    検索結果の件数とドキュメントの2つに分けずに済む。
+    """
+
     def set_document_dependent_enabled(self, *, enabled: bool) -> None:
         """ドキュメントが無いと意味のないアクションをまとめて切り替える。
 
@@ -144,6 +159,9 @@ def create_actions(parent: QWidget) -> ReaderActions:
         # 通常の PageUp/PageDown はスクロール操作として空けておく。
         previous_page=_action(parent, "前のページ(&P)", shortcuts=["Ctrl+PgUp"]),
         next_page=_action(parent, "次のページ(&N)", shortcuts=["Ctrl+PgDown"]),
+        find=_action(parent, "検索(&F)...", shortcuts=["Ctrl+F"]),
+        find_next=_action(parent, "次を検索(&N)", shortcuts=["F3"]),
+        find_previous=_action(parent, "前を検索(&V)", shortcuts=["Shift+F3"]),
     )
 
 
@@ -152,11 +170,12 @@ def populate_menus(
     actions: ReaderActions,
     study_marks_toggle: QAction,
     toc_toggle: QAction,
+    search_toggle: QAction,
     recent_menu: QMenu,
 ) -> None:
     """メニューバーを組み立てる。
 
-    `study_marks_toggle` と `toc_toggle` はそれぞれのドックの
+    `study_marks_toggle`・`toc_toggle`・`search_toggle` はそれぞれのドックの
     `toggleViewAction()`。表示/非表示の状態はドック自身が持つので、
     `ReaderActions` には入れず受け取ったものをそのまま並べる。
 
@@ -172,6 +191,7 @@ def populate_menus(
     view_menu = menu_bar.addMenu("表示(&V)")
     view_menu.addAction(study_marks_toggle)
     view_menu.addAction(toc_toggle)
+    view_menu.addAction(search_toggle)
     view_menu.addSeparator()
     view_menu.addAction(actions.zoom_in)
     view_menu.addAction(actions.zoom_out)
@@ -205,6 +225,10 @@ def populate_menus(
     go_menu = menu_bar.addMenu("移動(&G)")
     go_menu.addAction(actions.previous_page)
     go_menu.addAction(actions.next_page)
+    go_menu.addSeparator()
+    go_menu.addAction(actions.find)
+    go_menu.addAction(actions.find_next)
+    go_menu.addAction(actions.find_previous)
 
     help_menu = menu_bar.addMenu("ヘルプ(&H)")
     help_menu.addAction(actions.about)
