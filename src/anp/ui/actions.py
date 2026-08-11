@@ -21,6 +21,9 @@ class ReaderActions:
     """リーダーのアクション一式。"""
 
     open: QAction
+    clear_recent: QAction
+    """最近使ったファイルの一覧だけを空にする。他の設定には触らない。"""
+
     quit: QAction
     about: QAction
 
@@ -114,6 +117,7 @@ def create_actions(parent: QWidget) -> ReaderActions:
 
     return ReaderActions(
         open=_action(parent, "開く(&O)...", shortcuts=["Ctrl+O"]),
+        clear_recent=_action(parent, "最近使ったファイルをクリア(&C)"),
         quit=_action(parent, "終了(&X)", shortcuts=["Ctrl+Q"]),
         about=_action(parent, "anp について(&A)"),
         # Ctrl++ は Shift が要るキーボードが多いので Ctrl+= も受ける。
@@ -143,15 +147,24 @@ def create_actions(parent: QWidget) -> ReaderActions:
     )
 
 
-def populate_menus(menu_bar: QMenuBar, actions: ReaderActions, study_marks_toggle: QAction) -> None:
+def populate_menus(
+    menu_bar: QMenuBar,
+    actions: ReaderActions,
+    study_marks_toggle: QAction,
+    recent_menu: QMenu,
+) -> None:
     """メニューバーを組み立てる。
 
     `study_marks_toggle` は学習マークのドックの `toggleViewAction()`。
     表示/非表示の状態はドック自身が持つので、`ReaderActions` には入れず
     受け取ったものをそのまま並べる。
+
+    `recent_menu` も同じ扱い。中身は履歴が変わるたびに作り直されるので、
+    ここでは場所を決めるだけで項目には触らない。
     """
     file_menu = menu_bar.addMenu("ファイル(&F)")
     file_menu.addAction(actions.open)
+    file_menu.addMenu(recent_menu)
     file_menu.addSeparator()
     file_menu.addAction(actions.quit)
 

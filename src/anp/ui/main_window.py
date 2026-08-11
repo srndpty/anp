@@ -23,19 +23,26 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 外観のうち **UI テーマだけ**をここが持つ。アプリ全体のウィジェットの
 配色はビューの責務ではないため。キャンバスの色は `PdfView`、ページの
 色変換は `PageRenderService` が持ち、3つは互いに連動しない。
+
+**PDF を開く経路は `_open_document()` の1本だけ。** 利用者が選んだ場合も、
+最近使ったファイルからの場合も、起動時の自動復元の場合も同じ手順を通る。
+違うのは「履歴を更新するか」と「失敗をダイアログで知らせるか」の2点
+だけなので、そこだけを引数で分ける（復元専用の open を作らない）。
 """
 
 from __future__ import annotations
 
 import logging
+from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut, QShowEvent
 from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QSpinBox,
     QToolBar,
@@ -52,7 +59,8 @@ from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
-from anp.ui.pdf_view import PdfView, ZoomMode
+from anp.ui.pdf_view import PdfView, ReadingPosition, ZoomMode
+from anp.ui.recent_files import add_recent, normalize_recent, recent_labels, remove_recent
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_mark_interaction import StudyMarkInteraction
 from anp.ui.study_mark_sidebar import StudyMarkSidebar
@@ -78,6 +86,13 @@ _MARK_LOAD_ERROR = (
 _STALE_MARK_MESSAGE = "このマークのページは現在の PDF にありません"
 _STALE_MARK_MESSAGE_MS = 5000
 
+# ステータスバーの常設表示。一時メッセージ（`showMessage()`）が消えた後も
+# 開いている PDF が分かるよう、パスは常設ウィジェットに置く。
+_NO_DOCUMENT_STATUS = "PDF が開かれていません"
+
+_RECENT_MENU_TITLE = "最近使ったファイル(&R)"
+_RECENT_EMPTY_LABEL = "最近使ったファイルはありません"
+
 # 倍率モードの表示名。FREE はパーセント表示なのでここには無い。
 _ZOOM_MODE_LABELS = {
     ZoomMode.FIT_WIDTH: "幅に合わせる",
@@ -99,6 +114,17 @@ class MainWindow(QMainWindow):
 
         # 全画面から戻るときに復元する状態。全画面へ入る直前に記録する。
         self._maximized_before_full_screen = False
+
+        # 最近使ったファイル。並び・重複・件数の契約は `recent_files` に
+        # あるので、ここが持つのは「いまの一覧」だけ。読み込んだ時点で
+        # 契約の形に揃えるので、設定を手で書き換えられていても、次に
+        # PDF を開くまで重複や上限超えが残ることはない。
+        self._recent: tuple[Path, ...] = normalize_recent(
+            [Path(stored) for stored in self._settings.recent_files]
+        )
+
+        # 前回のセッションを復元したか。最初に表示されたときの1回だけ行う。
+        self._session_restored = False
 
         # UI テーマはアプリ全体の外観なので、ビューではなくここが持つ。
         # `QStyleHints` は「指定を外した」状態を読み出せないので、選ばれた
@@ -133,9 +159,19 @@ class MainWindow(QMainWindow):
         self._create_study_mark_sidebar()
 
         self.setWindowTitle("anp")
-        populate_menus(self.menuBar(), self._actions, self._marks_sidebar.toggleViewAction())
+        # 履歴のサブメニューはここが所有する。`addMenu(title)` の戻り値だけを
+        # 持つと Python 側の参照が消えてメニューが破棄されるので、親を明示する。
+        self._recent_menu = QMenu(_RECENT_MENU_TITLE, self)
+        populate_menus(
+            self.menuBar(),
+            self._actions,
+            self._marks_sidebar.toggleViewAction(),
+            self._recent_menu,
+        )
         self._create_toolbar()
+        self._create_status_bar()
         self._connect_actions()
+        self._rebuild_recent_menu()
 
         self._view.current_page_changed.connect(self._on_current_page_changed)
         self._view.zoom_changed.connect(self._sync_zoom_ui)
@@ -220,8 +256,61 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._page_count_label)
         toolbar.addAction(self._actions.next_page)
 
+    def _create_status_bar(self) -> None:
+        """開いている PDF のパスを常設ウィジェットとして置く。
+
+        `showMessage()` は普通のウィジェットを隠すが、常設ウィジェットは
+        隠さない。学習マークの一時メッセージが5秒で消えた後も、パスの
+        表示が戻る（消えたままにならない）のはこのため。
+        """
+        self._path_label = QLabel(_NO_DOCUMENT_STATUS, self)
+        self.statusBar().addPermanentWidget(self._path_label)
+
+    # -------------------------------------------------- 最近使ったファイル
+    def _rebuild_recent_menu(self) -> None:
+        """履歴のサブメニューを、いまの一覧から作り直す。
+
+        差分更新はしない。`QMenu.clear()` が前回の項目（メニューが親）を
+        破棄するので、古い `QAction` も接続も残らない。「クリア」だけは
+        ウィンドウが持つアクションなので、外れるだけで生き残る。
+
+        項目が持つのは **パスそのもの**。表示文字列からパスを逆算しない。
+        """
+        self._recent_menu.clear()
+
+        if not self._recent:
+            empty = self._recent_menu.addAction(_RECENT_EMPTY_LABEL)
+            empty.setEnabled(False)
+            return
+
+        for path, label in zip(self._recent, recent_labels(self._recent), strict=True):
+            # メニューは `&` をニーモニックとして食べるので、ファイル名に
+            # 含まれる分は二重にして見せる。
+            action = self._recent_menu.addAction(label.replace("&", "&&"))
+            action.setStatusTip(str(path))
+            action.setToolTip(str(path))
+            action.triggered.connect(partial(self.open_path, path))
+
+        self._recent_menu.addSeparator()
+        self._recent_menu.addAction(self._actions.clear_recent)
+
+    def _set_recent(self, paths: tuple[Path, ...]) -> None:
+        """履歴を差し替え、保存とメニューを揃える唯一の経路。"""
+        self._recent = paths
+        self._settings.recent_files = [str(path) for path in paths]
+        self._rebuild_recent_menu()
+
+    def _clear_recent(self) -> None:
+        """履歴だけを空にする。
+
+        前回のセッション・学習マーク・最後のディレクトリ・ウィンドウ状態・
+        外観のいずれにも触らない。
+        """
+        self._set_recent(())
+
     def _connect_actions(self) -> None:
         self._actions.open.triggered.connect(self._prompt_open)
+        self._actions.clear_recent.triggered.connect(self._clear_recent)
         self._actions.quit.triggered.connect(self.close)
         self._actions.about.triggered.connect(self._show_about)
 
@@ -324,7 +413,31 @@ class MainWindow(QMainWindow):
             self.open_path(Path(path))
 
     def open_path(self, path: Path) -> None:
-        """PDF を開く。失敗したら表示を空にしてから知らせる。
+        """利用者の操作で PDF を開く。
+
+        「開く...」からでも履歴からでも、通る手順はここで同じ。履歴専用の
+        読み込み経路は作らない。
+
+        履歴を更新するのは **PDF と学習マークの両方が読めて、開く操作が
+        最後まで成功したとき** だけ。開けなかった PDF が履歴の先頭に
+        並ぶことはない。
+
+        失敗したときは、**ファイルが無くなっていた場合に限り** その項目を
+        履歴から外す。何度押しても同じように失敗する項目を残さないため。
+        「開けなかった」だけの場合は残す（一時的な事情かもしれないし、
+        差し替えれば次は開ける）。
+        """
+        if self._open_document(path, notify=True):
+            self._set_recent(add_recent(self._recent, path))
+        elif not path.exists():
+            self._set_recent(remove_recent(self._recent, path))
+
+    def _open_document(self, path: Path, *, notify: bool) -> bool:
+        """PDF を開く。開けたかを返す。失敗したら表示を空にする。
+
+        `notify` は失敗を利用者に知らせるかどうか。利用者が明示的に開いた
+        ときは知らせるが、起動時の自動復元では出さない（起動した瞬間に
+        ダイアログが積み上がるのを避ける。ログには必ず残る）。
 
         `DocumentController.open()` は失敗時に前のドキュメントも閉じるので、
         表示だけ古い PDF のまま残すと、見えている内容と実体がずれる。
@@ -349,8 +462,10 @@ class MainWindow(QMainWindow):
             self._controller.open(path)
         except DocumentError as error:
             self._clear_document()
-            QMessageBox.warning(self, _OPEN_ERROR_TITLE, f"{path.name}\n\n{error.message}")
-            return
+            self._report_open_failure(
+                notify=notify, title=_OPEN_ERROR_TITLE, path=path, body=error.message
+            )
+            return False
 
         self._settings.last_directory = str(path.parent)
         self._view.set_document(self._controller.document, self._controller.page_sizes())
@@ -358,15 +473,28 @@ class MainWindow(QMainWindow):
             self._study_marks.activate_document(path)
         except StudyMarkLoadError:
             self._abort_open()
-            QMessageBox.warning(self, _MARK_LOAD_ERROR_TITLE, f"{path.name}\n\n{_MARK_LOAD_ERROR}")
-            return
+            self._report_open_failure(
+                notify=notify, title=_MARK_LOAD_ERROR_TITLE, path=path, body=_MARK_LOAD_ERROR
+            )
+            return False
         except Exception:
             self._abort_open()
             raise
 
         self.setWindowTitle(f"{path.name} - anp")
         self._sync_document_ui()
-        self.statusBar().showMessage(str(path))
+        return True
+
+    def _report_open_failure(self, *, notify: bool, title: str, path: Path, body: str) -> None:
+        """開けなかったことを知らせる。
+
+        知らせ方は1つだけ。PDF の失敗と学習マークの失敗で、まとめて2枚の
+        ダイアログを出すような経路は作らない（失敗した時点で戻る）。
+        """
+        if notify:
+            QMessageBox.warning(self, title, f"{path.name}\n\n{body}")
+        else:
+            logger.warning("automatic restore failed for %s: %s", path, title)
 
     def _abort_open(self) -> None:
         """開きかけた PDF を手放し、「PDF なし」の状態へ戻す。
@@ -400,9 +528,15 @@ class MainWindow(QMainWindow):
         self._page_input.setMaximum(max(page_count, 1))
         self._page_count_label.setText(f"/ {page_count}")
 
+        # 常設ウィジェットなので、一時メッセージが消えた後もここが残る。
+        # 開いているパスの情報源は `DocumentController` の1つだけ。
+        path = self._controller.path
+        self._path_label.setText(
+            str(path) if has_document and path is not None else _NO_DOCUMENT_STATUS
+        )
+
         if not has_document:
             self.setWindowTitle("anp")
-            self.statusBar().showMessage("PDF が開かれていません")
 
         self._sync_page_ui()
         self._sync_zoom_ui()
@@ -505,6 +639,82 @@ class MainWindow(QMainWindow):
         if state is not None:
             self.restoreState(state)
 
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 (Qt の命名規則)
+        """最初に表示されたときだけ、前回のセッションを復元する。
+
+        構築中ではなくここで行うのは、**ビューポートの大きさが確定して
+        から読書位置を決める**ため。先に決めると、その後のレイアウトで
+        フィット倍率が変わり、復元した位置がずれる。
+
+        タイマーは使わない。ジオメトリの復元は構築時に済んでおり、
+        この時点でビューポートの大きさは決まっている。
+        """
+        super().showEvent(event)
+        if self._session_restored:
+            return
+        self._session_restored = True
+        self._restore_last_document()
+
+    def _restore_last_document(self) -> None:
+        """前回終了時に読んでいた PDF を、その位置ごと開き直す。
+
+        **どんな失敗でも起動は続ける。** ファイルが無い・壊れている・
+        学習マークを読み込めない、のいずれでも「PDF なし」の状態で
+        立ち上がる（学習マークの fail-closed は Phase 3 のまま。ただし
+        起動時なのでアプリを終了させはしない）。
+
+        失敗したら復元対象を忘れる。残しておくと、起動のたびに同じ失敗を
+        繰り返すことになる。ファイルが無くなっていた場合は履歴からも外す。
+
+        **履歴の並びは変えない。** 履歴は「利用者が明示的に開いたもの」
+        なので、自動で開いただけの PDF が先頭へ上がったり、意図せず
+        履歴に載ったりはしない。
+
+        順序は「倍率（構築時に復元済み）→ ドキュメント → 読書位置」。
+        逆にすると、フィットの計算が読書位置を動かしてしまう。
+        """
+        stored = self._settings.last_document
+        if not stored:
+            return
+
+        path = Path(stored)
+        if not self._open_document(path, notify=False):
+            self._settings.clear_last_session()
+            if not path.exists():
+                self._set_recent(remove_recent(self._recent, path))
+            return
+
+        self._restore_reading_position()
+
+    def _restore_reading_position(self) -> None:
+        """保存された読書位置まで戻る。戻れなければ先頭のまま。
+
+        差し替えでページ数が減っていた場合は、最終ページへ丸めずに文書の
+        先頭で開く。セッションの位置は過去の読書状態のヒントでしかないので、
+        存在しない位置を無理に解釈しない（学習マークの移動とは扱いが違う）。
+        """
+        position = ReadingPosition(
+            page_index=self._settings.last_page_index,
+            y_norm=self._settings.last_y_norm,
+        )
+        if not self._view.restore_reading_position(position):
+            logger.info("saved reading position is outside the document: %s", position)
+
+    def _save_last_session(self) -> None:
+        """いま読んでいる PDF と位置を、次回の起動のために覚える。
+
+        PDF を開いていない状態で終了したときは忘れる。閉じたはずの PDF が
+        次回また勝手に開くのを避けるため。倍率は既存の設定
+        （`view/zoom_mode` と `view/free_zoom`）をそのまま使うので、
+        セッション用の倍率キーは作らない。
+        """
+        path = self._controller.path
+        position = self._view.current_reading_position()
+        if path is None or position is None:
+            self._settings.clear_last_session()
+            return
+        self._settings.set_last_session(str(path), position.page_index, position.y_norm)
+
     def _restore_zoom(self) -> None:
         """保存された倍率モードと手動倍率を復元する。
 
@@ -563,7 +773,7 @@ class MainWindow(QMainWindow):
         self.set_ui_theme(theme)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt の命名規則)
-        """終了時にウィンドウの位置と状態、倍率を保存し、PDF を解放する。
+        """終了時にウィンドウの位置と状態、倍率、セッションを保存し、PDF を解放する。
 
         解放の順序は「表示 → ドキュメント」。`clear_document()` が世代を
         進めてキャッシュと要求を捨ててから、ドキュメントを閉じる。逆に
@@ -573,6 +783,10 @@ class MainWindow(QMainWindow):
         抱えたままにならないようにするため。なお `QPdfDocument.close()` は
         ファイルハンドルまでは手放さない（それは破棄時）。
         """
+        # 表示を捨てる前に読書位置を取る。`clear_document()` の後では
+        # 現在ページもスクロール位置も失われている。
+        self._save_last_session()
+
         self._settings.window_geometry = self.saveGeometry()
         self._settings.window_state = self.saveState()
         self._settings.zoom_mode = self._view.zoom_mode.value
@@ -616,3 +830,18 @@ class MainWindow(QMainWindow):
     def study_mark_sidebar(self) -> StudyMarkSidebar:
         """学習マークの一覧ドック。"""
         return self._marks_sidebar
+
+    @property
+    def recent_files(self) -> tuple[Path, ...]:
+        """最近使ったファイルの一覧（新しい順）。"""
+        return self._recent
+
+    @property
+    def recent_menu(self) -> QMenu:
+        """最近使ったファイルのサブメニュー。"""
+        return self._recent_menu
+
+    @property
+    def document_status_text(self) -> str:
+        """ステータスバーに常設しているパスの表示。"""
+        return self._path_label.text()

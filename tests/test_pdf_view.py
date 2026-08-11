@@ -13,13 +13,22 @@ import pytest
 from PySide6.QtCore import QEvent, QPoint, QPointF, QSizeF, Qt
 from PySide6.QtGui import QColor, QWheelEvent
 from PySide6.QtWidgets import QApplication
+from pytestqt.qtbot import QtBot
 
 from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController
 from anp.pdf.layout import LayoutMetrics, PageLayout
 from anp.ui.appearance import CanvasTheme
-from anp.ui.pdf_view import MAX_ZOOM, MIN_ZOOM, NO_PAGE, ZOOM_STEP, PdfView, ZoomMode
+from anp.ui.pdf_view import (
+    MAX_ZOOM,
+    MIN_ZOOM,
+    NO_PAGE,
+    ZOOM_STEP,
+    PdfView,
+    ReadingPosition,
+    ZoomMode,
+)
 from helpers import RecordingService, UpdateSpy, count_transforms, put_image, render_view
 
 # ビューが既定で使う配置寸法。フィット倍率の検算に使う。
@@ -1693,3 +1702,196 @@ def test_go_to_page_without_a_document_is_harmless(view: PdfView) -> None:
     view.go_to_page(3)
 
     assert view.current_page == NO_PAGE
+
+
+# ------------------------------------------------------------------ 読書位置
+def test_the_reading_position_starts_at_the_top(loaded_view: PdfView) -> None:
+    """開いた直後は1ページ目の先頭。"""
+    position = loaded_view.current_reading_position()
+
+    assert position is not None
+    assert position.page_index == 0
+    assert position.y_norm == pytest.approx(0.0, abs=0.05)
+
+
+def test_the_reading_position_follows_the_scroll(loaded_view: PdfView) -> None:
+    """ページの途中までスクロールすると、その割合が縦位置になる。"""
+    rect = loaded_view.page_viewport_rect(1)
+    assert rect is not None
+    bar = loaded_view.verticalScrollBar()
+    # 2ページ目の 40% がビューポート上端に来るところまで送る。
+    bar.setValue(round(bar.value() + rect.top() + rect.height() * 0.4))
+
+    position = loaded_view.current_reading_position()
+
+    assert position is not None
+    assert position.page_index == 1
+    assert position.y_norm == pytest.approx(0.4, abs=0.01)
+
+
+def scroll_to_page_boundary(view: PdfView, controller: DocumentController) -> None:
+    """先頭ページがまだ上端に見えているが、重なりでは次ページが勝つ位置へ送る。
+
+    `current_page` は「ビューポートといちばん大きく重なるページ」なので、
+    継ぎ目付近では「上端はまだ前のページ」「現在ページは次のページ」に
+    なる。読書位置の基準を取り違えると、この状態が「次ページの先頭」
+    として保存されてしまう。
+    """
+    layout = layout_of(controller)
+    bottom = layout.page_rect(0, view.zoom).bottom()
+    height = view.viewport().height()
+    # 先頭ページの残りが、次ページの見える量より小さくなる位置。
+    view.verticalScrollBar().setValue(round(bottom - height * 0.4))
+
+
+def test_the_reading_position_anchors_to_the_page_at_the_top(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """継ぎ目付近では、現在ページではなく上端側のページを基準にする。
+
+    ここを `current_page` にすると比率が負になり、0.0 へ丸めた結果
+    「次ページの先頭」として保存され、再起動のたびに先へ進んでしまう。
+    """
+    scroll_to_page_boundary(loaded_view, controller)
+    assert loaded_view.current_page == 1, "テストの前提が崩れている（継ぎ目付近にいない）"
+
+    saved = loaded_view.current_reading_position()
+
+    assert saved is not None
+    assert saved.page_index == 0
+    assert 0.0 < saved.y_norm < 1.0
+
+
+def test_the_reading_position_round_trips_across_a_page_boundary(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """継ぎ目付近でも、戻したときに同じ位置になる（先へ進まない）。"""
+    scroll_to_page_boundary(loaded_view, controller)
+    saved = loaded_view.current_reading_position()
+    assert saved is not None
+    before = loaded_view.verticalScrollBar().value()
+
+    loaded_view.go_to_page(0)
+    assert loaded_view.restore_reading_position(saved)
+
+    assert loaded_view.verticalScrollBar().value() == pytest.approx(before, abs=1)
+    restored = loaded_view.current_reading_position()
+    assert restored is not None
+    assert restored.page_index == saved.page_index
+    assert restored.y_norm == pytest.approx(saved.y_norm, abs=0.01)
+
+
+def test_the_reading_position_in_a_gap_uses_the_next_page(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """上端がページ間の隙間なら、次のページの先頭とみなす。"""
+    layout = layout_of(controller)
+    gap = layout.page_rect(0, loaded_view.zoom).bottom() + LayoutMetrics().page_gap / 2
+    loaded_view.verticalScrollBar().setValue(round(gap))
+
+    saved = loaded_view.current_reading_position()
+
+    assert saved is not None
+    assert saved.page_index == 1
+    assert saved.y_norm == pytest.approx(0.0)
+
+
+def test_the_reading_position_is_none_without_a_document(view: PdfView) -> None:
+    """ドキュメントが無ければ読書位置も無い。"""
+    assert view.current_reading_position() is None
+
+
+def test_the_reading_position_round_trips(loaded_view: PdfView) -> None:
+    """保存した位置へ戻すと、同じ読書位置になる。"""
+    bar = loaded_view.verticalScrollBar()
+    bar.setValue(bar.maximum() // 2)
+    saved = loaded_view.current_reading_position()
+    assert saved is not None
+
+    loaded_view.go_to_page(0)
+    assert loaded_view.restore_reading_position(saved)
+
+    restored = loaded_view.current_reading_position()
+    assert restored is not None
+    assert restored.page_index == saved.page_index
+    assert restored.y_norm == pytest.approx(saved.y_norm, abs=0.01)
+
+
+def test_restoring_survives_a_viewport_resize(loaded_view: PdfView, qtbot: QtBot) -> None:
+    """保存したときと違う大きさのウィンドウでも、同じページの同じ割合へ戻る。
+
+    正規化座標なので、固定のピクセル値では比べない。
+    """
+    bar = loaded_view.verticalScrollBar()
+    bar.setValue(bar.maximum() // 3)
+    saved = loaded_view.current_reading_position()
+    assert saved is not None
+
+    loaded_view.resize(560, 420)
+    qtbot.waitUntil(lambda: loaded_view.viewport().width() > 0)
+    loaded_view.go_to_page(0)
+
+    assert loaded_view.restore_reading_position(saved)
+    restored = loaded_view.current_reading_position()
+    assert restored is not None
+    assert restored.page_index == saved.page_index
+    assert restored.y_norm == pytest.approx(saved.y_norm, abs=0.02)
+
+
+def test_restoring_does_not_touch_the_zoom(loaded_view: PdfView) -> None:
+    """読書位置を戻しても倍率も倍率モードも動かない（Fit のまま）。"""
+    loaded_view.fit_width()
+    zoom, mode = loaded_view.zoom, loaded_view.zoom_mode
+
+    assert loaded_view.restore_reading_position(ReadingPosition(page_index=1, y_norm=0.5))
+
+    assert loaded_view.zoom == pytest.approx(zoom)
+    assert loaded_view.zoom_mode is mode
+
+
+def test_restoring_a_missing_page_does_nothing(loaded_view: PdfView) -> None:
+    """いまの PDF に無いページは、最終ページへ丸めずに何もしない。"""
+    before = loaded_view.verticalScrollBar().value()
+
+    assert not loaded_view.restore_reading_position(ReadingPosition(page_index=9, y_norm=0.5))
+
+    assert loaded_view.verticalScrollBar().value() == before
+    assert loaded_view.current_page == 0
+
+
+def test_restoring_without_a_document_does_nothing(view: PdfView) -> None:
+    """ドキュメントが無ければ戻せない。"""
+    assert not view.restore_reading_position(ReadingPosition(page_index=0, y_norm=0.5))
+
+
+@pytest.mark.parametrize(
+    "position",
+    [
+        ReadingPosition(page_index=-1, y_norm=0.5),
+        ReadingPosition(page_index=0, y_norm=-0.1),
+        ReadingPosition(page_index=0, y_norm=1.5),
+        ReadingPosition(page_index=0, y_norm=float("nan")),
+    ],
+)
+def test_restoring_an_invalid_position_is_refused(
+    loaded_view: PdfView, position: ReadingPosition
+) -> None:
+    """契約外の値は黙って丸めずに失敗させる（呼び出し側の誤り）。
+
+    設定から読んだ値は `Settings` の側で既定へ落とすので、ここまで
+    壊れた値が来るのは実装の誤りだけ。
+    """
+    with pytest.raises((ValueError, TypeError)):
+        loaded_view.restore_reading_position(position)
+
+
+def test_restoring_does_not_discard_the_rendering_state(
+    loaded_view: PdfView, service: RecordingService
+) -> None:
+    """読書位置を戻しても世代は進まない（キャッシュを捨てない）。"""
+    generation = service.generation
+
+    loaded_view.restore_reading_position(ReadingPosition(page_index=2, y_norm=0.3))
+
+    assert service.generation == generation
+    assert service.last_pages[0] == 2

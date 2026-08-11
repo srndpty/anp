@@ -90,7 +90,9 @@ def test_window_has_menus_and_status_bar(window: MainWindow) -> None:
     """メニューとステータスバーが用意されている。"""
     titles = [action.text() for action in window.menuBar().actions()]
     assert titles == ["ファイル(&F)", "表示(&V)", "移動(&G)", "ヘルプ(&H)"]
-    assert window.statusBar().currentMessage() != ""
+    # パスは常設ウィジェットなので、一時メッセージ（`currentMessage()`）
+    # とは別に常に出ている。
+    assert window.document_status_text == "PDF が開かれていません"
 
 
 def test_the_pdf_view_is_the_central_widget(window: MainWindow) -> None:
@@ -200,7 +202,7 @@ def test_a_failed_open_resets_the_title_and_status(
     opened.open_path(broken_pdf)
 
     assert opened.windowTitle() == "anp"
-    assert opened.statusBar().currentMessage() == "PDF が開かれていません"
+    assert opened.document_status_text == "PDF が開かれていません"
     assert warnings
 
 

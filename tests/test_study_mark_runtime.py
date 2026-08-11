@@ -582,7 +582,7 @@ def test_a_repository_failure_leaves_no_document_open(
     assert not window.view.has_document
     assert window.view.page_count == 0
     assert window.windowTitle() == "anp"
-    assert window.statusBar().currentMessage() == "PDF が開かれていません"
+    assert window.document_status_text == "PDF が開かれていません"
     assert not window.reader_actions.next_page.isEnabled()
     assert not window.reader_actions.zoom_in.isEnabled()
     assert len(warnings) == 1
