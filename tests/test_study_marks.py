@@ -344,6 +344,35 @@ def test_increment_reaches_double_digits(
     assert persisted.mistake_count == 10
 
 
+def test_increment_is_a_single_statement(
+    repository: StudyMarkRepository,
+    connection: sqlite3.Connection,
+    pdf_path: Path,
+) -> None:
+    """回数を増やすのは1文の UPDATE で、読んでから書き戻さない。
+
+    「1 増やす」を SQL の外で計算すると、読み取りと書き込みの間に別の更新が
+    入れば取りこぼす。接続は `autocommit=True` でトランザクションを持たない
+    ので、アトミック性の拠り所は「1文で完結していること」だけになる。
+    同期のテストでは退行しても結果が同じになってしまうため、発行された文を
+    直接見る。
+
+    SQL の全文とは比べない（文言を変えるたびに壊れるため）。固定するのは
+    「文が1つ」と「読み取りが混ざっていない」の2点。
+    """
+    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    statements: list[str] = []
+    connection.set_trace_callback(statements.append)
+    try:
+        repository.increment_mistake_count(mark.id)
+    finally:
+        connection.set_trace_callback(None)
+
+    assert len(statements) == 1
+    assert statements[0].lstrip().upper().startswith("UPDATE")
+    assert "SELECT" not in statements[0].upper()
+
+
 def test_increment_touches_only_target_mark(
     repository: StudyMarkRepository,
     pdf_path: Path,
