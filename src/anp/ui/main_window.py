@@ -60,7 +60,7 @@ from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.pdf_view import PdfView, ReadingPosition, ZoomMode
-from anp.ui.recent_files import add_recent, recent_labels, remove_recent
+from anp.ui.recent_files import add_recent, normalize_recent, recent_labels, remove_recent
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_mark_interaction import StudyMarkInteraction
 from anp.ui.study_mark_sidebar import StudyMarkSidebar
@@ -116,9 +116,11 @@ class MainWindow(QMainWindow):
         self._maximized_before_full_screen = False
 
         # 最近使ったファイル。並び・重複・件数の契約は `recent_files` に
-        # あるので、ここが持つのは「いまの一覧」だけ。
-        self._recent: tuple[Path, ...] = tuple(
-            Path(stored) for stored in self._settings.recent_files
+        # あるので、ここが持つのは「いまの一覧」だけ。読み込んだ時点で
+        # 契約の形に揃えるので、設定を手で書き換えられていても、次に
+        # PDF を開くまで重複や上限超えが残ることはない。
+        self._recent: tuple[Path, ...] = normalize_recent(
+            [Path(stored) for stored in self._settings.recent_files]
         )
 
         # 前回のセッションを復元したか。最初に表示されたときの1回だけ行う。

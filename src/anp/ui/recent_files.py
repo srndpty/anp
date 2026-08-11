@@ -41,6 +41,28 @@ def _key(path: Path) -> str:
         return str(path)
 
 
+def normalize_recent(paths: Sequence[Path]) -> tuple[Path, ...]:
+    """保存されていた履歴を契約どおりの形にする。
+
+    並びは保たれたまま、重複を落として上限まで切り詰める。設定を手で
+    書き換えられていても「重複なし・最大 `MAX_RECENT_FILES` 件」という
+    不変条件が読み込みの境界で成り立つようにする（次に PDF を開くまで
+    20件並んだままにしない）。
+
+    重複が並んでいたときに残すのは先に書かれていた方。保存された時点で
+    新しい順なので、より新しい表記が残る。
+    """
+    kept: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = _key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(path)
+    return tuple(kept[:MAX_RECENT_FILES])
+
+
 def add_recent(paths: Sequence[Path], path: Path) -> tuple[Path, ...]:
     """`path` を先頭に置いた新しい履歴を返す（MRU）。
 

@@ -599,22 +599,39 @@ class PdfView(QAbstractScrollArea):
     def current_reading_position(self) -> ReadingPosition | None:
         """いま読んでいる位置。ドキュメントが無ければ None。
 
-        ビューポートの上端が現在ページのどこに当たるかを正規化座標で返す。
+        ビューポートの上端がどのページのどこに当たるかを正規化座標で返す。
         セッションの保存に使う値なので、**スクロールバーの値も倍率も
         含めない**（ウィンドウの大きさや DPI が変わると意味を失うため）。
 
-        上端が現在ページより手前（余白や前のページ）にある場合は 0.0 に
-        丸める。ページの外を指す読書位置は作らない。
+        **基準にするのは `current_page` ではなく、上端側の最初の可視
+        ページ。** `current_page` は「ビューポートといちばん大きく重なる
+        ページ」なので、ページの継ぎ目付近では上端がまだ前のページの
+        途中なのに次のページを指す。それを基準にすると比率が負になり、
+        0.0 に丸めた結果「次のページの先頭」として保存されて、再起動の
+        たびに数百ピクセルぶん先へ進んでしまう。
+
+        用途が違うだけで、`current_page` の契約（ページ入力や前/次の
+        基準）はそのまま。ここで使い分けるのは読書位置の基準だけ。
+
+        - 上端がページの途中: そのページと正確な比率
+        - 上端がページ間の隙間: 次のページの 0.0（`visible_pages()` が
+          隙間を次のページから数える）
+        - 上端が文書の上余白: 先頭ページの 0.0
         """
         layout = self._layout
         if layout is None or self._current_page < 0:
             return None
 
-        rect = layout.page_rect(self._current_page, self._zoom)
+        viewport = self.content_viewport_rect()
+        visible = layout.visible_pages(viewport, self._zoom)
+        # 可視ページが1つも無い（末尾の余白まで送られた）場合だけ、
+        # いちばん近いページを使う。
+        page = visible.start if visible else layout.current_page(viewport, self._zoom)
+
+        rect = layout.page_rect(page, self._zoom)
         height = rect.height()
-        top = self.content_viewport_rect().top()
-        y_norm = (top - rect.top()) / height if height > 0 else 0.0
-        return ReadingPosition(page_index=self._current_page, y_norm=_clamp_unit(y_norm))
+        y_norm = (viewport.top() - rect.top()) / height if height > 0 else 0.0
+        return ReadingPosition(page_index=page, y_norm=_clamp_unit(y_norm))
 
     def restore_reading_position(self, position: ReadingPosition) -> bool:
         """読書位置まで戻る。戻れたかを返す。

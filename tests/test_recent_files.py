@@ -14,6 +14,7 @@ import pytest
 from anp.ui.recent_files import (
     MAX_RECENT_FILES,
     add_recent,
+    normalize_recent,
     recent_labels,
     remove_recent,
 )
@@ -102,6 +103,37 @@ def test_reopening_the_oldest_entry_does_not_drop_it(tmp_path: Path) -> None:
 
     assert recent[0] == oldest
     assert len(recent) == MAX_RECENT_FILES
+
+
+# ---------------------------------------------------------------- 読み込みの正規化
+def test_normalizing_keeps_a_valid_history_as_is(tmp_path: Path) -> None:
+    """契約どおりの履歴は並びも件数も変えない。"""
+    a, b = _paths(tmp_path, "a.pdf", "b.pdf")
+
+    assert normalize_recent((a, b)) == (a, b)
+
+
+def test_normalizing_drops_duplicates(tmp_path: Path) -> None:
+    """保存されていた重複は、先に書かれていた（より新しい）方を残す。"""
+    a, b = _paths(tmp_path, "a.pdf", "b.pdf")
+    detoured = tmp_path / "sub" / ".." / "a.pdf"
+
+    assert normalize_recent((a, b, detoured)) == (a, b)
+
+
+def test_normalizing_enforces_the_limit(tmp_path: Path) -> None:
+    """上限を超えて保存されていたら、読み込んだ時点で切り詰める。"""
+    stored = tuple(tmp_path / f"{index}.pdf" for index in range(MAX_RECENT_FILES + 10))
+
+    normalized = normalize_recent(stored)
+
+    assert len(normalized) == MAX_RECENT_FILES
+    assert normalized == stored[:MAX_RECENT_FILES]
+
+
+def test_normalizing_an_empty_history(tmp_path: Path) -> None:
+    """空なら空のまま。"""
+    assert normalize_recent(()) == ()
 
 
 # ---------------------------------------------------------------- 重複の判定

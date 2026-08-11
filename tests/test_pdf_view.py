@@ -1729,6 +1729,73 @@ def test_the_reading_position_follows_the_scroll(loaded_view: PdfView) -> None:
     assert position.y_norm == pytest.approx(0.4, abs=0.01)
 
 
+def scroll_to_page_boundary(view: PdfView, controller: DocumentController) -> None:
+    """先頭ページがまだ上端に見えているが、重なりでは次ページが勝つ位置へ送る。
+
+    `current_page` は「ビューポートといちばん大きく重なるページ」なので、
+    継ぎ目付近では「上端はまだ前のページ」「現在ページは次のページ」に
+    なる。読書位置の基準を取り違えると、この状態が「次ページの先頭」
+    として保存されてしまう。
+    """
+    layout = layout_of(controller)
+    bottom = layout.page_rect(0, view.zoom).bottom()
+    height = view.viewport().height()
+    # 先頭ページの残りが、次ページの見える量より小さくなる位置。
+    view.verticalScrollBar().setValue(round(bottom - height * 0.4))
+
+
+def test_the_reading_position_anchors_to_the_page_at_the_top(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """継ぎ目付近では、現在ページではなく上端側のページを基準にする。
+
+    ここを `current_page` にすると比率が負になり、0.0 へ丸めた結果
+    「次ページの先頭」として保存され、再起動のたびに先へ進んでしまう。
+    """
+    scroll_to_page_boundary(loaded_view, controller)
+    assert loaded_view.current_page == 1, "テストの前提が崩れている（継ぎ目付近にいない）"
+
+    saved = loaded_view.current_reading_position()
+
+    assert saved is not None
+    assert saved.page_index == 0
+    assert 0.0 < saved.y_norm < 1.0
+
+
+def test_the_reading_position_round_trips_across_a_page_boundary(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """継ぎ目付近でも、戻したときに同じ位置になる（先へ進まない）。"""
+    scroll_to_page_boundary(loaded_view, controller)
+    saved = loaded_view.current_reading_position()
+    assert saved is not None
+    before = loaded_view.verticalScrollBar().value()
+
+    loaded_view.go_to_page(0)
+    assert loaded_view.restore_reading_position(saved)
+
+    assert loaded_view.verticalScrollBar().value() == pytest.approx(before, abs=1)
+    restored = loaded_view.current_reading_position()
+    assert restored is not None
+    assert restored.page_index == saved.page_index
+    assert restored.y_norm == pytest.approx(saved.y_norm, abs=0.01)
+
+
+def test_the_reading_position_in_a_gap_uses_the_next_page(
+    loaded_view: PdfView, controller: DocumentController
+) -> None:
+    """上端がページ間の隙間なら、次のページの先頭とみなす。"""
+    layout = layout_of(controller)
+    gap = layout.page_rect(0, loaded_view.zoom).bottom() + LayoutMetrics().page_gap / 2
+    loaded_view.verticalScrollBar().setValue(round(gap))
+
+    saved = loaded_view.current_reading_position()
+
+    assert saved is not None
+    assert saved.page_index == 1
+    assert saved.y_norm == pytest.approx(0.0)
+
+
 def test_the_reading_position_is_none_without_a_document(view: PdfView) -> None:
     """ドキュメントが無ければ読書位置も無い。"""
     assert view.current_reading_position() is None

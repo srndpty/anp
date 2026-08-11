@@ -382,6 +382,28 @@ def test_clearing_does_not_forget_the_session(
         second.close()
 
 
+def test_a_persisted_history_is_normalized_on_startup(
+    qtbot: QtBot, ini: str, backend: QSettings, study_marks: StudyMarkRepository, tmp_path: Path
+) -> None:
+    """設定に重複や上限超えが入っていても、読み込んだ時点で契約の形にする。
+
+    次に PDF を開くまで20件並んだままにしない。
+    """
+    stored = [str(tmp_path / f"{index}.pdf") for index in range(MAX_RECENT_FILES + 5)]
+    stored.insert(1, stored[0])
+    backend.setValue("files/recent", stored)
+    backend.sync()
+
+    window = make_window(qtbot, ini, study_marks)
+    try:
+        assert len(window.recent_files) == MAX_RECENT_FILES
+        assert len(set(window.recent_files)) == MAX_RECENT_FILES
+        assert len(recent_actions(window)) == MAX_RECENT_FILES
+        assert window.recent_files[0] == tmp_path / "0.pdf"
+    finally:
+        window.close()
+
+
 def test_the_history_persists_across_windows(
     qtbot: QtBot, ini: str, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
@@ -437,6 +459,37 @@ def test_the_reading_position_is_restored(
         restored = second.view.current_reading_position()
         assert restored is not None
         assert restored.page_index == saved.page_index
+        assert restored.y_norm == pytest.approx(saved.y_norm, abs=0.02)
+    finally:
+        second.close()
+
+
+def test_the_reading_position_does_not_creep_across_a_page_boundary(
+    qtbot: QtBot, ini: str, study_marks: StudyMarkRepository, sample_pdf: Path
+) -> None:
+    """ページの継ぎ目付近で終了しても、再起動で先へ進まない。
+
+    現在ページ（重なりの最大）と、ビューポート上端のページが食い違う
+    状態を作る。読書位置の基準を取り違えていると、再起動のたびに
+    次のページの先頭まで送られてしまう。
+    """
+    first = make_window(qtbot, ini, study_marks)
+    first.open_path(sample_pdf)
+    rect = first.view.page_viewport_rect(0)
+    assert rect is not None
+    bar = first.view.verticalScrollBar()
+    bar.setValue(round(bar.value() + rect.bottom() - first.view.viewport().height() * 0.4))
+    assert first.view.current_page == 1, "テストの前提が崩れている（継ぎ目付近にいない）"
+    saved = first.view.current_reading_position()
+    assert saved is not None
+    assert saved.page_index == 0
+    first.close()
+
+    second = make_window(qtbot, ini, study_marks)
+    try:
+        restored = second.view.current_reading_position()
+        assert restored is not None
+        assert restored.page_index == 0
         assert restored.y_norm == pytest.approx(saved.y_norm, abs=0.02)
     finally:
         second.close()
