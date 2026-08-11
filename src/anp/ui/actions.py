@@ -143,14 +143,21 @@ def create_actions(parent: QWidget) -> ReaderActions:
     )
 
 
-def populate_menus(menu_bar: QMenuBar, actions: ReaderActions) -> None:
-    """メニューバーを組み立てる。"""
+def populate_menus(menu_bar: QMenuBar, actions: ReaderActions, study_marks_toggle: QAction) -> None:
+    """メニューバーを組み立てる。
+
+    `study_marks_toggle` は学習マークのドックの `toggleViewAction()`。
+    表示/非表示の状態はドック自身が持つので、`ReaderActions` には入れず
+    受け取ったものをそのまま並べる。
+    """
     file_menu = menu_bar.addMenu("ファイル(&F)")
     file_menu.addAction(actions.open)
     file_menu.addSeparator()
     file_menu.addAction(actions.quit)
 
     view_menu = menu_bar.addMenu("表示(&V)")
+    view_menu.addAction(study_marks_toggle)
+    view_menu.addSeparator()
     view_menu.addAction(actions.zoom_in)
     view_menu.addAction(actions.zoom_out)
     view_menu.addAction(actions.actual_size)

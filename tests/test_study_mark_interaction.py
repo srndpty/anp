@@ -23,58 +23,12 @@ from pytestqt.qtbot import QtBot
 from anp.core.settings import Settings
 from anp.pdf.document import DocumentController
 from anp.storage import database
-from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkError
 from anp.ui.study_marks import PagePosition, StudyMarkTarget
-from helpers import RecordingService
-
-
-class BrokenRepository(StudyMarkRepository):
-    """指定した操作だけが失敗するリポジトリ。
-
-    「DB は生きているが、この1操作だけ失敗した」状況を決定的に作る。
-    `failing` は後から差し替えられるので、「更新は通ったのに読み直しが
-    失敗した」という2段階の失敗も再現できる。
-    """
-
-    def __init__(self, connection: sqlite3.Connection, failing: str = "") -> None:
-        super().__init__(connection)
-        self.failing = failing
-
-    def _fail_if(self, name: str) -> None:
-        if name == self.failing:
-            msg = f"{name} failed"
-            raise sqlite3.OperationalError(msg)
-
-    def create(
-        self,
-        document_path: Path | str,
-        page_index: int,
-        x_norm: float,
-        y_norm: float,
-        note: str | None = None,
-    ) -> StudyMark:
-        self._fail_if("create")
-        return super().create(document_path, page_index, x_norm, y_norm, note)
-
-    def increment_mistake_count(self, mark_id: int) -> StudyMark | None:
-        self._fail_if("increment")
-        return super().increment_mistake_count(mark_id)
-
-    def update_note(self, mark_id: int, note: str | None) -> StudyMark | None:
-        self._fail_if("update_note")
-        return super().update_note(mark_id, note)
-
-    def delete(self, mark_id: int) -> bool:
-        self._fail_if("delete")
-        return super().delete(mark_id)
-
-    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
-        self._fail_if("list")
-        return super().list_for_document(document_path)
+from helpers import BrokenRepository, RecordingService
 
 
 # ---------------------------------------------------------------- 道具

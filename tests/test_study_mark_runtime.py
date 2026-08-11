@@ -30,19 +30,7 @@ from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
-from helpers import RecordingService
-
-
-class RecordingRepository(StudyMarkRepository):
-    """問い合わせ先を記録するリポジトリ。"""
-
-    def __init__(self, connection: sqlite3.Connection) -> None:
-        super().__init__(connection)
-        self.queried: list[str] = []
-
-    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
-        self.queried.append(str(document_path))
-        return super().list_for_document(document_path)
+from helpers import RecordingRepository, RecordingService
 
 
 class FailingRepository(StudyMarkRepository):
