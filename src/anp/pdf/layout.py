@@ -206,6 +206,17 @@ class PageLayout:
             rect.top() + normalized.y() * rect.height(),
         )
 
+    def from_page_points(self, index: int, point: QPointF, zoom: float) -> QPointF:
+        """ページ内の PDF ポイント座標をコンテンツ座標に変換する。
+
+        原点はページの左上。PDF の outline destination はこの単位で来る
+        （`PdfDestination`）。正規化座標を経由しないのは、ページ寸法で
+        割ってから同じ寸法を掛け直す往復を作らないため。倍率が掛かるのは
+        ページの寸法だけで、余白と隙間には掛からない。
+        """
+        rect = self.page_rect(index, zoom)
+        return QPointF(rect.left() + point.x() * zoom, rect.top() + point.y() * zoom)
+
     # -------------------------------------------------- 内部
     def _tops(self, zoom: float) -> list[float]:
         """各ページの上端座標。倍率が変わったときだけ組み立て直す。"""
