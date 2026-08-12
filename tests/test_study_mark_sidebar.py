@@ -244,15 +244,15 @@ def test_a_mutation_publishes_the_updated_snapshot(
     assert study_mark_controller.study_marks == view.study_marks
 
 
-def test_a_refresh_failure_publishes_an_empty_snapshot(
+def test_a_mutation_publishes_without_rereading(
     study_mark_connection: sqlite3.Connection,
     view: PdfView,
     doc: DocumentController,
     sample_pdf: Path,
 ) -> None:
-    """更新は通ったが読み直せなかった場合、スナップショットは空になる。
+    """更新後のスナップショットは、返ってきた1件から組み立てる。
 
-    古い件数を残すと、画面の数字が保存されている値だと誤解させる。
+    全件の読み直しに失敗しても、確定済みの更新を「失敗」に見せない。
     """
     repository = BrokenRepository(study_mark_connection)
     mark = repository.create(sample_pdf, 0, 0.5, 0.5)
@@ -261,11 +261,10 @@ def test_a_refresh_failure_publishes_an_empty_snapshot(
     controller.activate_document(sample_pdf)
 
     repository.failing = "list"
-    with pytest.raises(sqlite3.OperationalError):
-        controller.increment_mark(mark.id)
+    controller.increment_mark(mark.id)
 
-    assert controller.study_marks == ()
-    assert view.study_marks == ()
+    assert [shown.mistake_count for shown in controller.study_marks] == [2]
+    assert controller.study_marks == view.study_marks
     assert controller.active_document_path == sample_pdf
 
 
@@ -1053,17 +1052,17 @@ def test_a_failed_mutation_keeps_the_old_rows(
     window.close()
 
 
-def test_a_failed_refresh_empties_both_views(
+def test_a_mutation_updates_both_views_without_rereading(
     qtbot: QtBot,
     settings: Settings,
     study_mark_connection: sqlite3.Connection,
     sample_pdf: Path,
     warnings: list[str],
 ) -> None:
-    """更新は通ったが読み直せなかった場合、一覧もオーバーレイも空になる。
+    """全件を読み直せなくても、一覧とオーバーレイは同じ新しい値になる。
 
-    オーバーレイだけ空で、一覧に古い数字が残る状態を作らない。PDF を
-    読むこと自体は続けられる。
+    情報源は1つ（`_publish_marks()`）なので、片方だけ古い数字が残る状態は
+    作れない。PDF を読むこと自体も続けられる。
     """
     repository = BrokenRepository(study_mark_connection)
     repository.create(sample_pdf, 0, 0.5, 0.5)
@@ -1076,9 +1075,9 @@ def test_a_failed_refresh_empties_both_views(
     repository.failing = "list"
     ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.5, 0.5))
 
-    assert len(warnings) == 1
-    assert window.study_mark_sidebar.rows == ()
-    assert window.view.study_marks == ()
+    assert warnings == []
+    assert [row.mistake_count for row in window.study_mark_sidebar.rows] == [2]
+    assert [shown.mistake_count for shown in window.view.study_marks] == [2]
     assert window.study_marks.active_document_path == sample_pdf
     assert window.view.has_document
     window.close()

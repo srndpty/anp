@@ -20,9 +20,20 @@
 すべて同期で、DB の読み取りも GUI スレッドで行う（学習マークの件数は
 1つの PDF あたり多くても数千件で、1回の SELECT で足りる）。
 
-**更新は「DB を変えてから読み直す」の一方向だけ。** 表示中のコレクションを
-手で継ぎ当てたり、`StudyMark` を書き換えたりはしない（不変）。1回の更新に
-つき SELECT が1回増えるだけなので、差分イベントや楽観的更新の仕組みは持たない。
+**更新は「DB を変えてから、返ってきた行で表示を差し替える」。** リポジトリの
+更新は `RETURNING` で更新後の1件を返すので、それを使ってスナップショットを
+組み直す（`StudyMark` は不変なので、既存の要素を書き換えることはしない）。
+
+以前は更新のたびに全件を SELECT し直していたが、**それだと「DB では成功、
+表示では失敗」という状態が作れてしまう**。接続は `autocommit=True` なので
+更新は 1 文で確定済みで、その後の SELECT が失敗しても取り消されない。
+利用者には「更新できませんでした」と出るのに実際は増えているので、もう一度
+押すと 1 回のつもりが 2 回加算される。更新の成功と、その後の全件同期の失敗を
+別の状態として扱わないかぎり避けられないので、そもそも読み直さないことにした。
+
+書き手はこのプロセスだけなので、返ってきた1件を反映すれば表示は DB と一致
+する。全件の読み直しは `activate_document()` と `refresh()`（外から明示的に
+呼ぶ）に限る。楽観的更新はしない（DB が成功を返す前に表示は変えない）。
 
 ログの担当を分けている。読み込み（`activate_document()`）の失敗はここが
 `logger.exception` で残す。呼び出し側はダイアログを出さずアプリケーション
@@ -151,7 +162,10 @@ class StudyMarkController(QObject):
         self._publish_marks(())
 
     def refresh(self) -> None:
-        """表示中のマークを、保存されている内容で丸ごと置き換える。
+        """表示中のマークを、保存されている内容で丸ごと**読み直す**。
+
+        更新のたびには呼ばない（module の docstring を参照）。外から別の
+        経路で DB が変わったときに、表示を実体へ合わせ直すための入口。
 
         表示対象が無ければ空にする。リポジトリが返したドメイン
         オブジェクトは加工せずそのまま渡す。件数の丸め・重複の除去・
@@ -193,8 +207,10 @@ class StudyMarkController(QObject):
             msg = "the active document changed after the position was captured"
             raise StudyMarkError(msg)
 
-        self._repository.create(path, position.page_index, position.x_norm, position.y_norm)
-        self._sync_after_mutation()
+        created = self._repository.create(
+            path, position.page_index, position.x_norm, position.y_norm
+        )
+        self._apply_stored(created)
 
     def increment_mark(self, mark_id: int) -> None:
         """間違えた回数を1増やす。
@@ -203,9 +219,10 @@ class StudyMarkController(QObject):
         （P3-1 の契約）。連続して押しても取りこぼさない。
         """
         self._require_owned(mark_id)
-        if self._repository.increment_mistake_count(mark_id) is None:
+        updated = self._repository.increment_mistake_count(mark_id)
+        if updated is None:
             self._fail_missing(mark_id)
-        self._sync_after_mutation()
+        self._apply_stored(updated)
 
     def update_note(self, mark_id: int, note: str | None) -> None:
         """メモを差し替える。
@@ -214,16 +231,17 @@ class StudyMarkController(QObject):
         `None` へ寄せたりはしない（P3-1 の契約）。
         """
         self._require_owned(mark_id)
-        if self._repository.update_note(mark_id, note) is None:
+        updated = self._repository.update_note(mark_id, note)
+        if updated is None:
             self._fail_missing(mark_id)
-        self._sync_after_mutation()
+        self._apply_stored(updated)
 
     def delete_mark(self, mark_id: int) -> None:
         """学習マークを1件消す。確認を取るのは UI の側。"""
         self._require_owned(mark_id)
         if not self._repository.delete(mark_id):
             self._fail_missing(mark_id)
-        self._sync_after_mutation()
+        self._publish_marks([mark for mark in self._marks if mark.id != mark_id])
 
     def _require_active_document(self) -> Path:
         """表示対象の PDF。無ければ操作させない。
@@ -245,40 +263,53 @@ class StudyMarkController(QObject):
         更新の境界で持ち主を確かめておけば、A の記録が B の操作で
         書き換わることはない。
 
-        持ち主の判定には P3-1 の `document_key()` をそのまま使う。パスの
-        正規化を UI 側に書き直さない。
+        判定に使うのは **表示中のスナップショット**。そこに載っているのは
+        `list_for_document()` が「このパス・この内容の PDF のもの」として
+        返した行だけなので、パスの正規化も内容の指紋もリポジトリ側の1箇所に
+        寄せたままになる。UI へ持ち主の判定基準を書き直さない。
+
+        スナップショットに無い ID は、DB を1回だけ引いて「消えた」のか
+        「別の PDF のもの」なのかを分ける。呼び出し側から見た扱いが違う
+        （前者は表示の作り直し、後者は操作の拒否）ため。
         """
-        path = self._require_active_document()
-        mark = self._repository.get(mark_id)
-        if mark is None:
+        self._require_active_document()
+        if any(mark.id == mark_id for mark in self._marks):
+            return
+        if self._repository.get(mark_id) is None:
             self._fail_missing(mark_id)
-        if mark.document_key != document_key(path):
-            msg = f"study mark {mark_id} belongs to another document"
-            raise StudyMarkError(msg)
+        msg = f"study mark {mark_id} belongs to another document"
+        raise StudyMarkError(msg)
 
     def _fail_missing(self, mark_id: int) -> NoReturn:
         """操作しようとしたマークが既に無い場合。
 
-        「消えていたのだから成功でよい」とはしない。表示を実体に合わせ直して
-        から失敗として伝える。
+        「消えていたのだから成功でよい」とはしない。表示からその1件を外して
+        から失敗として伝える。**ここで全件を読み直さない。** 読み直しが
+        失敗すると、伝えたい「もう無い」が DB の障害にすり替わってしまう。
         """
-        self._sync_after_mutation()
+        self._publish_marks([mark for mark in self._marks if mark.id != mark_id])
         msg = f"study mark {mark_id} no longer exists"
         raise StudyMarkError(msg)
 
-    def _sync_after_mutation(self) -> None:
-        """更新後に表示を読み直す。
+    def _apply_stored(self, mark: StudyMark) -> None:
+        """更新後の1件を、表示中のスナップショットへ反映する。
 
-        DB を source of truth にする。更新が通ったのに読み直せなかった場合、
-        **表示は空にする**。古い件数を出したままにすると、画面の数字が保存
-        されている値だと誤解させる。表示対象は解除しない（PDF を読むこと
-        自体は続けられる。P3-3A の読み込み失敗とはここが違う）。
+        `id` が一致するものがあれば差し替え、無ければ挿し込む。並びは
+        リポジトリの契約（`page_index`・`id` の昇順）に合わせるので、
+        追加したマークの位置も読み直したときと同じになる。
         """
-        try:
-            self.refresh()
-        except Exception:
-            self._publish_marks(())
-            raise
+        remaining = [existing for existing in self._marks if existing.id != mark.id]
+        order = (mark.page_index, mark.id)
+        index = next(
+            (
+                position
+                for position, existing in enumerate(remaining)
+                if (existing.page_index, existing.id) > order
+            ),
+            len(remaining),
+        )
+        remaining.insert(index, mark)
+        self._publish_marks(remaining)
 
     def _publish_marks(self, marks: Sequence[StudyMark]) -> None:
         """表示中のスナップショットを差し替え、表示側へ配る唯一の経路。

@@ -28,7 +28,7 @@ from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkError
 from anp.ui.study_marks import PagePosition, StudyMarkTarget
-from helpers import BrokenRepository, RecordingService
+from helpers import BrokenRepository, RecordingRepository, RecordingService
 
 
 # ---------------------------------------------------------------- 道具
@@ -361,16 +361,18 @@ def test_a_failed_note_update_keeps_the_old_note(
     assert view.study_marks[0].note == "元のメモ"
 
 
-def test_a_refresh_failure_after_a_successful_mutation_empties_the_view(
+def test_a_successful_mutation_does_not_depend_on_a_reread(
     study_mark_connection: sqlite3.Connection,
     view: PdfView,
     doc: DocumentController,
     sample_pdf: Path,
 ) -> None:
-    """更新は通ったが読み直せなかった場合。
+    """更新が通ったら、全件を読み直せなくても成功として扱う。
 
-    DB は更新済みなので、取り消したふりはしない。ただし古い数字を出したまま
-    にもしない（表示を空にする）。表示対象は保ったまま失敗を伝える。
+    接続は `autocommit=True` なので UPDATE の1文で確定している。その後の
+    SELECT が失敗したことを理由に「更新できませんでした」と伝えると、
+    利用者はもう一度押し、1回のつもりが2回加算される。更新後の1件は
+    `RETURNING` で返ってきているので、そもそも読み直さない。
     """
     repository = BrokenRepository(study_mark_connection)
     mark = repository.create(sample_pdf, 0, 0.5, 0.5)
@@ -380,15 +382,39 @@ def test_a_refresh_failure_after_a_successful_mutation_empties_the_view(
     controller.activate_document(sample_pdf)
     repository.failing = "list"
 
-    with pytest.raises(sqlite3.OperationalError):
-        controller.increment_mark(mark.id)
+    controller.increment_mark(mark.id)
 
-    assert view.study_marks == ()
+    assert [(shown.id, shown.mistake_count) for shown in view.study_marks] == [(mark.id, 2)]
     assert controller.active_document_path == sample_pdf
     repository.failing = ""
     stored = repository.get(mark.id)
     assert stored is not None
     assert stored.mistake_count == 2
+
+
+def test_a_mutation_does_not_reread_the_whole_document(
+    study_mark_connection: sqlite3.Connection,
+    view: PdfView,
+    doc: DocumentController,
+    sample_pdf: Path,
+) -> None:
+    """更新のたびに全件を SELECT し直さない。"""
+    repository = RecordingRepository(study_mark_connection)
+    mark = repository.create(sample_pdf, 0, 0.5, 0.5)
+    doc.open(sample_pdf)
+    view.set_document(doc.document, doc.page_sizes())
+    controller = StudyMarkController(repository, view)
+    controller.activate_document(sample_pdf)
+    queries = len(repository.queried)
+
+    controller.increment_mark(mark.id)
+    controller.update_note(mark.id, "メモ")
+    controller.create_mark(
+        PagePosition(page_index=0, x_norm=0.2, y_norm=0.2), expected_document=sample_pdf
+    )
+    controller.delete_mark(mark.id)
+
+    assert len(repository.queried) == queries
 
 
 def test_a_mutation_does_not_touch_the_rendering(
@@ -1072,13 +1098,17 @@ def test_a_failed_note_update_is_reported(
     assert window.view.has_document
 
 
-def test_a_refresh_failure_is_reported_without_closing_the_pdf(
+def test_a_broken_reread_does_not_break_a_click(
     qtbot: QtBot,
     broken_window: tuple[MainWindow, BrokenRepository],
     sample_pdf: Path,
     errors: list[str],
 ) -> None:
-    """更新後の読み直しに失敗しても PDF は開いたまま、表示は空になる。"""
+    """全件を読み直せない状態でも、Ctrl + クリックの加算はそのまま通る。
+
+    DB では成功しているのに警告が出る、という食い違いを作らない
+    （利用者がもう一度押して二重に加算されるのを避ける）。
+    """
     window, repository = broken_window
     mark = repository.create(sample_pdf, 0, 0.5, 0.5)
     window.study_marks.refresh()
@@ -1086,8 +1116,8 @@ def test_a_refresh_failure_is_reported_without_closing_the_pdf(
 
     ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.5, 0.5))
 
-    assert len(errors) == 1
-    assert window.view.study_marks == ()
+    assert errors == []
+    assert [shown.mistake_count for shown in window.view.study_marks] == [2]
     assert window.view.has_document
     assert window.study_marks.active_document_path == sample_pdf
     repository.failing = ""
