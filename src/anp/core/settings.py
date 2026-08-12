@@ -227,8 +227,9 @@ class Settings:
         1回の書き込みにすることで、次に読むのは古い3つ組か新しい3つ組の
         どちらかだけになる。
 
-        旧形式の鍵はここで消す。残しておくと、新しい鍵を消したときに
-        （`clear_last_session()`）古い位置が復活してしまう。
+        旧形式の鍵は **新しい鍵を書いた後で** 消す。残しておくと、新しい鍵を
+        消したときに（`clear_last_session()`）古い位置が復活してしまう。
+        逆順にすると、間で落ちたときにセッションを丸ごと失う。
         """
         self._backend.setValue(
             _KEY_SESSION,
@@ -247,9 +248,14 @@ class Settings:
 
         PDF を開いていない状態で終了したときと、復元に失敗したときに呼ぶ。
         後者で消しておかないと、起動のたびに同じ失敗を繰り返す。
+
+        **消す順は「旧形式が先」。** 新しい鍵を先に消すと、その直後に落ちた
+        ときに旧形式だけが残り、次の起動で `_session()` の fallback が
+        もっと古い位置を復活させてしまう。逆順なら、途中で落ちても最悪
+        「いま消したはずのセッションがもう1回残る」で済む。
         """
-        self._backend.remove(_KEY_SESSION)
         self._remove_legacy_session()
+        self._backend.remove(_KEY_SESSION)
 
     def _remove_legacy_session(self) -> None:
         """旧形式の3つの鍵を消す。"""

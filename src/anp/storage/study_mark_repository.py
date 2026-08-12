@@ -10,9 +10,10 @@ SQL をここに閉じ込め、UI からは `StudyMarkRepository` 越しに扱�
 2 段構えを避ける）。
 
 ドキュメントの同一性は **`DocumentIdentity`（パスと内容の指紋の組）** で
-決まる。この class はファイルを読まない。同一性を作るのは PDF を開いた
-1回だけで（`DocumentIdentity.of()`）、以後の操作はその値を持ち回す。
-操作のたびにパスから計算し直すと、表示中の PDF と保存先の PDF がずれる。
+決まる。この class はファイルを読まない。同一性は PDF を読み込んだその場で
+1つ作られ（`DocumentController.open()` の指紋 →
+`DocumentIdentity.for_content()`）、以後の操作はその値を持ち回す。操作の
+たびにパスから計算し直すと、表示中の PDF と保存先の PDF がずれる。
 """
 
 from __future__ import annotations
