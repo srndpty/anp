@@ -162,6 +162,44 @@ def test_saved_geometry_is_restored(
         reference.deleteLater()
 
 
+def test_the_three_docks_restore_their_visibility_together(
+    qtbot: QtBot, settings: Settings, study_marks: StudyMarkRepository
+) -> None:
+    """学習マーク・目次・検索の表示状態が、3つ同時に往復する。
+
+    3つのドックは1つの `saveState()` の blob を共有するので、片方だけを
+    見るテストでは「復元しているつもりで、別のドックの状態を潰している」
+    実装を通してしまう。**互いを上書きしない**ことまで固定するために、
+    3つを別々の状態（表示 / 非表示 / 表示）にしてから往復させる。
+
+    初期状態は3つとも非表示なので、表示にした2つはドック専用の設定キーが
+    無くても復元されていることになり、目次は「他の2つに引きずられて
+    勝手に開かない」ことになる。
+    """
+    first = MainWindow(settings, study_marks)
+    qtbot.addWidget(first)
+    with qtbot.waitExposed(first):
+        first.show()
+    assert first.study_mark_sidebar.isHidden(), "テストの前提が崩れている（初期状態は非表示）"
+    assert first.toc_sidebar.isHidden(), "テストの前提が崩れている（初期状態は非表示）"
+    assert first.search_dock.isHidden(), "テストの前提が崩れている（初期状態は非表示）"
+
+    first.study_mark_sidebar.show()
+    first.search_dock.show()
+    first.close()
+
+    second = MainWindow(settings, study_marks)
+    qtbot.addWidget(second)
+    with qtbot.waitExposed(second):
+        second.show()
+    try:
+        assert not second.study_mark_sidebar.isHidden()
+        assert second.toc_sidebar.isHidden()
+        assert not second.search_dock.isHidden()
+    finally:
+        second.close()
+
+
 # ------------------------------------------------------------------ PDF を開く
 def test_opening_a_pdf_fills_the_view(opened: MainWindow, sample_pdf: Path) -> None:
     """開いた PDF がビューに入る。"""
