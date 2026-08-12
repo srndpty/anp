@@ -82,6 +82,7 @@ from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.document_open import DocumentOpenCoordinator
+from anp.ui.fatal import guard_qt_callback
 from anp.ui.pdf_search_controller import PdfSearchController, SearchState
 from anp.ui.pdf_view import PdfView, ZoomMode
 from anp.ui.reading_session import ReadingSession
@@ -563,8 +564,13 @@ class MainWindow(QMainWindow):
         if path:
             self.open_path(Path(path))
 
+    @guard_qt_callback
     def open_path(self, path: Path) -> None:
         """利用者の操作で PDF を開く。
+
+        **Qt から直に呼ばれる**（「開く…」・履歴のメニュー項目）ので、
+        ここが想定外の失敗に対する fail-stop の境界になる。想定された失敗
+        （開けない・学習マークを読めない）はもっと内側でダイアログになる。
 
         「開く...」からでも履歴からでも、通る手順はここで同じ。履歴専用の
         読み込み経路は作らない。
@@ -752,6 +758,7 @@ class MainWindow(QMainWindow):
         if state is not None:
             self.restoreState(state)
 
+    @guard_qt_callback
     def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 (Qt の命名規則)
         """最初に表示されたときだけ、前回のセッションを復元する。
 

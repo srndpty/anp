@@ -30,10 +30,12 @@ from anp.storage import database
 from anp.storage import study_mark as study_mark_module
 from anp.storage.study_mark import DocumentIdentity, StudyMark, document_key
 from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.ui.fatal import EXIT_INTERNAL_ERROR
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_marks import PagePosition
+from conftest import FatalCalls
 from helpers import RecordingRepository, RecordingService
 
 
@@ -848,33 +850,35 @@ def test_a_repository_failure_is_reported_as_a_study_mark_failure(
     window.close()
 
 
-def test_an_unexpected_failure_while_opening_is_not_swallowed(
+def test_an_unexpected_failure_while_opening_stops_the_application(
     qtbot: QtBot,
     settings: Settings,
     study_marks: StudyMarkRepository,
     sample_pdf: Path,
     warnings: list[str],
+    fatal: FatalCalls,
 ) -> None:
-    """実装の誤りは警告にすり替えず、未捕捉例外として送出する。
+    """実装の誤りは警告にすり替えず、その場で終了させる。
 
-    読み込み失敗を1つの型に包むのは、この境界を作るため。後始末だけは
+    読み込み失敗を1つの型に包むのは、この境界を作るため。`open_path()` は
+    Qt から直に呼ばれるので、例外を外へ出さずに fail-stop する。後始末だけは
     読み込み失敗と同じで、開きかけの PDF を残さない。
     """
     window = MainWindow(settings, study_marks)
     qtbot.addWidget(window)
 
-    def boom(_path: Path) -> None:
+    def boom(_document: object) -> None:
         msg = "programming error"
         raise AttributeError(msg)
 
     window.study_marks.activate_document = boom  # type: ignore[assignment]
 
-    with pytest.raises(AttributeError):
-        window.open_path(sample_pdf)
+    window.open_path(sample_pdf)
 
     assert not window.view.has_document
     assert window.study_marks.active_document_path is None
-    assert warnings == []
+    assert warnings == [], "実装の誤りが通常の警告に化けている"
+    assert fatal.exit_codes == [EXIT_INTERNAL_ERROR]
     window.close()
 
 

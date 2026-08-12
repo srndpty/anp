@@ -33,6 +33,7 @@ from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox, QWidget
 
 from anp.storage.study_mark import DocumentIdentity, StudyMark
 from anp.storage.study_mark_repository import StoredStudyMarkError
+from anp.ui.fatal import guard_qt_callback, report_fatal
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkError
 from anp.ui.study_marks import PagePosition, StudyMarkTarget
@@ -76,6 +77,7 @@ class StudyMarkInteraction:
         view.study_mark_menu_requested.connect(self._on_menu_requested)
 
     # -------------------------------------------------- Ctrl + 左クリック
+    @guard_qt_callback
     def _on_activated(self, target: StudyMarkTarget) -> None:
         """バッジの上なら回数を増やし、ページの上なら追加する。
 
@@ -90,6 +92,7 @@ class StudyMarkInteraction:
             self._create(target.position, self._controller.active_document)
 
     # -------------------------------------------------- 右クリックメニュー
+    @guard_qt_callback
     def _on_menu_requested(self, target: StudyMarkTarget, global_pos: QPoint) -> None:
         menu = self.build_menu(target)
         if menu is None:
@@ -222,12 +225,17 @@ class StudyMarkInteraction:
         表示を成功したように見せないのは `StudyMarkController` の責任で、
         ここは「読み続けられる」状態を壊さないことだけを守る。
 
-        `AttributeError` のような実装の誤りはここで止めない。小さな警告に
-        化けさせるとバグが残り続けるので、アプリケーション境界の未捕捉例外
-        として扱う。
+        `AttributeError` のような実装の誤りは小さな警告に化けさせない。
+        ただし **ここは Qt が呼んだ slot の内側**（クリックもメニューの項目も
+        Qt から来る）で、そこから例外を外へ出すのは undefined behavior。
+        外へ投げる代わりに fail-stop の境界へ渡す（記録して知らせ、
+        イベントループを終わらせる。`anp.ui.fatal`）。
         """
         try:
             operation()
         except _OPERATION_ERRORS as error:
             logger.exception("study mark operation failed")
             QMessageBox.warning(self._parent, _ERROR_TITLE, f"{_ERROR_TEXT}\n\n{error}")
+        except Exception as error:
+            # 想定していない失敗＝実装の誤り。読み続けさせない。
+            report_fatal(error)

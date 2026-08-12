@@ -25,10 +25,12 @@ from anp.pdf.document import DocumentController
 from anp.storage import database
 from anp.storage.study_mark import DocumentIdentity
 from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.ui.fatal import EXIT_INTERNAL_ERROR
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkError
 from anp.ui.study_marks import PagePosition, StudyMarkTarget
+from conftest import FatalCalls
 from helpers import BrokenRepository, RecordingRepository, RecordingService
 
 
@@ -1107,28 +1109,34 @@ def test_a_failed_note_update_is_reported(
     assert window.view.has_document
 
 
-def test_a_programming_error_is_not_shown_as_an_update_failure(
+def test_a_programming_error_stops_the_application(
+    qtbot: QtBot,
     window: MainWindow,
+    sample_pdf: Path,
     errors: list[str],
+    fatal: FatalCalls,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """実装の誤りは小さな警告に化けさせず、そのまま送出する。
+    """実装の誤りは小さな警告に化けさせず、その場で終了させる。
 
     ここで広く捕まえると、バグが「学習マークを更新できませんでした」に
-    見えたまま残り続ける。**Qt のイベントループを挟まずに呼ぶ。** 挟むと
-    例外が PySide6 に拾われてしまい、素通ししたことを確かめられない。
+    見えたまま残り続ける。かといって Qt の slot から例外を外へ出すのは
+    undefined behavior なので、境界で受け止めて fail-stop する。
+
+    **本番と同じ経路（Ctrl + クリック）で確かめる。** 直接メソッドを呼ぶと、
+    Qt の境界を通っていないので、この契約を検査したことにならない。
     """
 
     def buggy(*_args: object, **_kwargs: object) -> None:
         raise AttributeError("bug")
 
     monkeypatch.setattr(window.study_marks, "create_mark", buggy)
-    target = StudyMarkTarget(position=PagePosition(page_index=0, x_norm=0.5, y_norm=0.5))
 
-    with pytest.raises(AttributeError):
-        window.study_mark_interaction._on_activated(target)  # noqa: SLF001
+    ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.5, 0.5))
 
-    assert errors == []
+    assert errors == [], "実装の誤りが通常の警告に化けている"
+    assert fatal.exit_codes == [EXIT_INTERNAL_ERROR]
+    assert "AttributeError" in fatal.dialogs[0]
 
 
 def test_a_broken_reread_does_not_break_a_click(

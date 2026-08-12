@@ -21,8 +21,10 @@ from anp.pdf.layout import InvalidPageGeometryError
 from anp.pdf.render import PageRenderService, PageRequest
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.appearance import CanvasTheme, UiTheme
+from anp.ui.fatal import EXIT_INTERNAL_ERROR
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import ZOOM_STEP, ZoomMode
+from conftest import FatalCalls
 
 
 @pytest.fixture
@@ -314,22 +316,24 @@ def test_an_invariant_violation_while_opening_leaves_no_document(
     opened: MainWindow,
     two_page_pdf: Path,
     warnings: list[str],
+    fatal: FatalCalls,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """想定外の失敗でも、開きかけの PDF と前の表示を混ぜたまま残さない。
 
-    実装の誤りは包まずに送出するが、後始末はしてから送る（AGENTS の
-    エラー処理方針）。ここでは指紋が入っていないという不変条件違反で
-    抜ける経路を作る。
+    実装の誤りは通常の警告に化けさせず、Qt の境界で fail-stop する
+    （AGENTS のエラー処理方針）。ここでは指紋が入っていないという不変条件
+    違反で抜ける経路を作る。
     """
     monkeypatch.setattr(DocumentController, "content_fingerprint", property(lambda _self: None))
 
-    with pytest.raises(RuntimeError, match="fingerprint"):
-        opened.open_path(two_page_pdf)
+    opened.open_path(two_page_pdf)
 
     assert not opened.view.has_document
     assert opened.study_marks.active_document_path is None
     assert warnings == []
+    assert fatal.exit_codes == [EXIT_INTERNAL_ERROR]
+    assert "RuntimeError" in fatal.dialogs[0]
 
 
 def test_a_broken_page_geometry_does_not_keep_the_old_marks(
