@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import gc
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -1805,3 +1805,37 @@ def test_a_transform_cap_below_one_is_rejected() -> None:
     """同時変換数を 0 以下にすると、何も投入されないまま止まる。設定させない。"""
     with pytest.raises(ValueError, match="max_transform_inflight"):
         PageRenderService(RenderCache(), max_transform_inflight=0)
+
+
+@pytest.mark.parametrize(
+    ("build", "message"),
+    [
+        (lambda: PageRenderService(RenderCache(), max_inflight=0), "max_inflight"),
+        (lambda: PageRenderService(RenderCache(), max_render_bytes=0), "max_render_bytes"),
+        (lambda: PageRenderService(RenderCache(), display_max_bytes=0), "display_max_bytes"),
+        (lambda: PageRenderService(RenderCache(), debounce_ms=-1), "debounce_ms"),
+    ],
+)
+def test_a_broken_setting_is_rejected_at_construction(
+    build: Callable[[], PageRenderService], message: str
+) -> None:
+    """壊れた設定値でサービスを作れてしまわない。
+
+    どれも症状は「1ページも描かれない」という遠くの静かな停止になる。
+    例えば `max_inflight=0` では、`flush()` の枠の判定が最初から成立して
+    要求が1件も発行されない。
+    """
+    with pytest.raises(ValueError, match=message):
+        build()
+
+
+def test_a_cache_that_cannot_hold_a_pixel_is_rejected() -> None:
+    """1画素も入らない上限のキャッシュは作らせない。"""
+    with pytest.raises(ValueError, match="max_bytes"):
+        RenderCache(max_bytes=0)
+
+
+def test_clamping_to_less_than_a_pixel_is_rejected() -> None:
+    """縮めようのない上限を渡されたら、`sqrt()` の定義域へ行く前に弾く。"""
+    with pytest.raises(ValueError, match="max_bytes"):
+        clamp_render_size(QSize(100, 100), max_bytes=0)

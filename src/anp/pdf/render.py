@@ -47,6 +47,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtPdf import QPdfDocument, QPdfDocumentRenderOptions, QPdfPageRenderer
 
 from anp.pdf.cache import (
+    BYTES_PER_PIXEL,
     DEFAULT_DISPLAY_MAX_BYTES,
     DisplayCache,
     DisplayKey,
@@ -56,9 +57,6 @@ from anp.pdf.cache import (
 from anp.pdf.color import PageColorMode, transform_page
 
 logger = logging.getLogger(__name__)
-
-# ARGB32 の1画素あたりのバイト数。
-_BYTES_PER_PIXEL = 4
 
 # 1枚のレンダリング要求で許す最大バイト数。キャッシュ上限より十分小さくする。
 # これを超える要求は縦横比を保って縮め、表示時に拡大する。高倍率では多少
@@ -80,16 +78,31 @@ DEFAULT_MAX_TRANSFORM_INFLIGHT = 2
 
 
 def clamp_render_size(size: QSize, max_bytes: int = DEFAULT_MAX_RENDER_BYTES) -> QSize:
-    """要求サイズを最大バイト数に収まるよう縦横比を保って縮める。"""
+    """要求サイズを最大バイト数に収まるよう縦横比を保って縮める。
+
+    `max_bytes` は最低でも1画素分。0 や負の値では縮めようがなく、
+    `sqrt()` の定義域エラーになるだけなので呼び出し側の誤りとして弾く。
+    """
+    if max_bytes < BYTES_PER_PIXEL:
+        msg = f"max_bytes must be at least {BYTES_PER_PIXEL}, got {max_bytes}"
+        raise ValueError(msg)
+
     width = max(size.width(), 1)
     height = max(size.height(), 1)
 
-    estimated = width * height * _BYTES_PER_PIXEL
+    estimated = width * height * BYTES_PER_PIXEL
     if estimated <= max_bytes:
         return QSize(width, height)
 
     scale = math.sqrt(max_bytes / estimated)
     return QSize(max(int(width * scale), 1), max(int(height * scale), 1))
+
+
+def _require_at_least(value: int, minimum: int, name: str) -> None:
+    """設定値が下限以上であることを確かめる。"""
+    if value < minimum:
+        msg = f"{name} must be at least {minimum}, got {value}"
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,9 +221,15 @@ class PageRenderService(QObject):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        if max_transform_inflight < 1:
-            msg = f"max_transform_inflight must be at least 1, got {max_transform_inflight}"
-            raise ValueError(msg)
+        # **不変条件はここで確定させる。** どれか1つでも壊れていると、症状は
+        # 「1ページも描かれない」という遠くの静かな停止として出る。例えば
+        # `max_inflight=0` では `flush()` の枠の判定が最初から成立し、要求が
+        # 1件も発行されない。作れてしまう時点で誤りなので生成を失敗させる。
+        _require_at_least(max_inflight, 1, "max_inflight")
+        _require_at_least(max_transform_inflight, 1, "max_transform_inflight")
+        _require_at_least(max_render_bytes, BYTES_PER_PIXEL, "max_render_bytes")
+        _require_at_least(display_max_bytes, BYTES_PER_PIXEL, "display_max_bytes")
+        _require_at_least(debounce_ms, 0, "debounce_ms")
 
         self._cache = cache
         self._display_cache = DisplayCache(display_max_bytes)
@@ -409,7 +428,7 @@ class PageRenderService(QObject):
                 continue
 
             # 変換後は必ず ARGB32 になるので、大きさは raw の画素数から決まる。
-            budget_used += raw_key.width_px * raw_key.height_px * _BYTES_PER_PIXEL
+            budget_used += raw_key.width_px * raw_key.height_px * BYTES_PER_PIXEL
             if budget_used > self._display_cache.max_bytes:
                 continue
 
