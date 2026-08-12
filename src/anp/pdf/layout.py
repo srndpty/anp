@@ -14,6 +14,7 @@ Qt ウィジェットに依存しないため、`QApplication` なしで単体�
 
 from __future__ import annotations
 
+import math
 from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -24,10 +25,41 @@ from PySide6.QtCore import QPointF, QRectF, QSizeF
 
 @dataclass(frozen=True, slots=True)
 class LayoutMetrics:
-    """ズームの影響を受けない配置の寸法（論理ピクセル）。"""
+    """ズームの影響を受けない配置の寸法（論理ピクセル）。
+
+    どちらも有限で 0 以上でなければならない。NaN や負の値を許すと、
+    ページの上端座標を通じてスクロール位置と描画矩形の全体へ広がる。
+    """
 
     page_gap: float = 12.0
     margin: float = 16.0
+
+    def __post_init__(self) -> None:
+        _validate_length(self.page_gap, "page_gap")
+        _validate_length(self.margin, "margin")
+
+
+def _validate_length(value: float, name: str) -> None:
+    """余白や隙間として使える長さかを確かめる（有限かつ 0 以上）。"""
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        msg = f"{name} must be a real number, got {type(value).__name__}"
+        raise TypeError(msg)
+    if not math.isfinite(value):
+        msg = f"{name} must be finite, got {value!r}"
+        raise ValueError(msg)
+    if value < 0:
+        msg = f"{name} must be >= 0, got {value!r}"
+        raise ValueError(msg)
+
+
+def _validate_page_extent(value: float, index: int, name: str) -> None:
+    """ページの寸法として使える値かを確かめる（有限かつ正）。
+
+    利用者に見せうる失敗（壊れた PDF）なので、メッセージは日本語にする。
+    """
+    if not math.isfinite(value) or value <= 0:
+        msg = f"ページ {index + 1} の{name}が不正です（{value!r}）"
+        raise ValueError(msg)
 
 
 class PageLayout:
@@ -46,6 +78,14 @@ class PageLayout:
         if not page_sizes:
             msg = "ページのない PDF はレイアウトできません"
             raise ValueError(msg)
+
+        # **不正な寸法はここで止める。** 0 高さのページは `to_normalized()` の
+        # ゼロ除算に、NaN は `fit_width_zoom()` の `width <= 0` をすり抜けて
+        # スクロール座標・二分探索・描画矩形へそのまま流れ込む。壊れた PDF への
+        # 防御を下流の各メソッドへ散らさず、入口の1箇所に置く。
+        for index, size in enumerate(page_sizes):
+            _validate_page_extent(size.width(), index, "幅")
+            _validate_page_extent(size.height(), index, "高さ")
 
         self._page_sizes = list(page_sizes)
         self._metrics = metrics or LayoutMetrics()
