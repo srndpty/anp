@@ -18,14 +18,18 @@ SQL をここに閉じ込め、UI からは `StudyMarkRepository` 越しに扱�
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 
+from anp.core.fingerprint import validate_fingerprint
 from anp.storage.study_mark import (
     DocumentIdentity,
     StudyMark,
     validate_note,
     validate_position,
 )
+
+logger = logging.getLogger(__name__)
 
 _COLUMNS = "id, document_key, document_fingerprint, page_index, x_norm, y_norm, mistake_count, note"
 
@@ -61,6 +65,22 @@ def _to_study_mark(row: sqlite3.Row) -> StudyMark:
     except (TypeError, ValueError) as error:
         msg = f"stored study mark {row['id']!r} does not satisfy the contract"
         raise StoredStudyMarkError(msg) from error
+
+
+def _stored_fingerprint(row: sqlite3.Row) -> str:
+    """行に保存されている指紋。壊れていれば保存データの不整合として失敗する。
+
+    **持ち主の判定に使う値なので、絞り込みの前に検証する。** 長さだけ合った
+    でたらめな値を「一致しない指紋」として黙って読み飛ばすと、記録が消えた
+    ようにしか見えない。
+    """
+    fingerprint = row["document_fingerprint"]
+    try:
+        validate_fingerprint(fingerprint)
+    except (TypeError, ValueError) as error:
+        msg = f"stored study mark {row['id']!r} has a broken fingerprint"
+        raise StoredStudyMarkError(msg) from error
+    return str(fingerprint)
 
 
 def _validate_mark_id(mark_id: int) -> None:
@@ -141,12 +161,16 @@ class StudyMarkRepository:
         消しはせず、`unverified_count()` で数えて
         `adopt_unverified()`（利用者の承認つき）で引き取る。
 
-        **指紋の照合は SQL ではなく、行を写し取ってから行う。** SQL で
+        **指紋の照合は SQL ではなく、指紋を検証してから行う。** SQL で
         `document_fingerprint = ?` と絞ると、壊れた指紋の行は「一致しない
-        だけの行」として素通りし、`_to_study_mark()` の検証にかからない。
-        保存データの不整合が、利用者からは「マークが黙って消えた」に
-        見えてしまう。1つの PDF あたりの行数は多くても数千件なので、
-        同じパスの行を全部写し取ってから絞る。
+        だけの行」として素通りし、検証にかからない。保存データの不整合が、
+        利用者からは「マークが黙って消えた」に見えてしまう。壊れた指紋は
+        どの内容のものか決めようがないので、ここで失敗させる。
+
+        **一方、他の列の検証は現在の内容の行だけに掛ける。** 同じパスの
+        別の版に付いた行が壊れていても、いま開いている版まで読めなく
+        なるのは行き過ぎ（その版の記録は健全なので）。行数は1つの PDF
+        あたり多くても数千件なので、絞り込みを Python 側で行う費用は変わらない。
         """
         rows = self._connection.execute(
             f"SELECT {_COLUMNS} FROM study_marks"
@@ -154,8 +178,9 @@ class StudyMarkRepository:
             " ORDER BY page_index, id",
             (document.key,),
         ).fetchall()
-        marks = [_to_study_mark(row) for row in rows]
-        return [mark for mark in marks if mark.document_fingerprint == document.fingerprint]
+        return [
+            _to_study_mark(row) for row in rows if _stored_fingerprint(row) == document.fingerprint
+        ]
 
     def unverified_count(self, document: DocumentIdentity) -> int:
         """このパスに残っている、指紋を持たない学習マークの数。
@@ -188,6 +213,11 @@ class StudyMarkRepository:
         時点で `StoredStudyMarkError` になり、UPDATE ごと巻き戻る。指紋を
         焼き込んだ後で読み込み失敗になり、その PDF を開けなくなる、という
         状態にはしない。
+
+        **`COMMIT` も try の中に入れる。** これも失敗しうる SQL で、失敗した
+        時点ではトランザクションが開いたまま残る。接続はアプリの起動から
+        終了まで使い回すので、開きっぱなしのトランザクションを残すと、以後の
+        更新が意図せずその中に入ったり、次の `BEGIN` が失敗したりする。
         """
         self._connection.execute("BEGIN IMMEDIATE")
         try:
@@ -198,12 +228,25 @@ class StudyMarkRepository:
                 (document.fingerprint, document.key),
             ).fetchall()
             adopted = [_to_study_mark(row) for row in rows]
+            self._connection.execute("COMMIT")
         except BaseException:
-            self._connection.execute("ROLLBACK")
+            self._rollback()
             raise
 
-        self._connection.execute("COMMIT")
         return sorted(adopted, key=lambda mark: (mark.page_index, mark.id))
+
+    def _rollback(self) -> None:
+        """開いているトランザクションを巻き戻す。
+
+        巻き戻し自体の失敗で、元の失敗を覆い隠さない（記録だけ残す）。
+        `COMMIT` の後に来た場合はトランザクションが残っていないので何もしない。
+        """
+        if not self._connection.in_transaction:
+            return
+        try:
+            self._connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            logger.exception("failed to roll back the study mark transaction")
 
     def increment_mistake_count(self, mark_id: int) -> StudyMark | None:
         """同じ問題をまた間違えたときに、間違えた回数を1増やす。

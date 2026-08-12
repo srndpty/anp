@@ -443,6 +443,71 @@ def test_adopting_only_touches_this_path(
     assert repository.unverified_count(DocumentIdentity.of(other)) == 1
 
 
+class CommitFailingConnection(sqlite3.Connection):
+    """`COMMIT` だけが失敗する接続。
+
+    `sqlite3.Connection.execute` は差し替えられないので、factory で
+    差し込む。トランザクションの後始末を確かめるためだけに使う。
+    """
+
+    fail_commit = False
+
+    def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+        if self.fail_commit and sql == "COMMIT":
+            msg = "commit failed"
+            raise sqlite3.OperationalError(msg)
+        return super().execute(sql, parameters)  # type: ignore[arg-type]
+
+
+def test_a_failed_commit_does_not_leave_a_transaction_open(
+    pdf_path: Path,
+    tmp_path: Path,
+) -> None:
+    """`COMMIT` が失敗しても、トランザクションを開いたまま残さない。
+
+    接続はアプリの起動から終了まで使い回すので、残ると以後の更新が意図せず
+    その中に入ったり、次の `BEGIN` が失敗したりする。
+    """
+    connection = sqlite3.connect(
+        tmp_path / "anp.sqlite3", autocommit=True, factory=CommitFailingConnection
+    )
+    with closing(connection) as failing:
+        failing.row_factory = sqlite3.Row
+        database.apply_migrations(failing)
+        repository = StudyMarkRepository(failing)
+        repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+        failing.execute("UPDATE study_marks SET document_fingerprint = NULL")
+        failing.fail_commit = True
+
+        with pytest.raises(sqlite3.OperationalError):
+            repository.adopt_unverified(DocumentIdentity.of(pdf_path))
+
+        assert not failing.in_transaction
+        # 引き取りは巻き戻っている。
+        failing.fail_commit = False
+        assert repository.unverified_count(DocumentIdentity.of(pdf_path)) == 1
+
+
+def test_a_broken_row_of_another_version_does_not_block_this_one(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """同じパスの別の版に壊れた行があっても、いまの版は読める。
+
+    指紋が食い違う行はそもそも別のドキュメントのものなので、その中身が
+    壊れていることを理由に、いま開いている版まで読めなくはしない。
+    """
+    other_version = "a" * 64
+    connection.execute(
+        "INSERT INTO study_marks"
+        " (document_key, document_fingerprint, page_index, x_norm, y_norm, note)"
+        " VALUES (?, ?, 0, 0.5, 0.5, x'414243')",
+        (document_key(pdf_path), other_version),
+    )
+    mine = repository.create(DocumentIdentity.of(pdf_path), 1, 0.5, 0.5)
+
+    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == [mine]
+
+
 def test_adopting_a_broken_old_row_changes_nothing(
     repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
 ) -> None:
