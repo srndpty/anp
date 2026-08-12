@@ -49,6 +49,16 @@ _NOTE_LABEL = "メモ"
 _DELETE_TITLE = "学習マークを削除"
 _DELETE_TEXT = "この学習マークを削除しますか？"
 
+# 指紋を持たない古い学習マーク（マイグレーション2 より前の分）の尋ね方。
+# どの PDF に付けたものか確かめようがないので、表示する前に本人へ聞く。
+_UNVERIFIED_TITLE = "古い形式の学習マーク"
+_UNVERIFIED_TEXT = (
+    "このファイルには、どの内容の PDF に付けられたか記録されていない\n"
+    "学習マークが {count} 件あります。\n\n"
+    "いま開いている PDF のものとして紐付けますか？\n"
+    "「いいえ」を選んでもマークは削除されません（次に開いたときにまた尋ねます）。"
+)
+
 # 更新の操作で起こりうる**想定された失敗**。表示対象の食い違い
 # （`StudyMarkError`）、DB の障害、保存データの不整合、PDF そのものを
 # 読めないこと（内容の指紋）。SQL はここに書かないが、リポジトリが
@@ -169,7 +179,40 @@ class StudyMarkInteraction:
             return
         self._run(lambda: self._controller.delete_mark(mark.id))
 
-    def _run(self, operation: Callable[[], None]) -> None:
+    # -------------------------------------------------- 古い形式のマーク
+    def prompt_adopt_unverified(self) -> None:
+        """指紋を持たない古い学習マークを、この PDF に紐付けるか尋ねる。
+
+        **PDF を開いた直後に呼ぶ**（呼ぶかどうかは `MainWindow` が決める）。
+        マイグレーション2 より前に作られたマークは、どの内容の PDF に
+        付けられたのかが分からない。黙って表示すると、同じパスの PDF を
+        別の本へ差し替えていた場合に前の本のマークが正常なデータとして
+        並ぶ。かといって黙って紐付けるのは取り消せない。
+
+        **どちらの側にも倒さず、その PDF を実際に見ている利用者に尋ねる。**
+        「いいえ」を選んでもマークは消えない（次に開いたときにまた尋ねる）。
+        既定のボタンも「いいえ」にしておく。
+
+        ここに置くのは、学習マークの操作の失敗を止める境界（`_run()`）が
+        ここにあるため。`MainWindow` から直に呼ぶと、DB の障害がそのまま
+        起動時の未捕捉例外になる。
+        """
+        count = self._controller.unverified_count
+        if count == 0:
+            return
+
+        answer = QMessageBox.question(
+            self._parent,
+            _UNVERIFIED_TITLE,
+            _UNVERIFIED_TEXT.format(count=count),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is not QMessageBox.StandardButton.Yes:
+            return
+        self._run(self._controller.adopt_unverified)
+
+    def _run(self, operation: Callable[[], object]) -> None:
         """操作を実行し、失敗したら記録して知らせる。
 
         捕まえるのは **想定された失敗だけ**（`_OPERATION_ERRORS`）。どれも

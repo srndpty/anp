@@ -169,19 +169,40 @@ class StudyMarkRepository:
         ).fetchone()
         return int(row[0])
 
-    def adopt_unverified(self, document: DocumentIdentity) -> int:
+    def adopt_unverified(self, document: DocumentIdentity) -> list[StudyMark]:
         """指紋を持たない学習マークを、この PDF のものとして引き取る。
 
-        引き取った件数を返す。**呼ぶのは利用者が承認したときだけ。**
-        「たぶんこの PDF のものだろう」と黙って結び付けると、差し替え後の
-        PDF に前の本のマークを焼き付けることになり、取り消せない。
+        引き取った後のマークを返す（並びは `list_for_document()` と同じ）。
+        **呼ぶのは利用者が承認したときだけ。** 「たぶんこの PDF のものだろう」
+        と黙って結び付けると、差し替え後の PDF に前の本のマークを焼き付ける
+        ことになり、取り消せない。
+
+        **ここだけは明示的なトランザクションにする。** 他の更新は1文で
+        完結するが、これは「更新して、更新後の行を読み直す」の2段になる。
+        接続は `autocommit=True` なので、分けて実行すると更新だけが確定して
+        読み直しが失敗する状態（呼び出し側から見れば失敗なのに DB は
+        書き換わっている）を作れてしまう。
+
+        古い行に壊れた値が混じっていた場合も、`RETURNING` で読み直した
+        時点で `StoredStudyMarkError` になり、UPDATE ごと巻き戻る。指紋を
+        焼き込んだ後で読み込み失敗になり、その PDF を開けなくなる、という
+        状態にはしない。
         """
-        cursor = self._connection.execute(
-            "UPDATE study_marks SET document_fingerprint = ?"
-            " WHERE document_key = ? AND document_fingerprint IS NULL",
-            (document.fingerprint, document.key),
-        )
-        return cursor.rowcount
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._connection.execute(
+                "UPDATE study_marks SET document_fingerprint = ?"
+                " WHERE document_key = ? AND document_fingerprint IS NULL"
+                f" RETURNING {_COLUMNS}",
+                (document.fingerprint, document.key),
+            ).fetchall()
+            adopted = [_to_study_mark(row) for row in rows]
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+
+        self._connection.execute("COMMIT")
+        return sorted(adopted, key=lambda mark: (mark.page_index, mark.id))
 
     def increment_mistake_count(self, mark_id: int) -> StudyMark | None:
         """同じ問題をまた間違えたときに、間違えた回数を1増やす。

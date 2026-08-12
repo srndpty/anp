@@ -460,7 +460,7 @@ def test_adopting_makes_the_old_marks_belong_to_this_pdf(
     connection.execute("UPDATE study_marks SET document_fingerprint = NULL")
     identity = DocumentIdentity.of(pdf_path)
 
-    assert repository.adopt_unverified(identity) == 1
+    assert repository.adopt_unverified(identity) == [mark]
 
     assert repository.list_for_document(identity) == [mark]
     assert repository.unverified_count(identity) == 0
@@ -478,9 +478,29 @@ def test_adopting_only_touches_this_path(
     repository.create(DocumentIdentity.of(other), 0, 0.5, 0.5)
     connection.execute("UPDATE study_marks SET document_fingerprint = NULL")
 
-    assert repository.adopt_unverified(DocumentIdentity.of(mine)) == 1
+    assert len(repository.adopt_unverified(DocumentIdentity.of(mine))) == 1
 
     assert repository.unverified_count(DocumentIdentity.of(other)) == 1
+
+
+def test_adopting_a_broken_old_row_changes_nothing(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """引き取ろうとした行が壊れていたら、1件も引き取らない。
+
+    更新だけ確定して読み直しが失敗すると、壊れた行に指紋が焼き込まれた
+    まま残り、以後その PDF を開くたびに読み込み失敗になる。更新と読み直しを
+    1つのトランザクションにしてあるので、巻き戻る。
+    """
+    repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute("UPDATE study_marks SET document_fingerprint = NULL, note = x'414243'")
+    identity = DocumentIdentity.of(pdf_path)
+
+    with pytest.raises(StoredStudyMarkError):
+        repository.adopt_unverified(identity)
+
+    assert repository.unverified_count(identity) == 1
+    assert repository.list_for_document(identity) == []
 
 
 # ---------------------------------------------------------------- increment

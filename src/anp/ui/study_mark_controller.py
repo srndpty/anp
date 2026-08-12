@@ -286,15 +286,17 @@ class StudyMarkController(QObject):
         引き取った件数を返す。**呼ぶのは利用者が承認したときだけ**（尋ねるのは
         UI の側）。取り消せない操作なので、黙って結び付けはしない。
 
-        引き取った分は表示に加わるので、ここだけは全件を読み直す。件数は
-        マイグレーション2 より前のマークに限られ、この操作は1つの PDF に
-        つき一度きり。
+        他の更新と同じく、**引き取った後の行を使って表示を差し替える**
+        （読み直さない）。リポジトリ側が1トランザクションで更新と読み直しを
+        済ませているので、成功したのに表示が失敗する、という状態は作れない。
         """
-        identity = self._require_identity()
-        adopted = self._repository.adopt_unverified(identity)
-        self._unverified_count = self._repository.unverified_count(identity)
-        self.refresh()
-        return adopted
+        adopted = self._repository.adopt_unverified(self._require_identity())
+        self._unverified_count -= len(adopted)
+        # 引き取った分は表示に無かったものなので、混ぜて並べ直すだけでよい。
+        # 通知は1回（1件ごとに配ると、一覧が途中の状態で何度も作り直される）。
+        merged = sorted([*self._marks, *adopted], key=lambda mark: (mark.page_index, mark.id))
+        self._publish_marks(merged)
+        return len(adopted)
 
     def delete_mark(self, mark_id: int) -> None:
         """学習マークを1件消す。確認を取るのは UI の側。"""

@@ -516,7 +516,7 @@ class AdoptPrompt:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.asked: list[str] = []
         self.accept = False
-        monkeypatch.setattr("anp.ui.main_window.QMessageBox.question", self._question)
+        monkeypatch.setattr("anp.ui.study_mark_interaction.QMessageBox.question", self._question)
 
     def _question(self, *args: object, **_kwargs: object) -> QMessageBox.StandardButton:
         self.asked.append(str(args[2]))

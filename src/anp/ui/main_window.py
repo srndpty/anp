@@ -96,16 +96,6 @@ _DEFAULT_SIZE = (1000, 800)
 
 _PDF_FILTER = "PDF ファイル (*.pdf)"
 
-# 指紋を持たない古い学習マーク（マイグレーション2 より前の分）の尋ね方。
-# どの PDF に付けたものか確かめようがないので、表示する前に本人へ聞く。
-_UNVERIFIED_MARK_TITLE = "古い形式の学習マーク"
-_UNVERIFIED_MARK_TEXT = (
-    "このファイルには、どの内容の PDF に付けられたか記録されていない\n"
-    "学習マークが {count} 件あります。\n\n"
-    "いま開いている PDF のものとして紐付けますか？\n"
-    "「いいえ」を選んでもマークは削除されません（次に開いたときにまた尋ねます）。"
-)
-
 # 一覧から移動できなかったときの知らせ方。読み進めるのを妨げないよう、
 # ダイアログではなくステータスバーへ一時的に出す。
 _STALE_MARK_MESSAGE = "このマークのページは現在の PDF にありません"
@@ -611,34 +601,9 @@ class MainWindow(QMainWindow):
         if notify:
             # 尋ねるのは利用者が自分で開いたときだけ。起動時の自動復元で
             # 出すと、立ち上がった瞬間に問いかけが出ることになる。
-            self._prompt_adopt_unverified_marks()
+            # 問いかけと失敗の扱いは学習マーク側の境界に任せる。
+            self._study_mark_interaction.prompt_adopt_unverified()
         return True
-
-    def _prompt_adopt_unverified_marks(self) -> None:
-        """指紋を持たない古い学習マークを、この PDF に紐付けるか尋ねる。
-
-        マイグレーション2 より前に作られたマークは、どの内容の PDF に
-        付けられたのかが分からない。黙って表示すると、同じパスの PDF を
-        別の本へ差し替えていた場合に、前の本のマークが正常なデータとして
-        並ぶ。かといって黙って紐付けるのは取り消せない。
-
-        **どちらの側にも倒さず、その PDF を実際に見ている利用者に尋ねる。**
-        「いいえ」を選んでもマークは消えない（次に開いたときにまた尋ねる）。
-        既定のボタンも「いいえ」にしておく。
-        """
-        count = self._study_marks.unverified_count
-        if count == 0:
-            return
-
-        answer = QMessageBox.question(
-            self,
-            _UNVERIFIED_MARK_TITLE,
-            _UNVERIFIED_MARK_TEXT.format(count=count),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer is QMessageBox.StandardButton.Yes:
-            self._study_marks.adopt_unverified()
 
     def _report_open_failure(self, *, notify: bool, title: str, path: Path, body: str) -> None:
         """開けなかったことを知らせる。
