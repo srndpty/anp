@@ -15,7 +15,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QSettings, QSizeF
+from PySide6.QtCore import QLockFile, QSettings, QSizeF
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
@@ -893,6 +893,77 @@ def test_the_application_opens_and_closes_one_connection(
     assert (tmp_path / "data" / "anp.sqlite3").is_file()
     with pytest.raises(sqlite3.ProgrammingError):
         opened[0].execute("SELECT 1")
+
+
+def test_a_second_instance_does_not_open_the_database(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """既に起動していたら、2つ目は DB もウィンドウも開かずに終わる。
+
+    `StudyMarkController` は「表示中のスナップショットと DB が一致する」を
+    前提に、更新のたびの読み直しを省いている。書き手が2つになるとその
+    前提が崩れ、片方の画面が古い件数を出したままになる。
+    """
+    data = tmp_path / "data"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(app_module, "QApplication", lambda _argv: qapp)
+    monkeypatch.setattr(app_module, "setup_logging", lambda _path: None)
+    monkeypatch.setattr(app_module, "_install_excepthook", lambda: None)
+    monkeypatch.setattr(
+        AppPaths,
+        "from_standard_paths",
+        classmethod(lambda _cls, _name: AppPaths(data_dir=data)),
+    )
+    informed: list[str] = []
+    monkeypatch.setattr(
+        app_module.QMessageBox,
+        "information",
+        lambda *args: informed.append(str(args[2])),
+    )
+
+    # 先に起動しているプロセスの代わりに、同じロックを取っておく。
+    held = QLockFile(str(AppPaths(data_dir=data).lock_file))
+    assert held.tryLock(0), "テストの前提が崩れている（ロックを取れない）"
+    try:
+        connections: list[object] = []
+        monkeypatch.setattr(app_module.database, "connect", lambda path: connections.append(path))
+
+        assert app_module.main() == app_module.EXIT_ALREADY_RUNNING
+
+        assert connections == []
+        assert len(informed) == 1
+        assert "既に起動" in informed[0]
+    finally:
+        held.unlock()
+
+
+def test_the_lock_is_released_when_the_application_exits(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """終了したら、次の起動はロックを取れる。"""
+    data = tmp_path / "data"
+    monkeypatch.setattr(app_module, "QApplication", lambda _argv: qapp)
+    monkeypatch.setattr(app_module, "setup_logging", lambda _path: None)
+    monkeypatch.setattr(app_module, "_install_excepthook", lambda: None)
+    monkeypatch.setattr(
+        app_module,
+        "QSettings",
+        lambda: QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+    )
+    monkeypatch.setattr(
+        AppPaths,
+        "from_standard_paths",
+        classmethod(lambda _cls, _name: AppPaths(data_dir=data)),
+    )
+    monkeypatch.setattr(qapp, "exec", lambda: 0)
+
+    assert app_module.main() == 0
+
+    after = QLockFile(str(AppPaths(data_dir=data).lock_file))
+    try:
+        assert after.tryLock(0)
+    finally:
+        after.unlock()
 
 
 def test_the_database_lives_next_to_the_log(tmp_path: Path) -> None:
