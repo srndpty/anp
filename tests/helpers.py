@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QImage
 
 from anp.pdf import render as render_module
@@ -32,6 +33,7 @@ from anp.pdf.color import PageColorMode
 from anp.pdf.render import PageRenderService, PageRequest, _TransformJob, _TransformResult
 from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.ui import pdf_view as view_module
 from anp.ui.pdf_view import PdfView
 
 
@@ -148,6 +150,97 @@ def put_image(
     image = QImage(width, height, QImage.Format.Format_ARGB32)
     image.fill(color)
     cache.put(RenderKey(page, width, height, dpr), image)
+
+
+class FakeSearchResult:
+    """`QPdfLink` の代わりに検索結果として渡せる値。
+
+    PySide6 の `QPdfLink` には Python から使える多引数のコンストラクタが
+    無いので、壊れた geometry や範囲外のページを持つ結果は組み立てられない。
+    実際の検索結果は `QPdfSearchModel` を使ったテストで確かめたうえで、
+    `PdfView` が読む4つの問い合わせだけを持つ値をここで用意する。
+    """
+
+    def __init__(
+        self,
+        page: int = 0,
+        location: QPointF | None = None,
+        rectangles: Sequence[QRectF] = (),
+        *,
+        valid: bool = True,
+        zoom: float = 0.0,
+    ) -> None:
+        self._page = page
+        self._location = location if location is not None else QPointF(0.0, 0.0)
+        self._rectangles = list(rectangles)
+        self._valid = valid
+        self._zoom = zoom
+
+    def isValid(self) -> bool:  # noqa: N802 (Qt の命名規則)
+        return self._valid
+
+    def page(self) -> int:
+        return self._page
+
+    def location(self) -> QPointF:
+        return self._location
+
+    def rectangles(self) -> list[QRectF]:
+        return list(self._rectangles)
+
+    def zoom(self) -> float:
+        return self._zoom
+
+
+@dataclass(frozen=True)
+class SearchDraw:
+    """`draw_search_result()` の1回の呼び出し。"""
+
+    rects: tuple[QRectF, ...]
+    current: bool
+
+
+class OverlaySpy:
+    """検索ハイライトと学習マークのバッジが、どの順で何回描かれたかを記録する。
+
+    画素の色から見分けようとすると、半透明の重ねとページ画像の色に依存して
+    脆くなる。ここで見たいのは「全一致と現在の一致で別の描画をしたか」
+    「重ね順はどうか」なので、描画の呼び出しそのものを記録する。
+
+    差し替えるのは `PdfView` が参照している名前だけ。座標変換も可視ページの
+    絞り込みも本番のコードを通る。
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.order: list[str] = []
+        self.searches: list[SearchDraw] = []
+
+        def draw_search_result(
+            _painter: object, rects: Sequence[QRectF], *, current: bool = False
+        ) -> None:
+            self.order.append("search")
+            self.searches.append(SearchDraw(rects=tuple(rects), current=current))
+
+        def draw_badge(_painter: object, _anchor: object, _count: int) -> None:
+            self.order.append("badge")
+
+        monkeypatch.setattr(view_module, "draw_search_result", draw_search_result)
+        monkeypatch.setattr(view_module, "draw_badge", draw_badge)
+
+    def reset(self) -> None:
+        """記録を空にする。1回の描画だけを見るために使う。"""
+        self.order.clear()
+        self.searches.clear()
+
+    @property
+    def all_matches(self) -> list[SearchDraw]:
+        """全一致として描かれた分（現在の一致の強調は含まない）。"""
+        return [draw for draw in self.searches if not draw.current]
+
+    @property
+    def current_matches(self) -> list[SearchDraw]:
+        """現在の一致として描かれた分。"""
+        return [draw for draw in self.searches if draw.current]
 
 
 def render_view(view: PdfView) -> QImage:

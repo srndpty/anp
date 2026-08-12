@@ -17,8 +17,9 @@
 - **レンダリング画像の物理ピクセル**: 論理サイズ × `devicePixelRatio`。
   `PageRenderService` への要求サイズだけに使う
 - **ページ内の PDF ポイント**: ページ左上を原点とする PDF の寸法単位。
-  目次の移動先（`PdfDestination`）だけがこの座標で来る。コンテンツ座標への
-  変換は `PageLayout.from_page_points()` にあり、ここには書かない
+  目次の移動先（`PdfDestination`）と検索結果の矩形（`QPdfLink.rectangles()`）
+  がこの座標で来る。コンテンツ座標への変換は `PageLayout.from_page_points()`
+  と `PageLayout.rect_from_page_points()` にあり、ここには書かない
 
 **オーバーレイの位置計算に物理ピクセルを混ぜない。** 学習マークの位置は
 上の3つの論理座標だけで決まり、DPR には依存しない。
@@ -50,7 +51,7 @@ from PySide6.QtGui import (
     QResizeEvent,
     QWheelEvent,
 )
-from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPdf import QPdfDocument, QPdfLink, QPdfSearchModel
 from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 
 from anp.pdf.color import PageColorMode, page_background_color
@@ -59,6 +60,8 @@ from anp.pdf.layout import PageLayout
 from anp.pdf.render import PageRenderService, PageRequest
 from anp.storage.study_mark import StudyMark, validate_position
 from anp.ui.appearance import CanvasTheme, canvas_color
+from anp.ui.pdf_search_controller import NO_RESULT
+from anp.ui.search_overlay import draw_search_result
 from anp.ui.study_marks import (
     PagePosition,
     StudyMarkIndex,
@@ -231,6 +234,11 @@ class PdfView(QAbstractScrollArea):
         self._canvas_theme = CanvasTheme.DARK_GRAY
         self._study_marks = StudyMarkIndex()
 
+        # 検索結果はモデルが持ち主。ここは「どのモデルを描くか」と
+        # 「何件目が現在の結果か」だけを持ち、結果の実体を写し取らない。
+        self._search_model: QPdfSearchModel | None = None
+        self._current_search_index = NO_RESULT
+
         # 可動域と位置をまとめて更新している間だけ立てる。`_quiet_scrollbars()` を参照。
         self._scroll_updates_suppressed = False
 
@@ -273,6 +281,9 @@ class PdfView(QAbstractScrollArea):
         self._render.set_document(document)
         self._layout = layout
         self._study_marks = StudyMarkIndex()
+        # 現在の検索結果も学習マークと同じ理由で即座に捨てる。番号は前の
+        # PDF の結果を指しているので、持ち越すと別の場所を強調してしまう。
+        self._current_search_index = NO_RESULT
 
         before = self._zoom
         self._zoom = self._resolved_zoom(0)
@@ -289,9 +300,10 @@ class PdfView(QAbstractScrollArea):
             self.zoom_changed.emit()
 
     def clear_document(self) -> None:
-        """表示を空にする。学習マークも一緒に捨てる。"""
+        """表示を空にする。学習マークと現在の検索結果も一緒に捨てる。"""
         self._layout = None
         self._study_marks = StudyMarkIndex()
+        self._current_search_index = NO_RESULT
         self._render.reset()
         with self._quiet_scrollbars():
             self._update_scrollbars()
@@ -880,6 +892,168 @@ class PdfView(QAbstractScrollArea):
             return StudyMarkTarget(mark=hits[0])
         return StudyMarkTarget(position=self.page_position_at(viewport_pos))
 
+    # -------------------------------------------------- 検索結果
+    @property
+    def search_model(self) -> QPdfSearchModel | None:
+        """ハイライトを描く検索モデル。設定されていなければ None。"""
+        return self._search_model
+
+    @property
+    def current_search_index(self) -> int:
+        """現在の検索結果の番号（0 始まり）。無ければ `NO_RESULT`。"""
+        return self._current_search_index
+
+    def set_search_model(self, model: QPdfSearchModel | None) -> None:
+        """ハイライトの情報源にする検索モデルを差し替える。
+
+        **結果を写し取らない。** 描くときに `resultsOnPage()` を引くだけ
+        なので、何千件の結果があってもここにコピーは作らない。
+
+        結果は検索の進行に合わせて増減するので、モデルの通知で描き直す。
+        古いモデルへの接続は必ず外す（外さないと、閉じた PDF の検索結果で
+        再描画が走る）。
+
+        起きるのは再描画だけ。レンダリング要求も色変換も世代の更新も
+        起こさない。倍率・スクロール位置・現在ページも触らない。
+        """
+        if model is self._search_model:
+            return
+        if self._search_model is not None:
+            self._disconnect_search_model(self._search_model)
+        self._search_model = model
+        if model is not None:
+            self._connect_search_model(model)
+        self._current_search_index = NO_RESULT
+        self.viewport().update()
+
+    def _connect_search_model(self, model: QPdfSearchModel) -> None:
+        """結果が増減したらオーバーレイを描き直す。
+
+        `countChanged` だけでは、件数が同じまま中身が入れ替わる更新
+        （モデルの作り直し）を取りこぼす。
+        """
+        model.countChanged.connect(self._on_search_results_changed)
+        model.modelReset.connect(self._on_search_results_changed)
+        model.rowsInserted.connect(self._on_search_results_changed)
+        model.rowsRemoved.connect(self._on_search_results_changed)
+        model.dataChanged.connect(self._on_search_results_changed)
+
+    def _disconnect_search_model(self, model: QPdfSearchModel) -> None:
+        model.countChanged.disconnect(self._on_search_results_changed)
+        model.modelReset.disconnect(self._on_search_results_changed)
+        model.rowsInserted.disconnect(self._on_search_results_changed)
+        model.rowsRemoved.disconnect(self._on_search_results_changed)
+        model.dataChanged.disconnect(self._on_search_results_changed)
+
+    def _on_search_results_changed(self, *_args: object) -> None:
+        """検索結果が変わったので描き直す。**再描画だけ**。"""
+        self.viewport().update()
+
+    def set_current_search_result(self, index: int) -> None:
+        """現在の検索結果の番号を差し替える（`NO_RESULT` で「無し」）。
+
+        強調して描く1件が変わるだけ。**移動はしない**（移動の入口は
+        `reveal_pdf_search_result()`）。レンダリングもキャッシュも倍率も
+        スクロール位置も触らない。
+        """
+        if index == self._current_search_index:
+            return
+        self._current_search_index = index
+        self.viewport().update()
+
+    def search_result_viewport_rects(self, link: QPdfLink) -> list[QRectF]:
+        """検索結果1件が占める領域（ビューポート座標）。
+
+        **`QPdfLink.rectangles()` をすべて使う。** 検索文字列が行をまたぐと
+        1件の結果が複数の矩形を持つので、先頭だけでは一致の一部しか表せない。
+
+        座標は「ページ内の PDF ポイント → コンテンツ座標 → ビューポート
+        座標」と論理座標だけで運ぶ。`devicePixelRatio` もレンダリング画像の
+        物理ピクセルも混ぜない。
+
+        矩形の値は外部の PDF metadata なので、`clamp_to_page()` でページの
+        内側へ収めてから使う（NaN や inf を可動域や描画へ流さない）。
+        いま開いているドキュメントに無いページを指す結果は空。
+        """
+        layout = self._layout
+        page = link.page()
+        if layout is None or not link.isValid() or not 0 <= page < layout.page_count:
+            return []
+
+        offset = self._scroll_offset()
+        return [
+            layout.rect_from_page_points(page, rect, self._zoom).translated(-offset)
+            for rect in self._clamped_result_rects(layout, page, link)
+        ]
+
+    def _clamped_result_rects(self, layout: PageLayout, page: int, link: QPdfLink) -> list[QRectF]:
+        """検索結果の矩形を、ページの内側に収めた PDF ポイントで返す。
+
+        矩形が1つも無い有効な結果（geometry を持たない PDF）では
+        `location()` へ落とす。location も読めない場合は `clamp_to_page()`
+        がページ左上へ落とすので、結果としてページ先頭を指す。
+        """
+        size = layout.page_size(page)
+        rects = [
+            QRectF(
+                clamp_to_page(rect.topLeft(), size), clamp_to_page(rect.bottomRight(), size)
+            ).normalized()
+            for rect in link.rectangles()
+        ]
+        if rects:
+            return rects
+        point = clamp_to_page(link.location(), size)
+        return [QRectF(point, QSizeF(0.0, 0.0))]
+
+    def reveal_pdf_search_result(self, link: QPdfLink) -> bool:
+        """検索結果が見えるところまで移動する。見せられたか返す。
+
+        **目次の `navigate_to_pdf_destination()` とは目的が違う。** あちらは
+        「PDF の作者が指定した位置を開く」なので移動先を左上へ寄せるが、
+        こちらは「検索文字列が占める領域を見せる」ので、その領域の中心を
+        ビューポートの中央に置く。ページ先頭へ飛ばすのでは、ページの途中に
+        ある一致が見えない。
+
+        領域の求め方はハイライトと同じ `QPdfLink.rectangles()`。描画と移動で
+        別々の geometry を使わない。
+
+        無効な結果（`isValid()` が偽・ページ番号が範囲外）は `False` を
+        返して何もしない。**最終ページへ丸めない**（目次・学習マークと
+        同じ方針）。文書の端で中央に置けない場合は、可動域の切り詰めを
+        そのまま受け入れる。
+
+        **倍率と倍率モードは触らない。** `QPdfLink.zoom()` は読まない。
+        Fit Width / Fit Page のまま次の結果へ飛んでも FREE へ落ちない。
+        レンダリングもスクロールと同じ経路でしか起こさない（世代も
+        キャッシュも色変換も触らない）。
+        """
+        rects = self.search_result_viewport_rects(link)
+        if not rects:
+            return False
+
+        # `QRectF.united()` は大きさ 0 の矩形を「無いもの」として捨てるので、
+        # 端点から直に組み立てる。geometry を持たない結果（location への
+        # フォールバック）でもその点が中央に来る。
+        center = (
+            QPointF(
+                (min(rect.left() for rect in rects) + max(rect.right() for rect in rects)) / 2,
+                (min(rect.top() for rect in rects) + max(rect.bottom() for rect in rects)) / 2,
+            )
+            + self._scroll_offset()
+        )
+
+        size = self.viewport().size()
+        # 可動域の切り詰めはスクロールバーに任せる。まとめて動かしてから
+        # 1回だけ追随する（`navigate_to_pdf_destination()` と同じ形）。
+        with self._quiet_scrollbars():
+            self.verticalScrollBar().setValue(round(center.y() - size.height() / 2))
+            self.horizontalScrollBar().setValue(round(center.x() - size.width() / 2))
+
+        self.viewport().update()
+        self._request_render()
+        self._refresh_current_page()
+        return True
+
     # -------------------------------------------------- スクロールバー
     def _update_scrollbars(self) -> None:
         """コンテンツとビューポートの大きさから可動域を決める。"""
@@ -1038,10 +1212,14 @@ class PdfView(QAbstractScrollArea):
     def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 (Qt の命名規則)
         """見えているページだけを描く。
 
-        重ね順は キャンバス → ページ下地 → ページ画像 → 学習マーク。
-        学習マークは **ページ画像より後** に描く。ページを1枚ずつ
-        「画像 → マーク」と描くのではなくオーバーレイを別の周回にするのは、
-        ページの端にあるバッジが次のページの下地で消されないようにするため。
+        重ね順は キャンバス → ページ下地 → ページ画像 → 検索結果 →
+        現在の検索結果 → 学習マーク。オーバーレイは **ページ画像より後**
+        に描く。ページを1枚ずつ「画像 → オーバーレイ」と描くのではなく
+        周回を分けるのは、ページの端にあるバッジやハイライトが次のページの
+        下地で消されないようにするため。
+
+        学習マークのバッジは検索ハイライトより上に残す。検索中でも印の
+        位置と回数が読めなくならないようにする。
 
         ここで行うのは軽いベクタ描画だけ。画素変換もレンダリング要求も
         待ち合わせもしない（P2 からの契約）。
@@ -1061,6 +1239,10 @@ class PdfView(QAbstractScrollArea):
             painter.setPen(_PAGE_BORDER_COLOR)
             for index in pages:
                 self._paint_page(painter, index)
+
+            for index in pages:
+                self._paint_search_results(painter, index)
+            self._paint_current_search_result(painter, pages)
 
             for index in pages:
                 self._paint_study_marks(painter, index)
@@ -1085,6 +1267,36 @@ class PdfView(QAbstractScrollArea):
             painter.drawImage(rect, image)
 
         painter.drawRect(rect)
+
+    def _paint_search_results(self, painter: QPainter, index: int) -> None:
+        """1ページ分の検索結果をすべて薄く塗る。
+
+        引くのは **そのページの結果だけ**（`resultsOnPage()`）。結果が
+        何千件あっても、描画のたびに文書全体を走査しない。
+
+        ハイライトは `PageColorMode`（オリジナル / 反転 / スマートダーク）
+        を通さない。オーバーレイはページ画像の外側にあり、`DisplayCache`
+        にも入らない。
+        """
+        if self._search_model is None:
+            return
+        for link in self._search_model.resultsOnPage(index):
+            draw_search_result(painter, self.search_result_viewport_rects(link))
+
+    def _paint_current_search_result(self, painter: QPainter, pages: range) -> None:
+        """現在の検索結果だけを強調して塗る。
+
+        全一致とは **別の描画経路**。薄い塗りの上に濃い塗りと縁を重ねる
+        ので、同じ検索結果のうちどれを見ているかが分かる。
+
+        現在の結果が見えているページに無ければ何もしない。
+        """
+        if self._search_model is None or self._current_search_index == NO_RESULT:
+            return
+        link = self._search_model.resultAtIndex(self._current_search_index)
+        if not link.isValid() or link.page() not in pages:
+            return
+        draw_search_result(painter, self.search_result_viewport_rects(link), current=True)
 
     def _paint_study_marks(self, painter: QPainter, index: int) -> None:
         """1ページ分の学習マークを描く。
