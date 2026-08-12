@@ -25,11 +25,13 @@ from anp.core.paths import AppPaths
 from anp.core.settings import Settings
 from anp.pdf.document import DocumentController
 from anp.storage import database
-from anp.storage.study_mark import StudyMark, document_key
+from anp.storage import study_mark as study_mark_module
+from anp.storage.study_mark import DocumentIdentity, StudyMark, document_key
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
+from anp.ui.study_marks import PagePosition
 from helpers import RecordingRepository, RecordingService
 
 
@@ -44,13 +46,13 @@ class FailingRepository(StudyMarkRepository):
 
     def __init__(self, connection: sqlite3.Connection, failing: Path | None = None) -> None:
         super().__init__(connection)
-        self._failing = failing
+        self._failing = None if failing is None else DocumentIdentity.of(failing)
 
-    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
-        if self._failing is None or Path(document_path) == self._failing:
+    def list_for_document(self, document: DocumentIdentity) -> list[StudyMark]:
+        if self._failing is None or document == self._failing:
             msg = "no such table: study_marks"
             raise sqlite3.OperationalError(msg)
-        return super().list_for_document(document_path)
+        return super().list_for_document(document)
 
 
 @pytest.fixture
@@ -90,7 +92,7 @@ def test_activating_a_document_shows_its_marks(
     sample_pdf: Path,
 ) -> None:
     """保存済みのマークが読み込まれてビューに載る。"""
-    mark = study_marks.create(sample_pdf, 0, 0.25, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.5)
 
     show(view, doc, sample_pdf)
     study_mark_controller.activate_document(sample_pdf)
@@ -112,8 +114,8 @@ def test_switching_documents_swaps_the_marks(
     どちらのマークも `page_index = 0` に置く。ページ番号だけでマークを
     引いていると、この検証だけが落ちる。
     """
-    a_mark = study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    b_mark = study_marks.create(two_page_pdf, 0, 0.9, 0.9)
+    a_mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    b_mark = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.9, 0.9)
 
     show(view, doc, sample_pdf)
     study_mark_controller.activate_document(sample_pdf)
@@ -137,7 +139,7 @@ def test_a_document_without_marks_shows_nothing(
     single_page_pdf: Path,
 ) -> None:
     """マークが1件も無い PDF へ切り替えたら空になる。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
     study_mark_controller.activate_document(sample_pdf)
 
@@ -155,7 +157,7 @@ def test_clearing_the_document_releases_the_marks(
     sample_pdf: Path,
 ) -> None:
     """表示対象を解除すると、対象もマークも無くなる。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
     study_mark_controller.activate_document(sample_pdf)
 
@@ -189,7 +191,7 @@ def test_refresh_reloads_the_active_document(
     study_mark_controller.activate_document(sample_pdf)
     assert list(view.study_marks) == []
 
-    added = study_marks.create(sample_pdf, 1, 0.5, 0.5)
+    added = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
     study_mark_controller.refresh()
 
     assert view.study_marks == (added,)
@@ -208,7 +210,76 @@ def test_only_the_active_document_is_queried(
     show(view, doc, sample_pdf)
     controller.activate_document(sample_pdf)
 
-    assert recording.queried == [str(sample_pdf)]
+    assert recording.queried == [document_key(sample_pdf)]
+
+
+def test_the_identity_is_fixed_when_the_document_is_opened(
+    study_mark_connection: sqlite3.Connection,
+    view: PdfView,
+    doc: DocumentController,
+    tmp_path: Path,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+) -> None:
+    """開いた後に同じパスの中身が入れ替わっても、保存先は開いた PDF のまま。
+
+    操作のたびにパスから指紋を計算し直すと、表示しているのは A なのに、
+    ディスク上の B のマークとして保存される（画面に見えない場所へ、
+    A の座標が記録される）。
+    """
+    path = tmp_path / "swapped.pdf"
+    path.write_bytes(sample_pdf.read_bytes())
+    original = DocumentIdentity.of(path)
+    repository = StudyMarkRepository(study_mark_connection)
+    controller = StudyMarkController(repository, view)
+    show(view, doc, path)
+    controller.activate_document(path)
+
+    # 表示したまま、同じパスの中身が別の PDF に置き換わった。
+    path.write_bytes(two_page_pdf.read_bytes())
+    controller.create_mark(
+        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=path
+    )
+
+    assert len(repository.list_for_document(original)) == 1
+    assert repository.list_for_document(DocumentIdentity.of(path)) == []
+    assert len(controller.study_marks) == 1
+
+
+def test_the_fingerprint_is_read_once_per_open(
+    study_mark_controller: StudyMarkController,
+    study_marks: StudyMarkRepository,
+    view: PdfView,
+    doc: DocumentController,
+    sample_pdf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """内容の指紋を計算するのは、開いたときの1回だけ。
+
+    マークを作るたびにファイル全体を読み直すと、数百 MB の PDF では
+    Ctrl + クリックのたびに画面が固まる。
+    """
+    reads: list[Path] = []
+    original = study_mark_module.document_fingerprint
+
+    def counting(path: Path | str) -> str:
+        reads.append(Path(path))
+        return original(path)
+
+    monkeypatch.setattr(study_mark_module, "document_fingerprint", counting)
+
+    show(view, doc, sample_pdf)
+    study_mark_controller.activate_document(sample_pdf)
+    assert len(reads) == 1
+
+    for index in range(3):
+        study_mark_controller.create_mark(
+            PagePosition(page_index=0, x_norm=0.1 * (index + 1), y_norm=0.5),
+            expected_document=sample_pdf,
+        )
+
+    assert len(reads) == 1
+    assert len(study_marks.list_for_document(DocumentIdentity.of(sample_pdf))) == 3
 
 
 def test_marks_are_passed_through_unchanged(
@@ -222,8 +293,8 @@ def test_marks_are_passed_through_unchanged(
 
     同じ位置のマークをまとめたり、回数を「3回以上」へ丸めたりしない。
     """
-    first = study_marks.create(sample_pdf, 0, 0.5, 0.5, note="メモ")
-    study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    first = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note="メモ")
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     for _ in range(9):
         study_marks.increment_mistake_count(first.id)
 
@@ -250,7 +321,7 @@ def test_marks_outside_the_page_range_are_still_handed_over(
     描画とヒットテストから外すのは `PdfView` の契約。同じ判断をここでも
     行うと、方針が2箇所に分かれる。
     """
-    stale = study_marks.create(single_page_pdf, 7, 0.5, 0.5)
+    stale = study_marks.create(DocumentIdentity.of(single_page_pdf), 7, 0.5, 0.5)
 
     show(view, doc, single_page_pdf)
     study_mark_controller.activate_document(single_page_pdf)
@@ -274,7 +345,7 @@ def test_a_read_failure_leaves_no_active_document(
     という状態を作らせない。失敗を「マーク0件」として黙って飲み込まない
     ことも同時に確かめる。
     """
-    a_mark = study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    a_mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     controller = StudyMarkController(
         FailingRepository(study_mark_connection, failing=two_page_pdf), view
     )
@@ -346,10 +417,12 @@ def test_a_broken_stored_row_is_a_load_failure(
     show(view, doc, sample_pdf)
     # CHECK 制約を通る値だけで、ドメインが受け付けない行を作る。TEXT 列でも
     # BLOB はそのまま入るので、note が文字列でない行になる。
+    identity = DocumentIdentity.of(sample_pdf)
     study_mark_connection.execute(
-        "INSERT INTO study_marks (document_key, page_index, x_norm, y_norm, note)"
-        " VALUES (?, 0, 0.5, 0.5, x'414243')",
-        (document_key(sample_pdf),),
+        "INSERT INTO study_marks"
+        " (document_key, document_fingerprint, page_index, x_norm, y_norm, note)"
+        " VALUES (?, ?, 0, 0.5, 0.5, x'414243')",
+        (identity.key, identity.fingerprint),
     )
 
     with pytest.raises(StudyMarkLoadError):
@@ -371,8 +444,8 @@ def test_a_programming_error_is_not_reported_as_a_load_failure(
     """
 
     class BuggyRepository(StudyMarkRepository):
-        def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
-            raise AttributeError(str(document_path))
+        def list_for_document(self, document: DocumentIdentity) -> list[StudyMark]:
+            raise AttributeError(document.key)
 
     controller = StudyMarkController(BuggyRepository(study_mark_connection), view)
     show(view, doc, sample_pdf)
@@ -393,7 +466,7 @@ def test_loading_marks_does_not_touch_the_rendering(
 
     P2-2 / P3-2 の分離を統合後も守る。
     """
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
     view.go_to_page(1)
 
@@ -447,7 +520,7 @@ def test_opening_a_pdf_loads_its_marks(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """PDF を開くと、その PDF のマークが表示される。"""
-    mark = study_marks.create(sample_pdf, 0, 0.25, 0.75)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.75)
 
     window.open_path(sample_pdf)
 
@@ -462,8 +535,8 @@ def test_switching_pdfs_never_shows_the_other_documents_marks(
     two_page_pdf: Path,
 ) -> None:
     """A → B → A の切り替えで、常に表示中の PDF のマークだけが出る。"""
-    a_mark = study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    b_mark = study_marks.create(two_page_pdf, 0, 0.9, 0.9)
+    a_mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    b_mark = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.9, 0.9)
 
     window.open_path(sample_pdf)
     assert window.view.study_marks == (a_mark,)
@@ -483,7 +556,7 @@ def test_opening_a_pdf_without_marks_clears_the_previous_ones(
     single_page_pdf: Path,
 ) -> None:
     """マークの無い PDF を開いたら、前の PDF のマークは残らない。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.open_path(single_page_pdf)
@@ -502,8 +575,8 @@ def test_marks_are_loaded_after_the_new_document_is_in_place(
     差し替えた直後の状態が空であること、つまり「新しいページ＋古い PDF の
     マーク」という中間状態が無いことを固定する。
     """
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    study_marks.create(two_page_pdf, 0, 0.9, 0.9)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.9, 0.9)
     window.open_path(sample_pdf)
 
     snapshots: list[tuple[StudyMark, ...]] = []
@@ -532,7 +605,7 @@ def test_a_failed_open_clears_the_active_document(
     既存の失敗時の振る舞い（表示を空にする）に合わせ、学習マークだけ別の
     後始末をしない。
     """
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.open_path(broken_pdf)
@@ -553,7 +626,7 @@ def test_every_kind_of_failed_open_clears_the_active_document(
     request: pytest.FixtureRequest,
 ) -> None:
     """どの失敗の仕方でも、表示対象は残らない。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.open_path(request.getfixturevalue(bad))
@@ -567,7 +640,7 @@ def test_closing_the_window_releases_the_active_document(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """ウィンドウを閉じたら、表示対象もマークも手放す。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.close()
@@ -591,7 +664,7 @@ def test_a_repository_failure_leaves_no_document_open(
     学習マークだけ別の失敗の仕方をしない。
     """
     repository = FailingRepository(study_mark_connection, failing=two_page_pdf)
-    a_mark = repository.create(sample_pdf, 0, 0.1, 0.1)
+    a_mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window = MainWindow(settings, repository)
     qtbot.addWidget(window)
 
@@ -677,7 +750,7 @@ def test_marks_survive_a_new_session(
     db = tmp_path / "session.sqlite3"
     first = database.connect(db)
     try:
-        StudyMarkRepository(first).create(sample_pdf, 0, 0.4, 0.6)
+        StudyMarkRepository(first).create(DocumentIdentity.of(sample_pdf), 0, 0.4, 0.6)
     finally:
         first.close()
 

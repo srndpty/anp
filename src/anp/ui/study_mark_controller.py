@@ -53,7 +53,7 @@ from typing import NoReturn
 
 from PySide6.QtCore import QObject, Signal
 
-from anp.storage.study_mark import StudyMark, document_key
+from anp.storage.study_mark import DocumentIdentity, StudyMark, document_key
 from anp.storage.study_mark_repository import StoredStudyMarkError, StudyMarkRepository
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_marks import PagePosition
@@ -110,6 +110,10 @@ class StudyMarkController(QObject):
         self._repository = repository
         self._view = view
         self._active_path: Path | None = None
+        # 表示中の PDF の同一性。**開いたときに1回だけ作る。** 操作のたびに
+        # パスから作り直すと、表示している PDF と保存先の PDF がずれる
+        # （表示中に同じパスが別の内容へ置き換わった場合）。
+        self._identity: DocumentIdentity | None = None
         self._marks: tuple[StudyMark, ...] = ()
 
     @property
@@ -154,23 +158,32 @@ class StudyMarkController(QObject):
         誤りは素通しする。ここで `except Exception` にすると、プログラムの
         誤りが「学習マークを読み込めませんでした」という日常的な失敗の
         見た目に化けて、fail-fast が効かなくなる。
+
+        **PDF の同一性を作るのはここだけ。** 内容の指紋はファイル全体を
+        読むので、開いたときに1回で済ませる。以後の追加・更新はこの値を
+        使うので、表示中に同じパスが別の内容へ置き換わっても、いま見えて
+        いる PDF のマークとして扱われる。
         """
         self._active_path = None
+        self._identity = None
         self._publish_marks(())
 
         try:
-            marks = self._repository.list_for_document(Path(path))
+            identity = DocumentIdentity.of(path)
+            marks = self._repository.list_for_document(identity)
         except _LOAD_ERRORS as error:
             logger.exception("failed to load study marks for %s", path)
             msg = f"failed to load study marks for {path}"
             raise StudyMarkLoadError(msg) from error
 
         self._active_path = Path(path)
+        self._identity = identity
         self._publish_marks(marks)
 
     def clear_document(self) -> None:
         """表示対象を解除し、表示中の学習マークを空にする。"""
         self._active_path = None
+        self._identity = None
         self._publish_marks(())
 
     def refresh(self) -> None:
@@ -189,11 +202,11 @@ class StudyMarkController(QObject):
         見えてしまう。表示対象は変えない（同じ PDF の読み直しなので、
         別の PDF のマークが残ることはない）。
         """
-        if self._active_path is None:
+        if self._identity is None:
             self._publish_marks(())
             return
 
-        self._publish_marks(self._repository.list_for_document(self._active_path))
+        self._publish_marks(self._repository.list_for_document(self._identity))
 
     # -------------------------------------------------- 追加・更新・削除
     def create_mark(self, position: PagePosition, *, expected_document: Path | None) -> None:
@@ -219,8 +232,11 @@ class StudyMarkController(QObject):
             msg = "the active document changed after the position was captured"
             raise StudyMarkError(msg)
 
+        # 持ち主は **開いたときに決めた同一性**。ここでパスから作り直すと、
+        # 表示中に同じパスが別の内容へ置き換わっていた場合に、いま見えて
+        # いる PDF の座標を別の PDF のマークとして保存してしまう。
         created = self._repository.create(
-            path, position.page_index, position.x_norm, position.y_norm
+            self._require_identity(), position.page_index, position.x_norm, position.y_norm
         )
         self._apply_stored(created)
 
@@ -266,6 +282,17 @@ class StudyMarkController(QObject):
             msg = "no active document"
             raise StudyMarkError(msg)
         return self._active_path
+
+    def _require_identity(self) -> DocumentIdentity:
+        """表示対象の PDF の同一性。無ければ操作させない。
+
+        `_active_path` と必ず対で入るので、ここを通るのは呼び出し側の
+        誤りのときだけ。
+        """
+        if self._identity is None:
+            msg = "no active document"
+            raise StudyMarkError(msg)
+        return self._identity
 
     def _require_owned(self, mark_id: int) -> None:
         """その ID が **表示中の PDF の** マークであることを確かめる。

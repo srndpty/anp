@@ -9,21 +9,19 @@ SQL をここに閉じ込め、UI からは `StudyMarkRepository` 越しに扱�
 アトミック性を得ている（`RETURNING` を使い、読み取ってから書き戻す
 2 段構えを避ける）。
 
-ドキュメントの同一性は **パス（`document_key()`）と内容の指紋
-（`document_fingerprint()`）の組**で決まる。そのため `create()` と
-`list_for_document()` はファイルを読む。読めなければ `OSError` がそのまま
-出る（`sqlite3.Error` と同じく、想定された失敗経路として扱う）。
+ドキュメントの同一性は **`DocumentIdentity`（パスと内容の指紋の組）** で
+決まる。この class はファイルを読まない。同一性を作るのは PDF を開いた
+1回だけで（`DocumentIdentity.of()`）、以後の操作はその値を持ち回す。
+操作のたびにパスから計算し直すと、表示中の PDF と保存先の PDF がずれる。
 """
 
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 from anp.storage.study_mark import (
+    DocumentIdentity,
     StudyMark,
-    document_fingerprint,
-    document_key,
     validate_note,
     validate_position,
 )
@@ -82,7 +80,7 @@ class StudyMarkRepository:
 
     def create(
         self,
-        document_path: Path | str,
+        document: DocumentIdentity,
         page_index: int,
         x_norm: float,
         y_norm: float,
@@ -93,11 +91,11 @@ class StudyMarkRepository:
         「マークを作る＝最初に間違えた」なので `mistake_count` は必ず 1 から
         始まる。呼び出し側に初期値を選ばせない。
 
-        **作った時点の内容の指紋も一緒に残す。** これが無いと、同じパスの
-        PDF が別の内容へ差し替えられたときに見分けられない。
+        **持ち主は呼び出し側が渡した `DocumentIdentity`。** ここでパスから
+        指紋を計算し直さない。表示しているのは開いた時点の PDF なので、
+        その間に同じパスが別の内容へ置き換わっていても、いま画面に見えて
+        いるものの持ち主として保存する。
         """
-        key = document_key(document_path)
-        fingerprint = document_fingerprint(document_path)
         validate_position(page_index, x_norm, y_norm)
         validate_note(note)
 
@@ -106,7 +104,14 @@ class StudyMarkRepository:
             " (document_key, document_fingerprint, page_index, x_norm, y_norm,"
             " mistake_count, note)"
             f" VALUES (?, ?, ?, ?, ?, 1, ?) RETURNING {_COLUMNS}",
-            (key, fingerprint, page_index, float(x_norm), float(y_norm), note),
+            (
+                document.key,
+                document.fingerprint,
+                page_index,
+                float(x_norm),
+                float(y_norm),
+                note,
+            ),
         ).fetchone()
         return _to_study_mark(row)
 
@@ -119,7 +124,7 @@ class StudyMarkRepository:
         ).fetchone()
         return None if row is None else _to_study_mark(row)
 
-    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
+    def list_for_document(self, document: DocumentIdentity) -> list[StudyMark]:
         """指定した PDF の学習マークをすべて返す。
 
         並び順はページ順、同じページ内は作成順（id）。読み順（y 座標順など）は
@@ -131,13 +136,11 @@ class StudyMarkRepository:
         指紋が NULL の行（マイグレーション2 より前に作られた分）はそのまま
         返す。内容が分からないものを、確かめずに切り離さないため。
         """
-        key = document_key(document_path)
-        fingerprint = document_fingerprint(document_path)
         rows = self._connection.execute(
             f"SELECT {_COLUMNS} FROM study_marks WHERE document_key = ?"
             " AND (document_fingerprint IS NULL OR document_fingerprint = ?)"
             " ORDER BY page_index, id",
-            (key, fingerprint),
+            (document.key, document.fingerprint),
         ).fetchall()
         return [_to_study_mark(row) for row in rows]
 

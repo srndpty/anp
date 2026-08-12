@@ -32,6 +32,7 @@ from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.destination import PdfDestination, clamp_to_page
 from anp.pdf.document import DocumentController
+from anp.storage.study_mark import DocumentIdentity
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView, ZoomMode
@@ -699,7 +700,7 @@ def test_clicking_an_item_does_not_touch_marks_or_history(
     window: MainWindow, study_marks: StudyMarkRepository, outline_pdf: Path
 ) -> None:
     """目次の移動は学習マークにも履歴にも設定にも触らない。"""
-    mark = study_marks.create(outline_pdf, 1, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(outline_pdf), 1, 0.5, 0.5)
     window.open_path(outline_pdf)
     recent = window.recent_files
     marks_filter = window.study_mark_sidebar.mark_filter
@@ -710,7 +711,7 @@ def test_clicking_an_item_does_not_touch_marks_or_history(
     assert window.view.study_marks == (mark,)
     assert window.study_mark_sidebar.rows == (mark,)
     assert window.study_mark_sidebar.mark_filter == marks_filter
-    assert study_marks.list_for_document(outline_pdf) == [mark]
+    assert study_marks.list_for_document(DocumentIdentity.of(outline_pdf)) == [mark]
 
 
 def test_an_out_of_range_destination_is_reported_in_the_status_bar(

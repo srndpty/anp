@@ -27,6 +27,7 @@ from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
 from anp.pdf.document import DocumentController
+from anp.storage.study_mark import DocumentIdentity
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import ZoomMode
@@ -266,7 +267,7 @@ def test_clicking_a_recent_item_opens_it(
     ドキュメント・学習マーク・一覧のどれも、専用の経路ではなく
     `open_path()` から載る。
     """
-    mark = study_marks.create(sample_pdf, 1, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
     window.open_path(sample_pdf)
     window.open_path(other_pdf)
 
@@ -365,7 +366,7 @@ def test_clearing_the_recent_files_keeps_everything_else(
     window: MainWindow, sample_pdf: Path, backend: QSettings, study_marks: StudyMarkRepository
 ) -> None:
     """クリアは履歴だけを空にする。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.open_path(sample_pdf)
     last_directory = window._settings.last_directory  # noqa: SLF001
 
@@ -575,7 +576,7 @@ def test_the_study_marks_are_restored_with_the_document(
     qtbot: QtBot, ini: str, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """自動復元でも学習マークがオーバーレイと一覧に載る。"""
-    mark = study_marks.create(sample_pdf, 1, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
     first = make_window(qtbot, ini, study_marks)
     first.open_path(sample_pdf)
     first.close()

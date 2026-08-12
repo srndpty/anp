@@ -32,6 +32,8 @@ _FINGERPRINT_CHUNK_BYTES = 1024 * 1024
 # SHA-256 の16進表記の長さ。スキーマの CHECK と揃える。
 FINGERPRINT_LENGTH = 64
 
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
 
 def document_key(path: Path | str) -> str:
     """PDF を識別する文字列を、パスの表記揺れを吸収して組み立てる。
@@ -78,13 +80,45 @@ def document_fingerprint(path: Path | str) -> str:
 
 
 def validate_fingerprint(fingerprint: str) -> None:
-    """指紋が SHA-256 の16進表記であることを確かめる。"""
+    """指紋が SHA-256 の16進表記であることを確かめる。
+
+    長さだけでなく文字種まで見る。長さしか見ないと、`"x" * 64` のような
+    値が「壊れたデータ」ではなく「たまたま一致しない指紋」として通り、
+    学習マークが黙って消えたように見える。
+    """
     if not isinstance(fingerprint, str):
         msg = f"fingerprint must be str, got {type(fingerprint).__name__}"
         raise TypeError(msg)
-    if len(fingerprint) != FINGERPRINT_LENGTH:
-        msg = f"fingerprint must be {FINGERPRINT_LENGTH} characters, got {len(fingerprint)}"
+    if len(fingerprint) != FINGERPRINT_LENGTH or not _HEX_DIGITS.issuperset(fingerprint):
+        msg = f"fingerprint must be {FINGERPRINT_LENGTH} lowercase hex digits, got {fingerprint!r}"
         raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentIdentity:
+    """学習マークの持ち主を決める、PDF の同一性。
+
+    パス（表記揺れを吸収した `document_key()`）と内容の指紋の組。
+
+    **PDF を開いた時点で1回だけ作り、以後はこれを持ち回す。** 操作のたびに
+    パスから計算し直すと、開いている PDF と保存先の PDF がずれる。例えば
+    A を表示している最中に外部で同じパスへ B が置かれると、Ctrl + クリック
+    で作ったマークは「A の座標」なのに「B のマーク」として保存される。
+    ファイル全体のハッシュを操作のたびに計算しないので、数百 MB の PDF でも
+    マークの作成が待たされない、という効果もある。
+    """
+
+    key: str
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        validate_document_key(self.key)
+        validate_fingerprint(self.fingerprint)
+
+    @classmethod
+    def of(cls, path: Path | str) -> DocumentIdentity:
+        """PDF を1回読んで同一性を作る。読めなければ `OSError`。"""
+        return cls(key=document_key(path), fingerprint=document_fingerprint(path))
 
 
 def validate_document_key(key: str) -> None:
