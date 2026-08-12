@@ -16,6 +16,7 @@ from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
 from anp.pdf.color import PageColorMode
+from anp.pdf.layout import InvalidPageGeometryError
 from anp.pdf.render import PageRenderService, PageRequest
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.appearance import CanvasTheme, UiTheme
@@ -273,6 +274,59 @@ def test_every_kind_of_failure_is_reported_and_clears_the_view(
     assert opened.view.page_count == 0
     assert len(warnings) == 1
     assert warnings[0].strip() != ""
+
+
+def test_a_broken_page_geometry_leaves_no_document(
+    opened: MainWindow,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+    warnings: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ページ寸法が壊れていて表示を組み立てられなくても、状態を混ぜない。
+
+    `QPdfDocument.load()` は成功しているので、ここで抜けると「ドキュメントは
+    新しい PDF、表示は前の PDF」という組み合わせが残る。
+    """
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise InvalidPageGeometryError("ページ 1 の高さが不正です（0.0）")
+
+    monkeypatch.setattr(opened.view, "set_document", broken)
+
+    opened.open_path(two_page_pdf)
+
+    assert not opened.view.has_document
+    assert opened.view.page_count == 0
+    assert opened.windowTitle() == "anp"
+    assert opened.document_status_text == "PDF が開かれていません"
+    assert len(warnings) == 1
+    assert "ページ 1 の高さが不正" in warnings[0]
+
+    # 後始末が済んでいるので、次の PDF は普通に開ける。
+    monkeypatch.undo()
+    opened.open_path(sample_pdf)
+    assert opened.view.page_count == 3
+
+
+def test_a_broken_page_geometry_does_not_keep_the_old_marks(
+    opened: MainWindow,
+    two_page_pdf: Path,
+    warnings: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """表示を組み立てられなかった PDF は、学習マークの表示対象にもしない。"""
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise InvalidPageGeometryError("ページ 1 の幅が不正です（nan）")
+
+    monkeypatch.setattr(opened.view, "set_document", broken)
+
+    opened.open_path(two_page_pdf)
+
+    assert opened.study_marks.active_document_path is None
+    assert opened.view.study_marks == ()
+    assert warnings
 
 
 def test_a_missing_file_is_reported(

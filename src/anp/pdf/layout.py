@@ -23,6 +23,23 @@ from itertools import accumulate
 from PySide6.QtCore import QPointF, QRectF, QSizeF
 
 
+class InvalidPageGeometryError(ValueError):
+    """PDF のページ寸法がレイアウトできる値ではなかった。
+
+    **これは壊れた PDF、つまり想定された失敗経路**なので、呼び出し側が
+    プログラミングの誤りと区別できるよう専用の型にする。素の `ValueError`
+    だと、開く手順の後始末がどこまでを「利用者に知らせる失敗」として
+    扱うべきか決められない。
+
+    `ValueError` を継承しているのは、値の契約違反であることに変わりは
+    ないため。`message` は利用者にそのまま見せられる日本語であること。
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 @dataclass(frozen=True, slots=True)
 class LayoutMetrics:
     """ズームの影響を受けない配置の寸法（論理ピクセル）。
@@ -59,7 +76,7 @@ def _validate_page_extent(value: float, index: int, name: str) -> None:
     """
     if not math.isfinite(value) or value <= 0:
         msg = f"ページ {index + 1} の{name}が不正です（{value!r}）"
-        raise ValueError(msg)
+        raise InvalidPageGeometryError(msg)
 
 
 class PageLayout:

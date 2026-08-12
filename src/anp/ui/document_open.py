@@ -22,6 +22,7 @@ from pathlib import Path
 
 from anp.core.settings import Settings
 from anp.pdf.document import DocumentController, DocumentError
+from anp.pdf.layout import InvalidPageGeometryError
 from anp.ui.pdf_search_controller import PdfSearchController
 from anp.ui.pdf_view import PdfView
 from anp.ui.search_dock import SearchDock
@@ -84,6 +85,11 @@ class DocumentOpenCoordinator:
     def open(self, path: Path) -> OpenFailure | None:
         """PDF を開く。開けたら None、開けなかったら理由を返す。
 
+        **途中のどこで失敗しても「PDF なし」まで戻す。** 差し替えは
+        ドキュメント・ビュー・学習マーク・目次・検索の5つに跨るので、
+        どれか1つで抜けると「ドキュメントは B、表示は A」のように
+        混ざった状態が残る。
+
         `DocumentController.open()` は失敗時に前のドキュメントも閉じるので、
         表示だけ古い PDF のまま残すと、見えている内容と実体がずれる。
         学習マークも同じ理由で、失敗時は表示対象ごと解除する。
@@ -111,10 +117,23 @@ class DocumentOpenCoordinator:
             self.clear()
             return OpenFailure(title=_OPEN_ERROR_TITLE, body=error.message)
 
-        self._settings.last_directory = str(path.parent)
-        self._view.set_document(self._document.document, self._document.page_sizes())
+        # **`open()` が成功した時点から後始末の内側。** ここから先で失敗すると
+        # `DocumentController` の `QPdfDocument` は新しい PDF に切り替わって
+        # いるので、途中で抜けると「ドキュメントは B、表示は A」という
+        # 混ざった状態が残る。例えばページ寸法が壊れた PDF では
+        # `set_document()` がレイアウトの構築で失敗する。
         try:
+            self._view.set_document(self._document.document, self._document.page_sizes())
             self._study_marks.activate_document(path)
+            # 目次と検索を載せるのは **他がすべて成功した後**。中止する経路は
+            # すべて `close()` を通るので、古い PDF の目次や検索結果が残る
+            # ことはない。検索語と入力欄は読み込みの前に空にしてあるので、
+            # A の検索語のまま B の件数が出ることもない。
+            self._toc.set_document(self._document.document)
+            self._search.attach_document(self._document.document)
+        except InvalidPageGeometryError as error:
+            self.close()
+            return OpenFailure(title=_OPEN_ERROR_TITLE, body=error.message)
         except StudyMarkLoadError:
             self.close()
             return OpenFailure(title=_MARK_LOAD_ERROR_TITLE, body=_MARK_LOAD_ERROR)
@@ -124,14 +143,8 @@ class DocumentOpenCoordinator:
             self.close()
             raise
 
-        # 目次を載せるのは **開く操作が最後まで成功した後**。途中で中止する
-        # 経路（PDF が読めない・学習マークが読めない）はすべて `clear()` を
-        # 通るので、古い PDF の目次が残ることはない。
-        self._toc.set_document(self._document.document)
-        # 検索も目次と同じ扱い。**開く操作が最後まで成功した後**に載せる。
-        # 検索語と入力欄は読み込みの前に空にしてあるので、A の検索語のまま
-        # B の件数が出ることはない。
-        self._search.attach_document(self._document.document)
+        # 「最後にファイルを開いたディレクトリ」も開けたときだけ覚える。
+        self._settings.last_directory = str(path.parent)
         return None
 
     def clear(self) -> None:
