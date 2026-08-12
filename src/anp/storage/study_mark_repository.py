@@ -26,7 +26,7 @@ from anp.storage.study_mark import (
     validate_position,
 )
 
-_COLUMNS = "id, document_key, page_index, x_norm, y_norm, mistake_count, note"
+_COLUMNS = "id, document_key, document_fingerprint, page_index, x_norm, y_norm, mistake_count, note"
 
 
 class StoredStudyMarkError(RuntimeError):
@@ -50,6 +50,7 @@ def _to_study_mark(row: sqlite3.Row) -> StudyMark:
         return StudyMark(
             id=row["id"],
             document_key=row["document_key"],
+            document_fingerprint=row["document_fingerprint"],
             page_index=row["page_index"],
             x_norm=row["x_norm"],
             y_norm=row["y_norm"],

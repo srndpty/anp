@@ -193,6 +193,14 @@ class StudyMark:
     y_norm: float
     mistake_count: int
     note: str | None
+    document_fingerprint: str | None = None
+    """作られた時点の内容の指紋。マイグレーション2 より前の行は None。
+
+    持ち主の判定に使うのは `list_for_document()` の絞り込みなので、ここに
+    持つのは **保存されている値を検証の対象に載せるため**。長さだけ合った
+    でたらめな文字列が入っていても、「指紋が一致しないマーク」として黙って
+    消えたように見えるのではなく、保存データの不整合として気づける。
+    """
 
     def __post_init__(self) -> None:
         _validate_index(self.id, "id")
@@ -200,6 +208,8 @@ class StudyMark:
             msg = f"id must be > 0, got {self.id}"
             raise ValueError(msg)
         validate_document_key(self.document_key)
+        if self.document_fingerprint is not None:
+            validate_fingerprint(self.document_fingerprint)
         validate_position(self.page_index, self.x_norm, self.y_norm)
         _validate_index(self.mistake_count, "mistake_count")
         if self.mistake_count < 1:

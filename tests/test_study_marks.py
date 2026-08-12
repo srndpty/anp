@@ -15,8 +15,14 @@ from pathlib import Path
 import pytest
 
 from anp.storage import database
-from anp.storage.study_mark import DocumentIdentity, StudyMark, document_fingerprint, document_key
-from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.storage.study_mark import (
+    DocumentIdentity,
+    StudyMark,
+    document_fingerprint,
+    document_key,
+    validate_fingerprint,
+)
+from anp.storage.study_mark_repository import StoredStudyMarkError, StudyMarkRepository
 
 
 @pytest.fixture
@@ -100,6 +106,34 @@ def test_the_fingerprint_of_a_missing_file_fails(tmp_path: Path) -> None:
     """読めないファイルの指紋は作れない（黙って既定値にしない）。"""
     with pytest.raises(OSError):
         document_fingerprint(tmp_path / "gone.pdf")
+
+
+@pytest.mark.parametrize("value", ["", "abc", "x" * 64, "A" * 64, "0" * 63, "0" * 65])
+def test_a_value_that_is_not_a_sha256_is_rejected(value: str) -> None:
+    """長さだけ合った文字列を指紋として受け付けない。
+
+    長さしか見ないと、`"x" * 64` のような値が「壊れたデータ」ではなく
+    「たまたま一致しない指紋」として通り、マークが黙って消えたように見える。
+    """
+    with pytest.raises(ValueError, match="fingerprint"):
+        validate_fingerprint(value)
+
+
+def test_a_stored_fingerprint_that_is_not_a_sha256_is_a_data_error(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """保存されていた指紋が壊れていたら、保存データの不整合として気づける。
+
+    スキーマの CHECK は長さしか見ないので、ここをすり抜ける値は入りうる。
+    黙って「一致しないマーク」として消すと、記録が失われたように見える。
+    """
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute(
+        "UPDATE study_marks SET document_fingerprint = ? WHERE id = ?", ("x" * 64, mark.id)
+    )
+
+    with pytest.raises(StoredStudyMarkError):
+        repository.get(mark.id)
 
 
 # ---------------------------------------------------------------- ドメインモデル
