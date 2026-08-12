@@ -11,6 +11,9 @@ from PySide6.QtCore import QByteArray, QSettings
 
 from anp.core.settings import Settings
 
+# 内容の指紋の代わり（書式だけ満たす値）。設定は書式を検証しない。
+FINGERPRINT = "0" * 64
+
 
 def test_unset_values_return_defaults(settings: Settings) -> None:
     """未保存のキーは None または空文字を返す。"""
@@ -210,7 +213,7 @@ def test_the_session_round_trips(tmp_path: Path) -> None:
     """読んでいた PDF と位置を読み戻せる。"""
     ini = str(tmp_path / "settings.ini")
     first = Settings(QSettings(ini, QSettings.Format.IniFormat))
-    first.set_last_session(r"C:\books\a.pdf", 42, 0.65)
+    first.set_last_session(r"C:\books\a.pdf", FINGERPRINT, 42, 0.65)
     first.sync()
 
     second = Settings(QSettings(ini, QSettings.Format.IniFormat))
@@ -223,7 +226,7 @@ def test_clearing_the_session_forgets_everything(tmp_path: Path) -> None:
     """セッションを忘れると、復元対象も位置も既定へ戻る。"""
     ini = str(tmp_path / "settings.ini")
     first = Settings(QSettings(ini, QSettings.Format.IniFormat))
-    first.set_last_session(r"C:\books\a.pdf", 42, 0.65)
+    first.set_last_session(r"C:\books\a.pdf", FINGERPRINT, 42, 0.65)
     first.clear_last_session()
     first.sync()
 
@@ -239,7 +242,7 @@ def test_clearing_the_session_keeps_the_other_settings(tmp_path: Path) -> None:
     settings = Settings(backend)
     settings.last_directory = r"C:\books"
     settings.recent_files = [r"C:\books\a.pdf"]
-    settings.set_last_session(r"C:\books\a.pdf", 3, 0.5)
+    settings.set_last_session(r"C:\books\a.pdf", FINGERPRINT, 3, 0.5)
 
     settings.clear_last_session()
 
@@ -265,7 +268,7 @@ def test_the_session_is_stored_under_a_single_key(tmp_path: Path) -> None:
     組み合わせが残りうる。API がまとまっているだけでは防げない。
     """
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    Settings(backend).set_last_session(r"C:\books\a.pdf", 42, 0.65)
+    Settings(backend).set_last_session(r"C:\books\a.pdf", FINGERPRINT, 42, 0.65)
 
     assert [key for key in backend.allKeys() if key.startswith("session/")] == ["session/last"]
 
@@ -308,7 +311,7 @@ def test_saving_moves_the_session_out_of_the_previous_format(tmp_path: Path) -> 
     backend.setValue("session/document", r"C:\books\old.pdf")
     settings = Settings(backend)
 
-    settings.set_last_session(r"C:\books\new.pdf", 1, 0.5)
+    settings.set_last_session(r"C:\books\new.pdf", FINGERPRINT, 1, 0.5)
     assert settings.last_document == r"C:\books\new.pdf"
 
     settings.clear_last_session()
@@ -375,10 +378,10 @@ def test_the_session_boundary_values_are_accepted(tmp_path: Path) -> None:
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     settings = Settings(backend)
 
-    settings.set_last_session(r"C:\a.pdf", 0, 0.0)
+    settings.set_last_session(r"C:\a.pdf", FINGERPRINT, 0, 0.0)
     assert settings.last_y_norm == pytest.approx(0.0)
 
-    settings.set_last_session(r"C:\a.pdf", 0, 1.0)
+    settings.set_last_session(r"C:\a.pdf", FINGERPRINT, 0, 1.0)
     assert settings.last_y_norm == pytest.approx(1.0)
 
 

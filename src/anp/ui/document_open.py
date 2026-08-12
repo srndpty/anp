@@ -83,6 +83,15 @@ class DocumentOpenCoordinator:
         """いま開いている PDF のパス。無ければ None。"""
         return self._document.path
 
+    @property
+    def content_fingerprint(self) -> str | None:
+        """いま開いている PDF の内容の指紋。無ければ None。
+
+        読み込みの直後に取った値。前回のセッションの保存にも使うので、
+        `DocumentController` を直接触らずに済むよう、ここで中継する。
+        """
+        return self._document.content_fingerprint
+
     def open(self, path: Path) -> OpenFailure | None:
         """PDF を開く。開けたら None、開けなかったら理由を返す。
 

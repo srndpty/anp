@@ -803,7 +803,7 @@ class MainWindow(QMainWindow):
                 self._set_recent(remove_recent(self._recent, path))
             return
 
-        self._session.restore_position()
+        self._session.restore_position(self._open.content_fingerprint)
 
     def _restore_zoom(self) -> None:
         """保存された倍率モードと手動倍率を復元する。
@@ -873,7 +873,7 @@ class MainWindow(QMainWindow):
         """
         # 表示を捨てる前に読書位置を取る。`clear_document()` の後では
         # 現在ページもスクロール位置も失われている。
-        self._session.save(self._controller.path)
+        self._session.save(self._open.path, self._open.content_fingerprint)
 
         self._settings.window_geometry = self.saveGeometry()
         self._settings.window_state = self.saveState()

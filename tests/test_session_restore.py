@@ -25,6 +25,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMenu
 from pytestqt.qtbot import QtBot
 
+from anp.core.fingerprint import file_fingerprint
 from anp.core.settings import Settings
 from anp.pdf.document import DocumentController
 from anp.storage.study_mark import DocumentIdentity
@@ -47,17 +48,41 @@ def backend(ini: str) -> QSettings:
     return QSettings(ini, QSettings.Format.IniFormat)
 
 
+_CURRENT_CONTENT = object()
+
+
 def set_session(
-    backend: QSettings, document: object, *, page: object = 0, y_norm: object = 0.0
+    backend: QSettings,
+    document: object,
+    *,
+    page: object = 0,
+    y_norm: object = 0.0,
+    fingerprint: object = _CURRENT_CONTENT,
 ) -> None:
     """前回のセッションを直接仕込む（壊れた値も含めてそのまま書く）。
 
-    3つの値は1つの鍵に JSON でまとまっているので、テストからも同じ形で
-    書き込む。書いたら `sync()` するのは呼び出し側。
+    値は1つの鍵に JSON でまとまっているので、テストからも同じ形で書き込む。
+    書いたら `sync()` するのは呼び出し側。
+
+    `fingerprint` の既定は「いまのファイルの内容」。位置の復元は指紋が
+    一致したときだけ起きるので、指定しない限り「同じ PDF を開き直した」
+    という普通の状況になる。読めないパスなら None（指紋なし）。
     """
+    if fingerprint is _CURRENT_CONTENT:
+        try:
+            fingerprint = file_fingerprint(str(document))
+        except OSError:
+            fingerprint = None
     backend.setValue(
         "session/last",
-        json.dumps({"document": document, "page_index": page, "y_norm": y_norm}),
+        json.dumps(
+            {
+                "document": document,
+                "fingerprint": fingerprint,
+                "page_index": page,
+                "y_norm": y_norm,
+            }
+        ),
     )
 
 
@@ -803,6 +828,77 @@ def test_a_page_beyond_the_document_falls_back_to_the_top(
         window.close()
 
 
+def test_a_replaced_document_opens_at_the_top(
+    qtbot: QtBot,
+    ini: str,
+    backend: QSettings,
+    study_marks: StudyMarkRepository,
+    tmp_path: Path,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+) -> None:
+    """同じパスの中身が入れ替わっていたら、前回の位置へは戻さない。
+
+    パスだけで位置を戻すと、別の本の同じページ番号へ飛ぶ。ページ数が
+    足りている場合は「戻れなかった」ことにも気づけない。
+    """
+    path = tmp_path / "book.pdf"
+    path.write_bytes(sample_pdf.read_bytes())
+    set_session(backend, str(path), page=2, y_norm=0.5)
+    backend.sync()
+    # 次の起動までに、同じパスの中身が別の PDF に置き換わった。
+    path.write_bytes(two_page_pdf.read_bytes())
+
+    window = make_window(qtbot, ini, study_marks)
+    try:
+        assert window.view.has_document
+        assert window.view.current_page == 0
+        assert window.view.verticalScrollBar().value() == 0
+    finally:
+        window.close()
+
+
+def test_the_same_document_still_restores_the_position(
+    qtbot: QtBot,
+    ini: str,
+    backend: QSettings,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+) -> None:
+    """中身が同じなら、これまでどおり位置まで戻る。"""
+    set_session(backend, str(sample_pdf), page=2, y_norm=0.0)
+    backend.sync()
+
+    window = make_window(qtbot, ini, study_marks)
+    try:
+        assert window.view.current_page == 2
+    finally:
+        window.close()
+
+
+def test_a_session_without_a_fingerprint_opens_at_the_top(
+    qtbot: QtBot,
+    ini: str,
+    backend: QSettings,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+) -> None:
+    """内容を記録していないセッションでは、位置を戻さず先頭から開く。
+
+    同じ内容だと確かめられない以上、読んでいない場所へ飛ばすより、
+    先頭から読み直せる方を選ぶ（fail-closed）。PDF 自体は開く。
+    """
+    set_session(backend, str(sample_pdf), page=2, y_norm=0.5, fingerprint=None)
+    backend.sync()
+
+    window = make_window(qtbot, ini, study_marks)
+    try:
+        assert window.view.has_document
+        assert window.view.current_page == 0
+    finally:
+        window.close()
+
+
 def test_an_invalid_last_document_type_is_ignored(
     qtbot: QtBot, ini: str, backend: QSettings, study_marks: StudyMarkRepository
 ) -> None:
@@ -844,7 +940,7 @@ def test_saving_the_session_does_not_touch_the_render_state(
     render = window.view._render  # noqa: SLF001
     generation = render.generation
 
-    window._session.save(window._open.path)  # noqa: SLF001
+    window._session.save(window._open.path, window._open.content_fingerprint)  # noqa: SLF001
 
     assert render.generation == generation
     assert window.view.has_document

@@ -39,16 +39,32 @@ class ReadingSession:
         stored = self._settings.last_document
         return Path(stored) if stored else None
 
-    def restore_position(self) -> None:
+    def restore_position(self, fingerprint: str | None) -> None:
         """保存された読書位置まで戻る。戻れなければ先頭のまま。
 
         **呼ぶのは PDF を開いた後、倍率が決まった後。** 順序を逆にすると、
         フィットの計算がここで決めたスクロール位置を動かす。
 
+        `fingerprint` は **いま開いている PDF の内容の指紋**
+        （`DocumentController.content_fingerprint`）。保存された指紋と
+        一致しなければ位置は戻さない。同じパスでも中身が違えば「120 ページ目の
+        途中」に意味は無く、読んでいない場所へ飛ばすことになる。
+
+        指紋を持たないセッション（1つ前の保存形式）も戻さない。同じ内容だと
+        確かめられない以上、先頭から読み直せる方を選ぶ（fail-closed）。
+
         差し替えでページ数が減っていた場合は、最終ページへ丸めずに文書の
         先頭で開く。セッションの位置は過去の読書状態のヒントでしかないので、
         存在しない位置を無理に解釈しない（学習マークの移動とは扱いが違う）。
         """
+        stored = self._settings.last_fingerprint
+        if stored is None:
+            logger.info("the last session has no fingerprint; starting at the top")
+            return
+        if stored != fingerprint:
+            logger.info("the document changed since the last session; starting at the top")
+            return
+
         position = ReadingPosition(
             page_index=self._settings.last_page_index,
             y_norm=self._settings.last_y_norm,
@@ -56,11 +72,15 @@ class ReadingSession:
         if not self._view.restore_reading_position(position):
             logger.info("saved reading position is outside the document: %s", position)
 
-    def save(self, path: Path | None) -> None:
+    def save(self, path: Path | None, fingerprint: str | None) -> None:
         """いま読んでいる PDF と位置を、次回の起動のために覚える。
 
         **呼ぶのは表示を捨てる前。** 後では現在ページもスクロール位置も
         失われている。
+
+        内容の指紋も一緒に残す（`DocumentController.content_fingerprint`）。
+        パスだけだと、次の起動までに同じパスの中身が入れ替わっていた場合に、
+        別の本の同じページ番号へ飛んでしまう。
 
         PDF を開いていない状態で終了したときは忘れる。閉じたはずの PDF が
         次回また勝手に開くのを避けるため。倍率は既存の設定
@@ -71,7 +91,9 @@ class ReadingSession:
         if path is None or position is None:
             self.forget()
             return
-        self._settings.set_last_session(str(path), position.page_index, position.y_norm)
+        self._settings.set_last_session(
+            str(path), fingerprint, position.page_index, position.y_norm
+        )
 
     def forget(self) -> None:
         """前回のセッションを忘れる。

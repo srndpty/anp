@@ -34,6 +34,7 @@ from PySide6.QtPdf import QPdfDocument, QPdfLink, QPdfSearchModel
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 from pytestqt.qtbot import QtBot
 
+from anp.core.fingerprint import file_fingerprint
 from anp.core.settings import Settings
 from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
@@ -1400,7 +1401,7 @@ def test_an_automatic_restore_attaches_the_search_model(
 ) -> None:
     """自動復元で開いた PDF にも検索モデルが載る。検索語は復元しない。"""
     settings = Settings(QSettings(str(tmp_path / "restore.ini"), QSettings.Format.IniFormat))
-    settings.set_last_session(str(searchable_pdf), 0, 0.0)
+    settings.set_last_session(str(searchable_pdf), file_fingerprint(searchable_pdf), 0, 0.0)
 
     window = MainWindow(settings, study_marks)
     qtbot.addWidget(window)

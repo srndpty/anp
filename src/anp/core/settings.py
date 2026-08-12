@@ -32,6 +32,7 @@ _KEY_UI_THEME = "ui/theme"
 _KEY_SESSION = "session/last"
 
 _FIELD_DOCUMENT = "document"
+_FIELD_FINGERPRINT = "fingerprint"
 _FIELD_PAGE_INDEX = "page_index"
 _FIELD_Y_NORM = "y_norm"
 
@@ -172,6 +173,18 @@ class Settings:
         return value if isinstance(value, str) else ""
 
     @property
+    def last_fingerprint(self) -> str | None:
+        """前回終了時に開いていた PDF の内容の指紋。無ければ None。
+
+        **同じパスでも中身が違えば、前回の位置は意味を持たない。** 復元する
+        側がこれと現在の指紋を突き合わせる。旧形式で保存されたセッションには
+        入っていないので None になる。値の書式の検証は呼び出し側
+        （`anp.core.fingerprint`）に任せ、ここは文字列かどうかだけを見る。
+        """
+        value = self._session().get(_FIELD_FINGERPRINT)
+        return value if isinstance(value, str) and value else None
+
+    @property
     def last_page_index(self) -> int:
         """前回終了時に読んでいたページ（0 始まり）。読めなければ先頭。
 
@@ -218,7 +231,9 @@ class Settings:
             return DEFAULT_SESSION_Y_NORM
         return y_norm
 
-    def set_last_session(self, document: str, page_index: int, y_norm: float) -> None:
+    def set_last_session(
+        self, document: str, fingerprint: str | None, page_index: int, y_norm: float
+    ) -> None:
         """前回のセッションを丸ごと保存する。
 
         **3つの値は1つの鍵へ1回で書く。** API をまとめただけでは、パスだけ
@@ -236,6 +251,7 @@ class Settings:
             json.dumps(
                 {
                     _FIELD_DOCUMENT: document,
+                    _FIELD_FINGERPRINT: fingerprint,
                     _FIELD_PAGE_INDEX: page_index,
                     _FIELD_Y_NORM: y_norm,
                 }
