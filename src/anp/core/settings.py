@@ -35,6 +35,12 @@ _FIELD_DOCUMENT = "document"
 _FIELD_PAGE_INDEX = "page_index"
 _FIELD_Y_NORM = "y_norm"
 
+# 1つの鍵にまとめる前の形式。**読むだけ**（書き戻すことはない）。
+# 設定は消えても再設定すれば済むが、これは「前回どこまで読んだか」なので、
+# 更新した最初の1回だけ前回位置を失うのは避ける。新しい形式で1度保存すれば
+# 消えるので、次のスキーマ変更のときに一緒に落とす。
+_LEGACY_SESSION_KEYS = ("session/document", "session/page_index", "session/y_norm")
+
 # キーボードショートカットは `shortcuts/<command-id>` に1コマンド1件で置く。
 # コマンド ID を決めるのは UI 層で、`core` は文字列として読み書きするだけ。
 _KEY_SHORTCUT_PREFIX = "shortcuts/"
@@ -119,10 +125,12 @@ class Settings:
 
         3つの値は1つの JSON にまとめて入っている。読めない値が1つあっても
         セッション全体を捨てはしない（各 property が既定値へ落とす）。
+
+        新しい鍵が無ければ、旧形式の3つの鍵から読む（`_legacy_session()`）。
         """
         value = self._backend.value(_KEY_SESSION)
         if value is None:
-            return {}
+            return self._legacy_session()
         if not isinstance(value, str):
             logger.warning("ignoring non-string session value: %r", value)
             return {}
@@ -135,6 +143,23 @@ class Settings:
             logger.warning("ignoring non-object session value: %r", parsed)
             return {}
         return parsed
+
+    def _legacy_session(self) -> dict[str, object]:
+        """1つの鍵にまとめる前の形式で保存されていた前回のセッション。
+
+        更新した最初の1回で前回位置を失わないためだけの経路。値の検証は
+        新しい形式と共通（各 property が既定値へ落とす）。次に保存した
+        時点で新しい鍵へ移り、旧形式の鍵は消える。
+        """
+        document, page_index, y_norm = _LEGACY_SESSION_KEYS
+        if not self._backend.contains(document):
+            return {}
+        logger.info("reading the last session from the pre-JSON keys")
+        return {
+            _FIELD_DOCUMENT: self._backend.value(document),
+            _FIELD_PAGE_INDEX: self._backend.value(page_index, DEFAULT_SESSION_PAGE_INDEX),
+            _FIELD_Y_NORM: self._backend.value(y_norm, DEFAULT_SESSION_Y_NORM),
+        }
 
     @property
     def last_document(self) -> str:
@@ -201,6 +226,9 @@ class Settings:
         （`setValue()` を3回呼ぶ間に落ちれば、その状態が残る）。JSON にして
         1回の書き込みにすることで、次に読むのは古い3つ組か新しい3つ組の
         どちらかだけになる。
+
+        旧形式の鍵はここで消す。残しておくと、新しい鍵を消したときに
+        （`clear_last_session()`）古い位置が復活してしまう。
         """
         self._backend.setValue(
             _KEY_SESSION,
@@ -212,6 +240,7 @@ class Settings:
                 }
             ),
         )
+        self._remove_legacy_session()
 
     def clear_last_session(self) -> None:
         """前回のセッションを忘れる。
@@ -220,6 +249,12 @@ class Settings:
         後者で消しておかないと、起動のたびに同じ失敗を繰り返す。
         """
         self._backend.remove(_KEY_SESSION)
+        self._remove_legacy_session()
+
+    def _remove_legacy_session(self) -> None:
+        """旧形式の3つの鍵を消す。"""
+        for key in _LEGACY_SESSION_KEYS:
+            self._backend.remove(key)
 
     # -------------------------------------------------- 表示
     @property

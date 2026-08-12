@@ -282,6 +282,40 @@ def test_an_unreadable_session_falls_back(tmp_path: Path, stored: str) -> None:
     assert settings.last_y_norm == pytest.approx(0.0)
 
 
+def test_the_session_of_the_previous_format_is_still_read(tmp_path: Path) -> None:
+    """1つの鍵にまとめる前の形式でも、前回位置を1回は失わない。
+
+    「どこまで読んだか」は設定の中でも作り直しの効かない値なので、
+    保存形式を変えた最初の起動で捨てはしない。
+    """
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/document", r"C:\books\a.pdf")
+    backend.setValue("session/page_index", 42)
+    backend.setValue("session/y_norm", 0.65)
+    settings = Settings(backend)
+
+    assert settings.last_document == r"C:\books\a.pdf"
+    assert settings.last_page_index == 42
+    assert settings.last_y_norm == pytest.approx(0.65)
+
+
+def test_saving_moves_the_session_out_of_the_previous_format(tmp_path: Path) -> None:
+    """新しい形式で保存したら、旧形式の鍵は残さない。
+
+    残すと、新しい鍵を消したときに古い位置が復活する。
+    """
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/document", r"C:\books\old.pdf")
+    settings = Settings(backend)
+
+    settings.set_last_session(r"C:\books\new.pdf", 1, 0.5)
+    assert settings.last_document == r"C:\books\new.pdf"
+
+    settings.clear_last_session()
+    assert settings.last_document == ""
+    assert [key for key in backend.allKeys() if key.startswith("session/")] == []
+
+
 def test_a_session_of_a_wrong_type_falls_back(tmp_path: Path) -> None:
     """文字列ですらない値が入っていても落ちない。"""
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
