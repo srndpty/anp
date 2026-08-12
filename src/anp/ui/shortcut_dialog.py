@@ -140,6 +140,10 @@ class ShortcutDialog(QDialog):
 
         `"Ctrl+Shift+X"` を手で打たせるのではなく、実際に押したキーを
         受け取る（`QKeySequenceEdit`）。
+
+        `QKeySequenceEdit` が持てるのは1つだけなので、ここで編集できるのは
+        **先頭のショートカットだけ**。代替（拡大の `Ctrl+=`）は編集しても
+        残る。代替ごと捨てたいときは「解除」を使う。
         """
         row = QHBoxLayout()
 
@@ -177,7 +181,10 @@ class ShortcutDialog(QDialog):
         self._refresh_all()
 
     def clear_selected(self) -> None:
-        """選ばれているコマンドの割り当てを外す（キーで起動しなくなる）。
+        """選ばれているコマンドの割り当てを**全部**外す（キーで起動しなくなる）。
+
+        代替も含めて空にする唯一の手段。「代替も捨てて1つだけにしたい」
+        利用者は、解除してから打鍵すればよい。
 
         コマンド自体を無効にはしない。メニューからはこれまでどおり使える。
         """
@@ -186,9 +193,7 @@ class ShortcutDialog(QDialog):
     def _on_sequence_changed(self, sequence: QKeySequence) -> None:
         if self._loading:
             return
-        # 打鍵での編集は1つの割り当てに置き換える。既定で複数持つコマンド
-        # （拡大）の代替は、「既定値に戻す」で戻せる。
-        self._set_selected(() if sequence.isEmpty() else (sequence,))
+        self._set_selected(_replace_primary(self._draft[self.selected_command_id], sequence))
 
     def _set_selected(self, sequences: tuple[QKeySequence, ...]) -> None:
         self._draft[self.selected_command_id] = sequences
@@ -265,6 +270,25 @@ class ShortcutDialog(QDialog):
     def select(self, command_id: str) -> None:
         """コマンドを選ぶ。マウス操作の代わりにテストから使う。"""
         self._table.selectRow(_row_for(command_id))
+
+
+def _replace_primary(
+    current: tuple[QKeySequence, ...], sequence: QKeySequence
+) -> tuple[QKeySequence, ...]:
+    """先頭のショートカットだけを差し替え、**代替は残す**。
+
+    `QKeySequenceEdit` が扱えるのは1つだけなので、打鍵で編集できるのは
+    先頭に限る。そこで代替まで巻き添えに消すと、拡大の `Ctrl+=` のような
+    既存の割り当てが、無関係な編集で黙って失われる。
+
+    差し替えた結果と同じキーが代替に残っていたら落とす（1つのコマンドに
+    同じショートカットを2つ持たせない）。
+
+    空の打鍵は「編集欄を空にした」なので、全体を解除する。
+    """
+    if sequence.isEmpty():
+        return ()
+    return (sequence, *(item for item in current[1:] if item != sequence))
 
 
 def _row_for(command_id: str) -> int:

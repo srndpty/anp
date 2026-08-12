@@ -45,7 +45,7 @@ from anp.ui.shortcuts import (
 )
 from anp.ui.study_marks import PagePosition
 from conftest import SEARCH_QUERY
-from helpers import put_image
+from helpers import ManualTransforms, put_image
 
 # P5-4 導入前から使われていたキー。**設定の互換性の契約**なので、
 # レジストリを書き換えたらここが落ちる。「一般にはこちらが標準的」を
@@ -541,15 +541,80 @@ def test_restore_defaults_only_changes_the_draft(
     assert store.shortcut_override("navigation.next_page") is None
 
 
-def test_restore_defaults_brings_back_alternate_shortcuts(dialog: ShortcutDialog) -> None:
-    """打鍵で1つへ置き換えても、既定へ戻せば代替も戻る。"""
+def test_restore_defaults_brings_back_a_cleared_assignment(dialog: ShortcutDialog) -> None:
+    """解除しても、既定へ戻せば代替ごと戻る。"""
     dialog.select("view.zoom_in")
-    dialog.editor.setKeySequence(QKeySequence.fromString("Ctrl+Up", PORTABLE))
-    assert len(dialog.assignments["view.zoom_in"]) == 1
+    dialog.clear_button.click()
+    assert dialog.assignments["view.zoom_in"] == ()
 
     dialog.restore_defaults()
 
     assert texts(dialog.assignments["view.zoom_in"]) == ("Ctrl++", "Ctrl+=")
+
+
+# ---------------------------------------------------------------- 代替の保持
+# `QKeySequenceEdit` が扱えるのは1つだけなので、打鍵で編集できるのは先頭の
+# ショートカットだけ。**そこで代替まで巻き添えに消さない。**
+def test_editing_keeps_the_alternate_shortcut(dialog: ShortcutDialog) -> None:
+    """拡大の先頭を変えても `Ctrl+=` は残る。"""
+    dialog.select("view.zoom_in")
+
+    dialog.editor.setKeySequence(QKeySequence.fromString("Ctrl+Up", PORTABLE))
+
+    assert texts(dialog.assignments["view.zoom_in"]) == ("Ctrl+Up", "Ctrl+=")
+
+
+def test_editing_keeps_a_custom_alternate_shortcut(qtbot: QtBot) -> None:
+    """既定に限らず、いま持っている代替を残す。"""
+    dialog = ShortcutDialog({"view.zoom_in": seq("Ctrl+K", "Ctrl+L")})
+    qtbot.addWidget(dialog)
+    dialog.select("view.zoom_in")
+
+    dialog.editor.setKeySequence(QKeySequence.fromString("Ctrl+J", PORTABLE))
+
+    assert texts(dialog.assignments["view.zoom_in"]) == ("Ctrl+J", "Ctrl+L")
+
+
+def test_editing_after_clearing_leaves_a_single_shortcut(dialog: ShortcutDialog) -> None:
+    """代替ごと捨てたいときは「解除」してから打鍵する。"""
+    dialog.select("view.zoom_in")
+    dialog.clear_button.click()
+
+    dialog.editor.setKeySequence(QKeySequence.fromString("Ctrl+J", PORTABLE))
+
+    assert texts(dialog.assignments["view.zoom_in"]) == ("Ctrl+J",)
+
+
+def test_editing_to_the_alternate_key_does_not_duplicate(dialog: ShortcutDialog) -> None:
+    """先頭を代替と同じキーにしても、同じ割り当てを2つ持たない。"""
+    dialog.select("view.zoom_in")
+
+    dialog.editor.setKeySequence(QKeySequence.fromString("Ctrl+=", PORTABLE))
+
+    assert texts(dialog.assignments["view.zoom_in"]) == ("Ctrl+=",)
+
+
+def test_editing_a_single_shortcut_command_stays_single(dialog: ShortcutDialog) -> None:
+    """代替を持たないコマンドは、編集しても1つのまま。"""
+    dialog.select("search.find")
+
+    dialog.editor.setKeySequence(QKeySequence.fromString("Ctrl+G", PORTABLE))
+
+    assert texts(dialog.assignments["search.find"]) == ("Ctrl+G",)
+
+
+def test_the_alternate_shortcut_survives_the_round_trip_to_the_actions(
+    dialog: ShortcutDialog, manager: ShortcutManager, actions: ReaderActions, store: Settings
+) -> None:
+    """OK まで通しても代替が残り、設定にも両方が書かれる。"""
+    dialog.select("view.zoom_in")
+    dialog.editor.setKeySequence(QKeySequence.fromString("Ctrl+Up", PORTABLE))
+    dialog.accept()
+
+    manager.apply(dialog.assignments)
+
+    assert action_texts(actions, "view.zoom_in") == ("Ctrl+Up", "Ctrl+=")
+    assert store.shortcut_override("view.zoom_in") == "Ctrl+Up; Ctrl+="
 
 
 def test_a_conflicting_draft_keeps_the_dialog_open(
@@ -847,15 +912,24 @@ def test_editing_shortcuts_does_not_touch_the_rendering_pipeline(
 ) -> None:
     """ショートカットの設定はレンダリングにもキャッシュにも触らない。
 
-    ダイアログを開いて編集し、OK まで通しても、世代も持っている画像も
-    ページの色も変わらない。
+    ダイアログを開いて編集し、OK まで通しても、世代も持っている画像
+    （生・表示用の両方）もページの色も変わらない。
+
+    表示用キャッシュまで見るのは、生の画像だけ残して表示用を捨てる実装でも
+    通ってしまわないようにするため（P4 で一度空いていた穴）。色変換は
+    本物のワーカーへ流さず、投入と同時に完了させて決定的にする。
     """
     render = opened.view._render  # noqa: SLF001
     cache = opened._cache  # noqa: SLF001
+    ManualTransforms(render, immediate=True)
 
     put_image(cache, opened.view, 0, Qt.GlobalColor.red)
     raw_key = cache.nearest_key(0, width_px=0)
     assert raw_key is not None
+
+    opened.view.set_page_color_mode(PageColorMode.INVERT)
+    display_key = render.display_cache.nearest_key(0, 0, PageColorMode.INVERT)
+    assert display_key is not None
 
     generation = render.generation
     color_mode = opened.view.page_color_mode
@@ -870,5 +944,6 @@ def test_editing_shortcuts_does_not_touch_the_rendering_pipeline(
 
     assert render.generation == generation
     assert raw_key in cache
+    assert display_key in render.display_cache
     assert opened.view.page_color_mode is color_mode
-    assert color_mode is PageColorMode.ORIGINAL
+    assert color_mode is PageColorMode.INVERT
