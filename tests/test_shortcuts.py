@@ -27,6 +27,7 @@ from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
 from anp.pdf.color import PageColorMode
+from anp.storage.study_mark import DocumentIdentity
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions
 from anp.ui.main_window import MainWindow
@@ -877,7 +878,8 @@ def test_search_state_is_untouched(qtbot: QtBot, window: MainWindow, searchable_
 def test_study_marks_are_untouched(opened: MainWindow, sample_pdf: Path) -> None:
     """ショートカットの変更で学習マークに触らない。"""
     opened.study_marks.create_mark(
-        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5),
+        expected_document=DocumentIdentity.of(sample_pdf),
     )
     before = opened.study_marks.study_marks
     assert len(before) == 1

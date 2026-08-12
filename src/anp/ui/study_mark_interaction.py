@@ -27,12 +27,11 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
-from pathlib import Path
 
 from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox, QWidget
 
-from anp.storage.study_mark import StudyMark
+from anp.storage.study_mark import DocumentIdentity, StudyMark
 from anp.storage.study_mark_repository import StoredStudyMarkError
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkError
@@ -88,7 +87,7 @@ class StudyMarkInteraction:
         elif target.position is not None:
             # クリックと保存の間に PDF は切り替わりようがないが、対象の
             # PDF を名乗るのは呼び出し側の責任なので、ここでも明示する。
-            self._create(target.position, self._controller.active_document_path)
+            self._create(target.position, self._controller.active_document)
 
     # -------------------------------------------------- 右クリックメニュー
     def _on_menu_requested(self, target: StudyMarkTarget, global_pos: QPoint) -> None:
@@ -130,9 +129,12 @@ class StudyMarkInteraction:
         位置と一緒に **メニューを開いた時点の表示対象** も捕まえる。
         `PagePosition` は正規化座標なのでどの PDF のものか名乗れず、
         これが無いと PDF を切り替えた後の発火で別の PDF にマークができる。
-        照合はコントローラ側（パスの正規化を UI に持ち込まない）。
+
+        捕まえるのはパスではなく `DocumentIdentity`。同じパスの PDF を別の
+        内容へ差し替えて開き直された場合も、別の PDF として弾ける。中身の
+        比較はコントローラ側（判定基準を UI に持ち込まない）。
         """
-        expected = self._controller.active_document_path
+        expected = self._controller.active_document
         menu = QMenu(self._parent)
         menu.addAction("学習マークを追加").triggered.connect(
             lambda: self._create(position, expected)
@@ -140,7 +142,7 @@ class StudyMarkInteraction:
         return menu
 
     # -------------------------------------------------- 操作
-    def _create(self, position: PagePosition, expected_document: Path | None) -> None:
+    def _create(self, position: PagePosition, expected_document: DocumentIdentity | None) -> None:
         self._run(
             lambda: self._controller.create_mark(position, expected_document=expected_document)
         )

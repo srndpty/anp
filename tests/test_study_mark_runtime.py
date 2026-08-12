@@ -240,7 +240,8 @@ def test_the_identity_is_fixed_when_the_document_is_opened(
     # 表示したまま、同じパスの中身が別の PDF に置き換わった。
     path.write_bytes(two_page_pdf.read_bytes())
     controller.create_mark(
-        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=path
+        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5),
+        expected_document=controller.active_document,
     )
 
     assert len(repository.list_for_document(original)) == 1
@@ -326,7 +327,7 @@ def test_the_fingerprint_is_read_once_per_open(
     for index in range(3):
         study_mark_controller.create_mark(
             PagePosition(page_index=0, x_norm=0.1 * (index + 1), y_norm=0.5),
-            expected_document=sample_pdf,
+            expected_document=study_mark_controller.active_document,
         )
 
     assert len(reads) == 1, "マークを作るたびに読み直している"

@@ -55,7 +55,7 @@ from typing import NoReturn
 
 from PySide6.QtCore import QObject, Signal
 
-from anp.storage.study_mark import DocumentIdentity, StudyMark, document_key
+from anp.storage.study_mark import DocumentIdentity, StudyMark
 from anp.storage.study_mark_repository import StoredStudyMarkError, StudyMarkRepository
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_marks import PagePosition
@@ -123,6 +123,16 @@ class StudyMarkController(QObject):
     def active_document_path(self) -> Path | None:
         """いま学習マークを表示している PDF のパス。無ければ None。"""
         return self._active_path
+
+    @property
+    def active_document(self) -> DocumentIdentity | None:
+        """いま学習マークを表示している PDF の同一性。無ければ None。
+
+        **後で発火する操作が「どの PDF のつもりだったか」を捕まえるための
+        値。** パスだけを捕まえると、同じパスの PDF を差し替えて開き直した
+        場合に、前の内容の座標が新しい内容のマークとして通ってしまう。
+        """
+        return self._identity
 
     @property
     def unverified_count(self) -> int:
@@ -224,26 +234,32 @@ class StudyMarkController(QObject):
         self._publish_marks(self._repository.list_for_document(self._identity))
 
     # -------------------------------------------------- 追加・更新・削除
-    def create_mark(self, position: PagePosition, *, expected_document: Path | None) -> None:
+    def create_mark(
+        self, position: PagePosition, *, expected_document: DocumentIdentity | None
+    ) -> None:
         """表示中の PDF に学習マークを1件追加する。
 
         位置は `PdfView.page_position_at()` が返した `PagePosition` だけを
         受け取る。ページ番号と 0.0〜1.0 の座標であることはそこで保証されて
         いるので、ビューポートのピクセル座標がリポジトリまで届くことはない。
 
-        `expected_document` は **その位置を取った時点の表示対象**。
-        `PagePosition` は正規化座標なのでどの PDF のものか自分では名乗れず、
-        照合しないと「A のページで開いたメニューを B へ切り替えてから実行」
-        で B に A 由来の座標のマークができてしまう。既存マークの
-        `_require_owned()` と同じ役割を、新規作成に対して果たす。
+        `expected_document` は **その位置を取った時点の表示対象**
+        （`active_document`）。`PagePosition` は正規化座標なのでどの PDF の
+        ものか自分では名乗れず、照合しないと「A のページで開いたメニューを
+        B へ切り替えてから実行」で B に A 由来の座標のマークができてしまう。
+        既存マークの `_require_owned()` と同じ役割を、新規作成に対して果たす。
+
+        **照合はパスではなく同一性で行う。** パスだけを見ていると、同じパスの
+        PDF を別の内容へ差し替えて開き直した場合に、前の内容の座標が新しい
+        内容のマークとして通ってしまう（パスは一致したままなので）。
 
         既定値は置かない。呼び出し側にどの PDF のつもりかを必ず書かせる。
 
         間違えた回数は呼び出し側に選ばせない。「マークを作る＝最初に
         間違えた」なので、P3-1 の契約どおり必ず 1 から始まる。
         """
-        path = self._require_active_document()
-        if expected_document is None or document_key(expected_document) != document_key(path):
+        identity = self._require_identity()
+        if expected_document != identity:
             msg = "the active document changed after the position was captured"
             raise StudyMarkError(msg)
 
@@ -251,7 +267,7 @@ class StudyMarkController(QObject):
         # 表示中に同じパスが別の内容へ置き換わっていた場合に、いま見えて
         # いる PDF の座標を別の PDF のマークとして保存してしまう。
         created = self._repository.create(
-            self._require_identity(), position.page_index, position.x_norm, position.y_norm
+            identity, position.page_index, position.x_norm, position.y_norm
         )
         self._apply_stored(created)
 
