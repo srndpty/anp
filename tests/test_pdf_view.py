@@ -1715,7 +1715,12 @@ def test_the_reading_position_starts_at_the_top(loaded_view: PdfView) -> None:
 
 
 def test_the_reading_position_follows_the_scroll(loaded_view: PdfView) -> None:
-    """ページの途中までスクロールすると、その割合が縦位置になる。"""
+    """ページの途中までスクロールすると、その割合が縦位置になる。
+
+    基準はページ上端そのものではなく「そのページを開いたときのスクロール
+    位置」（ページ上端 − 余白）なので、余白1つぶんだけ大きい値になる。
+    こう定義しておくと `go_to_page()` の位置が 0.0 で表せる。
+    """
     rect = loaded_view.page_viewport_rect(1)
     assert rect is not None
     bar = loaded_view.verticalScrollBar()
@@ -1726,7 +1731,8 @@ def test_the_reading_position_follows_the_scroll(loaded_view: PdfView) -> None:
 
     assert position is not None
     assert position.page_index == 1
-    assert position.y_norm == pytest.approx(0.4, abs=0.01)
+    expected = 0.4 + LayoutMetrics().margin / rect.height()
+    assert position.y_norm == pytest.approx(expected, abs=0.01)
 
 
 def scroll_to_page_boundary(view: PdfView, controller: DocumentController) -> None:
@@ -1784,16 +1790,24 @@ def test_the_reading_position_round_trips_across_a_page_boundary(
 def test_the_reading_position_in_a_gap_uses_the_next_page(
     loaded_view: PdfView, controller: DocumentController
 ) -> None:
-    """上端がページ間の隙間なら、次のページの先頭とみなす。"""
+    """上端がページ間の隙間なら、次のページの先頭付近とみなす。
+
+    隙間は次のページを開いた位置（ページ上端 − 余白）より後ろなので、
+    0.0 ではなくごく小さい正の値になる。0.0 へ丸めないので、ここから
+    復元しても隙間の同じ場所へ戻る。
+    """
     layout = layout_of(controller)
-    gap = layout.page_rect(0, loaded_view.zoom).bottom() + LayoutMetrics().page_gap / 2
+    metrics = LayoutMetrics()
+    gap = layout.page_rect(0, loaded_view.zoom).bottom() + metrics.page_gap / 2
     loaded_view.verticalScrollBar().setValue(round(gap))
 
     saved = loaded_view.current_reading_position()
 
     assert saved is not None
     assert saved.page_index == 1
-    assert saved.y_norm == pytest.approx(0.0)
+    height = layout.page_rect(1, loaded_view.zoom).height()
+    expected = (metrics.margin - metrics.page_gap / 2) / height
+    assert saved.y_norm == pytest.approx(expected, abs=0.005)
 
 
 def test_the_reading_position_is_none_without_a_document(view: PdfView) -> None:
@@ -1815,6 +1829,25 @@ def test_the_reading_position_round_trips(loaded_view: PdfView) -> None:
     assert restored is not None
     assert restored.page_index == saved.page_index
     assert restored.y_norm == pytest.approx(saved.y_norm, abs=0.01)
+
+
+@pytest.mark.parametrize("page", [0, 1, 2])
+def test_a_page_top_round_trips_to_the_same_scroll_value(loaded_view: PdfView, page: int) -> None:
+    """`go_to_page()` → 保存 → 復元で、スクロール位置がそのまま戻る。
+
+    読書位置の基準がページ上端だと、`go_to_page()` の残す余白1つぶんが
+    「0 より手前」になって表現できず、0.0 へ丸められる。復元すると余白の
+    ぶんだけ先へ進むので、ページ先頭の見え方が保存の前後で変わってしまう。
+    """
+    loaded_view.go_to_page(page)
+    expected = loaded_view.verticalScrollBar().value()
+    saved = loaded_view.current_reading_position()
+    assert saved is not None
+
+    loaded_view.go_to_page(0)
+    assert loaded_view.restore_reading_position(saved)
+
+    assert loaded_view.verticalScrollBar().value() == pytest.approx(expected, abs=1)
 
 
 def test_restoring_survives_a_viewport_resize(loaded_view: PdfView, qtbot: QtBot) -> None:
