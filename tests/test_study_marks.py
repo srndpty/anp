@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from anp.storage import database
-from anp.storage.study_mark import StudyMark, document_key
+from anp.storage.study_mark import StudyMark, document_fingerprint, document_key
 from anp.storage.study_mark_repository import StudyMarkRepository
 
 
@@ -77,6 +77,29 @@ def test_document_key_rejects_empty_path() -> None:
     """空文字はカレントディレクトリではなく誤りとして扱う。"""
     with pytest.raises(ValueError, match="empty"):
         document_key("")
+
+
+# ------------------------------------------------------------ document_fingerprint
+def test_the_fingerprint_depends_only_on_the_content(tmp_path: Path, pdf_path: Path) -> None:
+    """指紋は内容だけで決まる。パスが違っても、中身が同じなら同じ。"""
+    copy = tmp_path / "copy.pdf"
+    copy.write_bytes(pdf_path.read_bytes())
+
+    assert document_fingerprint(copy) == document_fingerprint(pdf_path)
+
+
+def test_the_fingerprint_changes_with_the_content(pdf_path: Path) -> None:
+    """内容が変われば指紋も変わる。"""
+    before = document_fingerprint(pdf_path)
+    pdf_path.write_bytes(b"%PDF-1.4 another book")
+
+    assert document_fingerprint(pdf_path) != before
+
+
+def test_the_fingerprint_of_a_missing_file_fails(tmp_path: Path) -> None:
+    """読めないファイルの指紋は作れない（黙って既定値にしない）。"""
+    with pytest.raises(OSError):
+        document_fingerprint(tmp_path / "gone.pdf")
 
 
 # ---------------------------------------------------------------- ドメインモデル
@@ -309,7 +332,65 @@ def test_list_of_unknown_document_is_empty(
     tmp_path: Path,
 ) -> None:
     """マークの無い PDF では空リスト。"""
-    assert repository.list_for_document(tmp_path / "unknown.pdf") == []
+    unknown = tmp_path / "unknown.pdf"
+    unknown.write_bytes(b"%PDF-unknown")
+
+    assert repository.list_for_document(unknown) == []
+
+
+def test_listing_a_missing_file_fails(repository: StudyMarkRepository, tmp_path: Path) -> None:
+    """読めないファイルは「マークが0件」にしない。
+
+    内容の指紋を計算できない以上、そのパスのどのマークが持ち主なのかを
+    決められない。黙って空を返すと、記録が消えたように見える。
+    """
+    with pytest.raises(OSError):
+        repository.list_for_document(tmp_path / "gone.pdf")
+
+
+# ---------------------------------------------------------------- 内容の同一性
+def test_marks_do_not_follow_a_replaced_file(
+    repository: StudyMarkRepository, pdf_path: Path
+) -> None:
+    """同じパスの PDF を別の内容へ差し替えたら、古いマークは出てこない。
+
+    パスだけを識別子にすると、差し替えた本の同じページ番号のところに、
+    前の本のマークが正常なデータとして表示される。位置がそれらしく
+    見えるぶん、単に消えるより危ない。
+    """
+    original = pdf_path.read_bytes()
+    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    pdf_path.write_bytes(b"%PDF-1.4 another book")
+
+    assert repository.list_for_document(pdf_path) == []
+
+    # 記録は消していない。元の PDF を戻せばまた出てくる。
+    pdf_path.write_bytes(original)
+    assert repository.list_for_document(pdf_path) == [mark]
+
+
+def test_marks_survive_an_unchanged_reopen(repository: StudyMarkRepository, pdf_path: Path) -> None:
+    """内容が同じなら、開き直しても持ち主のままでいる。"""
+    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    pdf_path.write_bytes(pdf_path.read_bytes())
+
+    assert repository.list_for_document(pdf_path) == [mark]
+
+
+def test_marks_without_a_fingerprint_are_kept(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """マイグレーション2 より前に作られた行は、指紋が無くても切り離さない。
+
+    学習の記録は再取得できないので、内容が分からないという理由で
+    見えなくしたり、確かめようのない指紋を埋めたりはしない。
+    """
+    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    connection.execute(
+        "UPDATE study_marks SET document_fingerprint = NULL WHERE id = ?", (mark.id,)
+    )
+
+    assert repository.list_for_document(pdf_path) == [mark]
 
 
 # ---------------------------------------------------------------- increment

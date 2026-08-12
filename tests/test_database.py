@@ -71,6 +71,7 @@ def test_default_migrations_create_study_marks(tmp_path: Path) -> None:
     assert columns == {
         "id",
         "document_key",
+        "document_fingerprint",
         "page_index",
         "x_norm",
         "y_norm",
@@ -90,6 +91,29 @@ def test_study_marks_has_document_lookup_index(tmp_path: Path) -> None:
 
     # 先頭が document_key であれば「ある PDF のマークを引く」検索に効く。
     assert any(cols[:1] == ["document_key"] for cols in columns)
+
+
+def test_the_fingerprint_migration_keeps_existing_rows(tmp_path: Path) -> None:
+    """指紋の列を足しても、既に保存されている学習マークは消さない。
+
+    学習の記録は再取得できないので、内容が分からないという理由で消したり、
+    確かめようのない指紋を埋めたりはしない（NULL のまま残す）。
+    """
+    db_path = tmp_path / "anp.sqlite3"
+
+    # 指紋の列ができる前（マイグレーション1 まで）の DB。
+    with _connect(db_path, database._MIGRATIONS[:1]) as connection:  # noqa: SLF001
+        connection.execute(
+            "INSERT INTO study_marks (document_key, page_index, x_norm, y_norm, mistake_count)"
+            " VALUES ('doc', 0, 0.5, 0.5, 3)"
+        )
+
+    with _connect_with_default_migrations(db_path) as connection:
+        rows = connection.execute(
+            "SELECT mistake_count, document_fingerprint FROM study_marks"
+        ).fetchall()
+
+    assert [(row[0], row[1]) for row in rows] == [(3, None)]
 
 
 def test_default_migrations_are_idempotent(tmp_path: Path) -> None:

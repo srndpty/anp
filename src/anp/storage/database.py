@@ -61,9 +61,35 @@ def _create_study_marks(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_document_fingerprint(connection: sqlite3.Connection) -> None:
+    """マイグレーション2 `study_marks.document_fingerprint`: 内容の指紋を持たせる。
+
+    マイグレーション1 の識別子はパスだけだった。そのため、同じパスの PDF を
+    **別の内容のものへ差し替える**と、古い本の学習マークが新しい本の同じ
+    ページ番号のところに、正常なデータとして表示される。位置がそれらしく
+    見えるぶん、単に消えるより危ない。
+
+    追加する列は SHA-256 の16進表記（`document_fingerprint()`）。
+    **既存の行は NULL のまま残す。** 学習の記録は再取得できないので、
+    指紋を知らないという理由で消したり、確かめようのない値を埋めたりは
+    しない。NULL は「内容が分からない ＝ そのパスのどの内容にも属する」
+    として読み出し側が扱う（マイグレーション1 までの挙動と同じ）。
+    以後に作られるマークは必ず指紋を持つので、そこからは差し替えを
+    見分けられる。
+
+    インデックスは作り直さない。絞り込みは今までどおり `document_key` で
+    効き、指紋の比較は取り出した行に対してかかるだけで、1 PDF あたりの
+    行数はもともと数千件に収まる。
+    """
+    connection.execute(
+        "ALTER TABLE study_marks ADD COLUMN document_fingerprint TEXT NULL"
+        " CHECK (document_fingerprint IS NULL OR length(document_fingerprint) = 64)"
+    )
+
+
 # スキーマ更新の手順。先頭から順に適用し、適用済み件数を user_version に持つ。
 # 一度リリースした要素は書き換えず、末尾に追加していく。
-_MIGRATIONS: tuple[Migration, ...] = (_create_study_marks,)
+_MIGRATIONS: tuple[Migration, ...] = (_create_study_marks, _add_document_fingerprint)
 
 
 def connect(path: Path, *, migrations: Sequence[Migration] = _MIGRATIONS) -> sqlite3.Connection:
