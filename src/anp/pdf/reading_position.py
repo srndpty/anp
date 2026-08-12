@@ -14,8 +14,20 @@ go_to_page(n) が作るスクロール位置 = page_top_offset(n) = y_norm 0.0
 ```
 
 と定義すれば、`go_to_page()` → 保存 → 復元でスクロール位置が一致する。
-代わりにページ末尾の余白ぶんだけが 1.0 へ丸められるが、そちらは
-利用者が意図して止まる位置ではない。
+
+**完全な逆変換ではない。** 保存できるのは `(page_index, 0.0〜1.0)` だけで、
+ページ間の隙間は倍率で伸び縮みしないため、ページの区切り
+（`page_top_offset(n)` から `page_top_offset(n+1)` まで）はページ高さより
+`page_gap` ぶん長い。はみ出す分は 1.0 へ丸めるので、**ページ末尾の
+`page_gap` px だけは、復元するとその分だけ手前に戻る**（既定値で 12 px）。
+丸めは常に手前向きで、復元して読んでいない場所へ進むことはない。
+
+最終ページの末尾より下（文書の下余白）はさらに手前へ戻るが、そこが
+ビューポートの上端に来るのはビューポートが余白2つ分より小さいときだけ
+なので、実際には起こらない。
+
+丸めをページの末尾側へ寄せてあるのは、そこが「利用者が意図して止まる
+位置」ではないため。ページ先頭・ページの途中・隙間はすべて誤差なく戻る。
 """
 
 from __future__ import annotations
@@ -90,9 +102,13 @@ def reading_position_at(layout: PageLayout, viewport: QRectF, zoom: float) -> Re
 def scroll_top_for(layout: PageLayout, position: ReadingPosition, zoom: float) -> float | None:
     """読書位置を、ビューポート上端に来るスクロール位置へ戻す。
 
-    `reading_position_at()` の逆変換。いま開いているドキュメントに無い
-    ページなら `None`。**最終ページへ丸めない**（差し替えでページ数の
-    減った PDF で、関係のない場所へ飛ばないため）。
+    `reading_position_at()` の逆。ページ末尾の `page_gap` px ぶんだけは
+    1.0 へ丸められているので、そこだけは元の位置より手前に戻る
+    （module の docstring を参照）。
+
+    いま開いているドキュメントに無いページなら `None`。**最終ページへ
+    丸めない**（差し替えでページ数の減った PDF で、関係のない場所へ
+    飛ばないため）。
     """
     if not 0 <= position.page_index < layout.page_count:
         return None

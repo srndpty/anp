@@ -54,7 +54,7 @@ def test_a_page_top_is_exactly_zero(page: int) -> None:
     [0.0, 5.0, 60.0, 199.0, 210.0, 215.0, 219.0, 220.0, 300.0, 430.0, 500.0],
 )
 def test_the_scroll_position_round_trips(top: float) -> None:
-    """どの位置でも、保存して復元すれば同じスクロール位置に戻る。
+    """ページ末尾の隙間を除けば、保存して復元すれば同じ位置に戻る。
 
     区切りをページ上端に置くと、ページの先頭付近と隙間で 0.0 / 1.0 へ
     丸められ、その分だけずれる。
@@ -65,6 +65,46 @@ def test_the_scroll_position_round_trips(top: float) -> None:
     restored = scroll_top_for(layout, position, 1.0)
 
     assert restored == pytest.approx(top)
+
+
+@pytest.mark.parametrize("top", [200.5, 205.0, 209.5, 410.5, 415.0, 419.5])
+def test_the_page_tail_is_rounded_back_by_at_most_a_page_gap(top: float) -> None:
+    """ページ末尾の隙間ぶんだけは、復元すると手前へ丸められる。
+
+    保存できるのは `(page_index, 0.0〜1.0)` だけで、ページの区切りは
+    ページ高さより `page_gap` ぶん長い。はみ出す分は 1.0 になるので、
+    **ページ末尾の `page_gap` px は表現できない**。これは仕様。
+    """
+    layout = make_layout()
+
+    position = reading_position_at(layout, viewport_at(top), 1.0)
+    restored = scroll_top_for(layout, position, 1.0)
+
+    assert position.y_norm == pytest.approx(1.0)
+    assert restored is not None
+    assert 0.0 < top - restored <= METRICS.page_gap
+
+
+def test_the_round_trip_never_moves_forward() -> None:
+    """スクロールできるどの位置でも、復元して先へ進むことはない。
+
+    先へ進む向きに丸めると、再起動のたびに読んでいない場所へ進んでしまう。
+    戻る側は最大でもページ末尾の隙間（`page_gap`）まで。
+
+    走査するのは実際にスクロールできる範囲だけ（ビューポートの上端は
+    「全体の高さ − ビューポートの高さ」より下へは行けない）。
+    """
+    layout = make_layout()
+    limit = METRICS.page_gap
+    reachable = int(layout.content_size(1.0).height() - VIEWPORT_HEIGHT)
+
+    for step in range(reachable + 1):
+        top = float(step)
+        position = reading_position_at(layout, viewport_at(top), 1.0)
+        restored = scroll_top_for(layout, position, 1.0)
+        assert restored is not None
+        # 浮動小数点の丸め（1e-15 程度）は「進んだ」に数えない。
+        assert -1e-9 <= top - restored <= limit, f"top={top}"
 
 
 def test_the_position_stays_within_the_unit_range() -> None:
