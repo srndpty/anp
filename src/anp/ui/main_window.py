@@ -49,6 +49,7 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut, QShowEvent
 from PySide6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QLabel,
     QMainWindow,
@@ -74,6 +75,8 @@ from anp.ui.pdf_search_controller import PdfSearchController, SearchState
 from anp.ui.pdf_view import PdfView, ReadingPosition, ZoomMode
 from anp.ui.recent_files import add_recent, normalize_recent, recent_labels, remove_recent
 from anp.ui.search_dock import SearchDock
+from anp.ui.shortcut_dialog import ShortcutDialog
+from anp.ui.shortcut_manager import ShortcutManager
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
 from anp.ui.study_mark_interaction import StudyMarkInteraction
 from anp.ui.study_mark_sidebar import StudyMarkSidebar
@@ -194,6 +197,12 @@ class MainWindow(QMainWindow):
         self._create_status_bar()
         self._connect_actions()
         self._rebuild_recent_menu()
+
+        # ショートカットの設定を **アクションが使えるようになった直後** に
+        # 反映する。メニューを一度開くまで効かない、といった遅延は作らない。
+        # 衝突の判定も設定の直列化もここには書かない（`ShortcutManager`）。
+        self._shortcuts = ShortcutManager(self._settings, self._actions.command_actions())
+        self._shortcuts.apply_stored()
 
         self._view.current_page_changed.connect(self._on_current_page_changed)
         self._view.zoom_changed.connect(self._sync_zoom_ui)
@@ -417,6 +426,7 @@ class MainWindow(QMainWindow):
         self._actions.clear_recent.triggered.connect(self._clear_recent)
         self._actions.quit.triggered.connect(self.close)
         self._actions.about.triggered.connect(self._show_about)
+        self._actions.shortcut_settings.triggered.connect(self._show_shortcut_settings)
 
         self._actions.zoom_in.triggered.connect(self._view.zoom_in)
         self._actions.zoom_out.triggered.connect(self._view.zoom_out)
@@ -503,6 +513,20 @@ class MainWindow(QMainWindow):
         shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
         shortcut.activated.connect(self._exit_full_screen)
+
+    def _show_shortcut_settings(self) -> None:
+        """ショートカットの設定ダイアログを開く。
+
+        ダイアログは下書きしか触らないので、キャンセルされれば設定も
+        `QAction` も変わらない。OK なら**丸ごと**保存して反映する。
+        衝突していれば `accept()` が閉じないので、ここへは届かない。
+
+        レンダリングにも検索にも学習マークにも触らない。ショートカットの
+        変更は入力の振り分けだけを変える。
+        """
+        dialog = ShortcutDialog(self._shortcuts.current_assignments(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._shortcuts.apply(dialog.assignments)
 
     def _show_about(self) -> None:
         QMessageBox.about(
@@ -979,6 +1003,11 @@ class MainWindow(QMainWindow):
     def search_dock(self) -> SearchDock:
         """テキスト検索のドック。"""
         return self._search_dock
+
+    @property
+    def shortcuts(self) -> ShortcutManager:
+        """キーボードショートカットの管理。"""
+        return self._shortcuts
 
     @property
     def recent_files(self) -> tuple[Path, ...]:

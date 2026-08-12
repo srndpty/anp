@@ -765,3 +765,136 @@ def test_the_session_keeps_the_position_after_a_toc_jump(
         assert restored.y_norm == pytest.approx(position.y_norm, abs=0.01)
     finally:
         second.close()
+
+
+# ================================================================ キーボード操作
+# P5-2 では移動をマウスのクリックだけで実装し、Enter / Return は P5-4 へ
+# 送っていた。ここでその積み残しを閉じる。**マウスの挙動は変えない。**
+def test_enter_requests_the_current_destination(
+    qtbot: QtBot, sidebar: TocSidebar, outline_document: QPdfDocument
+) -> None:
+    """現在行で Enter を押すと、クリックと同じ移動先を要求する。"""
+    sidebar.set_document(outline_document)
+    index = row(sidebar.model, 0, 1)
+    sidebar.tree.setCurrentIndex(index)
+
+    with qtbot.waitSignal(sidebar.destination_requested) as signal:
+        qtbot.keyClick(sidebar.tree, Qt.Key.Key_Return)
+
+    assert signal.args[0] == destination_for(index)
+
+
+def test_return_and_enter_both_activate(
+    qtbot: QtBot, sidebar: TocSidebar, outline_document: QPdfDocument
+) -> None:
+    """テンキーの Enter でも同じ。"""
+    sidebar.set_document(outline_document)
+    sidebar.tree.setCurrentIndex(row(sidebar.model, 1))
+
+    with qtbot.waitSignal(sidebar.destination_requested):
+        qtbot.keyClick(sidebar.tree, Qt.Key.Key_Enter)
+
+
+def test_enter_requests_the_destination_only_once(
+    qtbot: QtBot, sidebar: TocSidebar, outline_document: QPdfDocument
+) -> None:
+    """1回の押鍵で移動の要求は1回だけ。
+
+    `clicked` と `activated` を両方つなぐと、環境によっては二重に出る。
+    """
+    sidebar.set_document(outline_document)
+    sidebar.tree.setCurrentIndex(row(sidebar.model, 1))
+    requests: list[PdfDestination] = []
+    sidebar.destination_requested.connect(requests.append)
+
+    qtbot.keyClick(sidebar.tree, Qt.Key.Key_Return)
+
+    assert len(requests) == 1
+
+
+def test_enter_without_a_current_row_does_nothing(
+    qtbot: QtBot, sidebar: TocSidebar, outline_document: QPdfDocument
+) -> None:
+    """選択が無ければ何も要求しない（P5-2 の stale の扱いと同じ）。"""
+    sidebar.set_document(outline_document)
+    sidebar.tree.setCurrentIndex(QModelIndex())
+    requests: list[PdfDestination] = []
+    sidebar.destination_requested.connect(requests.append)
+
+    qtbot.keyClick(sidebar.tree, Qt.Key.Key_Return)
+
+    assert requests == []
+
+
+def test_other_keys_still_move_the_current_row(
+    qtbot: QtBot, sidebar: TocSidebar, outline_document: QPdfDocument
+) -> None:
+    """Enter 以外の押鍵はツリーの通常の操作のまま。"""
+    sidebar.set_document(outline_document)
+    sidebar.tree.setCurrentIndex(row(sidebar.model, 0))
+
+    qtbot.keyClick(sidebar.tree, Qt.Key.Key_Down)
+
+    assert sidebar.tree.currentIndex() != row(sidebar.model, 0)
+
+
+def test_enter_moves_the_view(qtbot: QtBot, window: MainWindow, outline_pdf: Path) -> None:
+    """ツリーの Enter → サイドバー → ウィンドウ → ビューの経路を通る。"""
+    window.open_path(outline_pdf)
+    sidebar = window.toc_sidebar
+    sidebar.tree.setCurrentIndex(row(sidebar.model, 0, 1))
+
+    qtbot.keyClick(sidebar.tree, Qt.Key.Key_Return)
+
+    assert 2 in window.view.visible_pages()
+
+
+def test_enter_on_a_nested_item_reaches_the_location(
+    qtbot: QtBot, window: MainWindow, outline_pdf: Path
+) -> None:
+    """節の移動先（ページ途中）までキーボードでも動く。"""
+    window.open_path(outline_pdf)
+    sidebar = window.toc_sidebar
+    index = row(sidebar.model, 0, 0)
+    destination = destination_for(index)
+    assert destination is not None
+    sidebar.tree.setCurrentIndex(index)
+
+    qtbot.keyClick(sidebar.tree, Qt.Key.Key_Return)
+
+    point = destination_point(window.view, destination)
+    assert window.view.viewport().rect().contains(point.toPoint())
+    assert point.y() == pytest.approx(16.0, abs=1.5)
+
+
+@pytest.mark.parametrize("mode", [ZoomMode.FIT_WIDTH, ZoomMode.FIT_PAGE])
+def test_enter_keeps_the_zoom_mode(
+    qtbot: QtBot, window: MainWindow, outline_pdf: Path, mode: ZoomMode
+) -> None:
+    """キーボードでの移動でも倍率モードを維持する（マウスと同じ経路）。"""
+    window.open_path(outline_pdf)
+    if mode is ZoomMode.FIT_WIDTH:
+        window.view.fit_width()
+    else:
+        window.view.fit_page()
+    zoom = window.view.zoom
+
+    sidebar = window.toc_sidebar
+    sidebar.tree.setCurrentIndex(row(sidebar.model, 1))
+    qtbot.keyClick(sidebar.tree, Qt.Key.Key_Return)
+
+    assert window.view.zoom_mode is mode
+    assert window.view.zoom == pytest.approx(zoom)
+
+
+def test_clicking_still_works_after_the_keyboard_support(
+    window: MainWindow, outline_pdf: Path
+) -> None:
+    """シングルクリックでの移動は従来どおり（キーボード対応で壊さない）。"""
+    window.open_path(outline_pdf)
+    sidebar = window.toc_sidebar
+    index = row(sidebar.model, 0, 1)
+
+    sidebar.tree.clicked.emit(index)
+
+    assert 2 in window.view.visible_pages()

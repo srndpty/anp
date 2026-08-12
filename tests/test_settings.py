@@ -271,6 +271,39 @@ def test_a_page_index_of_a_wrong_type_falls_back(tmp_path: Path) -> None:
     assert Settings(backend).last_page_index == 0
 
 
+@pytest.mark.parametrize("stored", [True, False])
+def test_a_boolean_page_index_falls_back(tmp_path: Path, stored: bool) -> None:
+    """真偽値はページ番号として受け付けない。
+
+    Python では `isinstance(True, int)` が真なので、素直に `int()` へ通すと
+    `True` が 2 ページ目（0 始まりの 1）になってしまう。
+    """
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/page_index", stored)
+
+    assert Settings(backend).last_page_index == 0
+
+
+@pytest.mark.parametrize("stored", [1.5, 3.25, -1.2, float("nan"), float("inf"), float("-inf")])
+def test_a_non_integral_page_index_falls_back(tmp_path: Path, stored: float) -> None:
+    """整数でない実数を丸めて使わない。
+
+    `int(1.5)` は黙って 1 になるが、それは保存された位置ではなく推測。
+    """
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/page_index", stored)
+
+    assert Settings(backend).last_page_index == 0
+
+
+def test_an_integral_float_page_index_is_accepted(tmp_path: Path) -> None:
+    """整数と同じ値の実数は、これまでどおり受け付ける。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/page_index", 3.0)
+
+    assert Settings(backend).last_page_index == 3
+
+
 @pytest.mark.parametrize("stored", ["", "abc", "-0.5", "2", "nan", "inf", "-inf"])
 def test_a_broken_y_norm_falls_back(tmp_path: Path, stored: str) -> None:
     """壊れた縦位置はページ先頭へ落とす。"""

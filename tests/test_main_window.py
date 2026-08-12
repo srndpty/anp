@@ -89,7 +89,7 @@ def zoom_label_text(window: MainWindow) -> str:
 def test_window_has_menus_and_status_bar(window: MainWindow) -> None:
     """メニューとステータスバーが用意されている。"""
     titles = [action.text() for action in window.menuBar().actions()]
-    assert titles == ["ファイル(&F)", "表示(&V)", "移動(&G)", "ヘルプ(&H)"]
+    assert titles == ["ファイル(&F)", "表示(&V)", "移動(&G)", "設定(&S)", "ヘルプ(&H)"]
     # パスは常設ウィジェットなので、一時メッセージ（`currentMessage()`）
     # とは別に常に出ている。
     assert window.document_status_text == "PDF が開かれていません"
@@ -160,6 +160,44 @@ def test_saved_geometry_is_restored(
             second.deleteLater()
     finally:
         reference.deleteLater()
+
+
+def test_the_three_docks_restore_their_visibility_together(
+    qtbot: QtBot, settings: Settings, study_marks: StudyMarkRepository
+) -> None:
+    """学習マーク・目次・検索の表示状態が、3つ同時に往復する。
+
+    3つのドックは1つの `saveState()` の blob を共有するので、片方だけを
+    見るテストでは「復元しているつもりで、別のドックの状態を潰している」
+    実装を通してしまう。**互いを上書きしない**ことまで固定するために、
+    3つを別々の状態（表示 / 非表示 / 表示）にしてから往復させる。
+
+    初期状態は3つとも非表示なので、表示にした2つはドック専用の設定キーが
+    無くても復元されていることになり、目次は「他の2つに引きずられて
+    勝手に開かない」ことになる。
+    """
+    first = MainWindow(settings, study_marks)
+    qtbot.addWidget(first)
+    with qtbot.waitExposed(first):
+        first.show()
+    assert first.study_mark_sidebar.isHidden(), "テストの前提が崩れている（初期状態は非表示）"
+    assert first.toc_sidebar.isHidden(), "テストの前提が崩れている（初期状態は非表示）"
+    assert first.search_dock.isHidden(), "テストの前提が崩れている（初期状態は非表示）"
+
+    first.study_mark_sidebar.show()
+    first.search_dock.show()
+    first.close()
+
+    second = MainWindow(settings, study_marks)
+    qtbot.addWidget(second)
+    with qtbot.waitExposed(second):
+        second.show()
+    try:
+        assert not second.study_mark_sidebar.isHidden()
+        assert second.toc_sidebar.isHidden()
+        assert not second.search_dock.isHidden()
+    finally:
+        second.close()
 
 
 # ------------------------------------------------------------------ PDF を開く

@@ -12,8 +12,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import QMenu, QMenuBar, QWidget
+
+from anp.ui.shortcuts import apply_assignments, default_assignments
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +28,13 @@ class ReaderActions:
 
     quit: QAction
     about: QAction
+
+    shortcut_settings: QAction
+    """キーボードショートカットの設定ダイアログを開く。
+
+    このアクション自体にはショートカットを割り当てない（設定を開くために
+    キーを1つ潰す理由がない）。
+    """
 
     zoom_in: QAction
     zoom_out: QAction
@@ -60,15 +69,38 @@ class ReaderActions:
 
     find_next: QAction
     find_previous: QAction
-    """次/前の検索結果へ移動する（F3 / Shift+F3）。
-
-    P5-4 でショートカットを設定可能にするまでは固定のキーで持つ。
+    """次/前の検索結果へ移動する（既定は F3 / Shift+F3）。
 
     ドキュメントの有無では切り替えない（`set_document_dependent_enabled()`
     に入れない）。結果が無ければコントローラ側で何も起きないので、
     「押せるのに何も起きない」以上の害はなく、有効/無効の情報源を
     検索結果の件数とドキュメントの2つに分けずに済む。
     """
+
+    def command_actions(self) -> dict[str, QAction]:
+        """ショートカットを設定できるコマンドの、ID から `QAction` への対応。
+
+        **`anp.ui.shortcuts` のレジストリと1対1で対応する。** 表示名から
+        アクションを探したり、`findChildren(QAction)` を総当たりして
+        `text()` を比べたりしない（文言を直した瞬間に壊れるため）。
+
+        ここに無いアクション（幅に合わせる・ページ全体・履歴のクリア・
+        anp について・ショートカットの設定）は、P5-4 開始時点で明示的な
+        ショートカットを持っていなかったので設定の対象にしない。
+        """
+        return {
+            "file.open": self.open,
+            "file.quit": self.quit,
+            "view.zoom_in": self.zoom_in,
+            "view.zoom_out": self.zoom_out,
+            "view.actual_size": self.actual_size,
+            "view.full_screen": self.full_screen,
+            "navigation.previous_page": self.previous_page,
+            "navigation.next_page": self.next_page,
+            "search.find": self.find,
+            "search.find_next": self.find_next,
+            "search.find_previous": self.find_previous,
+        }
 
     def set_document_dependent_enabled(self, *, enabled: bool) -> None:
         """ドキュメントが無いと意味のないアクションをまとめて切り替える。
@@ -85,16 +117,13 @@ class ReaderActions:
             action.setEnabled(enabled)
 
 
-def _action(
-    parent: QWidget,
-    text: str,
-    *,
-    shortcuts: list[str] | None = None,
-    checkable: bool = False,
-) -> QAction:
+def _action(parent: QWidget, text: str, *, checkable: bool = False) -> QAction:
+    """アクションを1つ作る。**ショートカットはここでは付けない。**
+
+    既定のショートカットの情報源は `anp.ui.shortcuts` のレジストリ1つだけ
+    なので、`create_actions()` の最後にまとめて載せる。
+    """
     action = QAction(text, parent)
-    if shortcuts:
-        action.setShortcuts([QKeySequence(shortcut) for shortcut in shortcuts])
     action.setCheckable(checkable)
     return action
 
@@ -130,18 +159,18 @@ def create_actions(parent: QWidget) -> ReaderActions:
     ui_theme_light = _action(parent, "ライト(&L)", checkable=True)
     ui_theme_dark = _action(parent, "ダーク(&D)", checkable=True)
 
-    return ReaderActions(
-        open=_action(parent, "開く(&O)...", shortcuts=["Ctrl+O"]),
+    actions = ReaderActions(
+        open=_action(parent, "開く(&O)..."),
         clear_recent=_action(parent, "最近使ったファイルをクリア(&C)"),
-        quit=_action(parent, "終了(&X)", shortcuts=["Ctrl+Q"]),
+        quit=_action(parent, "終了(&X)"),
         about=_action(parent, "anp について(&A)"),
-        # Ctrl++ は Shift が要るキーボードが多いので Ctrl+= も受ける。
-        zoom_in=_action(parent, "拡大(&I)", shortcuts=["Ctrl++", "Ctrl+="]),
-        zoom_out=_action(parent, "縮小(&O)", shortcuts=["Ctrl+-"]),
-        actual_size=_action(parent, "実際の大きさ(&A)", shortcuts=["Ctrl+0"]),
+        shortcut_settings=_action(parent, "ショートカット(&K)..."),
+        zoom_in=_action(parent, "拡大(&I)"),
+        zoom_out=_action(parent, "縮小(&O)"),
+        actual_size=_action(parent, "実際の大きさ(&A)"),
         fit_width=_action(parent, "幅に合わせる(&W)", checkable=True),
         fit_page=_action(parent, "ページ全体(&P)", checkable=True),
-        full_screen=_action(parent, "全画面表示(&F)", shortcuts=["F11"], checkable=True),
+        full_screen=_action(parent, "全画面表示(&F)", checkable=True),
         page_color_original=page_color_original,
         page_color_invert=page_color_invert,
         page_color_smart_dark=page_color_smart_dark,
@@ -156,13 +185,18 @@ def create_actions(parent: QWidget) -> ReaderActions:
         ui_theme_light=ui_theme_light,
         ui_theme_dark=ui_theme_dark,
         ui_theme_group=_exclusive_group(parent, [ui_theme_system, ui_theme_light, ui_theme_dark]),
-        # 通常の PageUp/PageDown はスクロール操作として空けておく。
-        previous_page=_action(parent, "前のページ(&P)", shortcuts=["Ctrl+PgUp"]),
-        next_page=_action(parent, "次のページ(&N)", shortcuts=["Ctrl+PgDown"]),
-        find=_action(parent, "検索(&F)...", shortcuts=["Ctrl+F"]),
-        find_next=_action(parent, "次を検索(&N)", shortcuts=["F3"]),
-        find_previous=_action(parent, "前を検索(&V)", shortcuts=["Shift+F3"]),
+        previous_page=_action(parent, "前のページ(&P)"),
+        next_page=_action(parent, "次のページ(&N)"),
+        find=_action(parent, "検索(&F)..."),
+        find_next=_action(parent, "次を検索(&N)"),
+        find_previous=_action(parent, "前を検索(&V)"),
     )
+    # 既定のショートカットを載せる。**利用者の設定を読むのはここではない**
+    # （`ShortcutManager.apply_stored()` が上書きする）。ここで既定を載せて
+    # おくのは、設定を持たないアクション一式でも従来どおり使えるようにする
+    # ため。
+    apply_assignments(actions.command_actions(), default_assignments())
+    return actions
 
 
 def populate_menus(
@@ -229,6 +263,9 @@ def populate_menus(
     go_menu.addAction(actions.find)
     go_menu.addAction(actions.find_next)
     go_menu.addAction(actions.find_previous)
+
+    settings_menu = menu_bar.addMenu("設定(&S)")
+    settings_menu.addAction(actions.shortcut_settings)
 
     help_menu = menu_bar.addMenu("ヘルプ(&H)")
     help_menu.addAction(actions.about)
