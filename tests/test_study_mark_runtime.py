@@ -937,6 +937,81 @@ def test_a_second_instance_does_not_open_the_database(
         held.unlock()
 
 
+def test_a_lock_that_cannot_be_created_is_not_reported_as_a_second_instance(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ロックを作れないのと、既に起動しているのを混同しない。
+
+    まとめて「既に起動しています」と伝えると、書き込めないディレクトリが
+    原因のときに、利用者が居もしない別のウィンドウを探すことになる。
+    """
+    data = tmp_path / "data"
+    monkeypatch.setattr(app_module, "QApplication", lambda _argv: qapp)
+    monkeypatch.setattr(app_module, "setup_logging", lambda _path: None)
+    monkeypatch.setattr(app_module, "_install_excepthook", lambda: None)
+    monkeypatch.setattr(
+        AppPaths,
+        "from_standard_paths",
+        classmethod(lambda _cls, _name: AppPaths(data_dir=data)),
+    )
+    monkeypatch.setattr(QLockFile, "tryLock", lambda _self, _timeout: False)
+    monkeypatch.setattr(QLockFile, "error", lambda _self: QLockFile.LockError.PermissionError)
+
+    informed: list[str] = []
+    critical: list[str] = []
+    monkeypatch.setattr(
+        app_module.QMessageBox, "information", lambda *args: informed.append(str(args[2]))
+    )
+    monkeypatch.setattr(
+        app_module.QMessageBox, "critical", lambda *args: critical.append(str(args[2]))
+    )
+
+    assert app_module.main() == app_module.EXIT_LOCK_FAILED
+
+    assert informed == []
+    assert len(critical) == 1
+    assert "ロックファイル" in critical[0]
+
+
+def test_the_lock_is_not_treated_as_stale_over_time(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ロックは経過時間では無効にならない（起動中ずっと持ち続けるため）。
+
+    Qt の既定（30 秒）のままだと、長く開いているだけのウィンドウが
+    「古いロック」と判断され、2つ目が起動できてしまう。
+    """
+    data = tmp_path / "data"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(app_module, "QApplication", lambda _argv: qapp)
+    monkeypatch.setattr(app_module, "setup_logging", lambda _path: None)
+    monkeypatch.setattr(app_module, "_install_excepthook", lambda: None)
+    monkeypatch.setattr(
+        AppPaths,
+        "from_standard_paths",
+        classmethod(lambda _cls, _name: AppPaths(data_dir=data)),
+    )
+
+    stale: list[int] = []
+    original = QLockFile.setStaleLockTime
+
+    def record(self: QLockFile, value: int) -> None:
+        stale.append(value)
+        original(self, value)
+
+    monkeypatch.setattr(QLockFile, "setStaleLockTime", record)
+    monkeypatch.setattr(qapp, "exec", lambda: 0)
+    monkeypatch.setattr(
+        app_module,
+        "QSettings",
+        lambda: QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+    )
+
+    assert app_module.main() == 0
+
+    assert stale == [0]
+
+
 def test_the_lock_is_released_when_the_application_exits(
     qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

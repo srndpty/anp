@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 from types import TracebackType
 
 from PySide6.QtCore import QCoreApplication, QLockFile, QSettings
@@ -39,13 +40,25 @@ _ALREADY_RUNNING_TEXT = (
     "anp は既に起動しています。\n\n学習マークの記録が食い違わないよう、同時に1つだけ起動します。"
 )
 
-# ロックの持ち主が生きているかを Qt に確かめさせるまでの時間（ミリ秒）。
-# これを過ぎたロックは、プロセスの生死を見たうえで無効と判断される。
-# 強制終了やブルースクリーンでロックが残っても、次の起動で回復する。
-_STALE_LOCK_MS = 30_000
+_LOCK_FAILED_TITLE = "anp を起動できません"
+_LOCK_PERMISSION_TEXT = (
+    "起動に必要なロックファイルを作成できませんでした。\n\n{path}\n\n"
+    "この場所へ書き込めるかを確認してください。"
+)
+_LOCK_UNKNOWN_TEXT = (
+    "起動に必要なロックファイルを作成できませんでした。\n\nログを確認してください。"
+)
+
+# ロックを保持するのは **アプリが動いている間ずっと**。この使い方では
+# 経過時間で無効と判断させてはいけないので 0 にする（Qt の既定の 30 秒は、
+# 短時間で終わる処理向け）。0 でも、ロックを持っていたプロセスが居なく
+# なっていれば Qt が PID を見て無効と判断するので、強制終了で残った
+# ロックは次の起動で回復する。
+_STALE_LOCK_DISABLED = 0
 
 # 起動できなかったときの終了コード。
 EXIT_ALREADY_RUNNING = 1
+EXIT_LOCK_FAILED = 2
 
 
 def _install_excepthook() -> None:
@@ -69,6 +82,31 @@ def _install_excepthook() -> None:
     sys.excepthook = hook
 
 
+def _report_lock_failure(lock: QLockFile, path: Path) -> int:
+    """ロックを取れなかった理由を知らせ、終了コードを返す。
+
+    **取れない ＝ 二重起動、ではない。** `QLockFile.error()` は「他が持って
+    いる（`LockFailedError`）」のほかに、ロックファイルを作れない
+    （`PermissionError`）や原因不明（`UnknownError`）も返す。まとめて
+    「既に起動しています」と伝えると、書き込めないディレクトリが原因の
+    ときに利用者が延々と別のウィンドウを探すことになる。
+    """
+    error = lock.error()
+    if error == QLockFile.LockError.LockFailedError:
+        logger.warning("another instance is already running")
+        QMessageBox.information(None, _ALREADY_RUNNING_TITLE, _ALREADY_RUNNING_TEXT)
+        return EXIT_ALREADY_RUNNING
+
+    logger.error("failed to acquire the lock file %s: %s", path, error.name)
+    text = (
+        _LOCK_PERMISSION_TEXT.format(path=path)
+        if error == QLockFile.LockError.PermissionError
+        else _LOCK_UNKNOWN_TEXT
+    )
+    QMessageBox.critical(None, _LOCK_FAILED_TITLE, text)
+    return EXIT_LOCK_FAILED
+
+
 def main() -> int:
     """アプリケーションを起動し、終了コードを返す。"""
     QCoreApplication.setOrganizationName(ORGANIZATION_NAME)
@@ -85,11 +123,9 @@ def main() -> int:
 
     # **DB を開く前にロックを取る。** 取れなければウィンドウも接続も作らない。
     lock = QLockFile(str(paths.lock_file))
-    lock.setStaleLockTime(_STALE_LOCK_MS)
+    lock.setStaleLockTime(_STALE_LOCK_DISABLED)
     if not lock.tryLock(0):
-        logger.warning("another instance is already running")
-        QMessageBox.information(None, _ALREADY_RUNNING_TITLE, _ALREADY_RUNNING_TEXT)
-        return EXIT_ALREADY_RUNNING
+        return _report_lock_failure(lock, paths.lock_file)
 
     # SQLite の接続はアプリケーションが所有する。ウィンドウやリポジトリより
     # 寿命が長く、閉じるのはここだけ（`__del__` には頼らない）。学習マークの
