@@ -38,6 +38,12 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 最近使ったファイルからの場合も、起動時の自動復元の場合も同じ手順を通る。
 違うのは「履歴を更新するか」と「失敗をダイアログで知らせるか」の2点
 だけなので、そこだけを引数で分ける（復元専用の open を作らない）。
+
+**差し替えそのものの手順は `DocumentOpenCoordinator` にある。** ドキュメント・
+ビュー・学習マーク・目次・検索を決まった順で入れ替え、途中で失敗したら
+その順に後始末する、という部分をここへ書くと、メニュー・履歴・ダイアログの
+配線に埋もれて順序の正しさが読み取れなくなる。ここが受け持つのは、返って
+きた失敗をどう知らせるかと、タイトル・ツールバー・ステータスバーの追随。
 """
 
 from __future__ import annotations
@@ -65,19 +71,21 @@ from anp.core.settings import Settings
 from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.destination import PdfDestination
-from anp.pdf.document import DocumentController, DocumentError
+from anp.pdf.document import DocumentController
+from anp.pdf.reading_position import ReadingPosition
 from anp.pdf.render import PageRenderService
 from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
+from anp.ui.document_open import DocumentOpenCoordinator
 from anp.ui.pdf_search_controller import PdfSearchController, SearchState
-from anp.ui.pdf_view import PdfView, ReadingPosition, ZoomMode
+from anp.ui.pdf_view import PdfView, ZoomMode
 from anp.ui.recent_files import add_recent, normalize_recent, recent_labels, remove_recent
 from anp.ui.search_dock import SearchDock
 from anp.ui.shortcut_dialog import ShortcutDialog
 from anp.ui.shortcut_manager import ShortcutManager
-from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
+from anp.ui.study_mark_controller import StudyMarkController
 from anp.ui.study_mark_interaction import StudyMarkInteraction
 from anp.ui.study_mark_sidebar import StudyMarkSidebar
 from anp.ui.toc_sidebar import TocSidebar
@@ -87,16 +95,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SIZE = (1000, 800)
 
 _PDF_FILTER = "PDF ファイル (*.pdf)"
-
-_OPEN_ERROR_TITLE = "PDF を開けません"
-
-# 学習マークを読み込めなかったときの知らせ方。開くのを中止した理由と、
-# 記録そのものは消えていないことを書く（利用者がいちばん恐れるのはそこ）。
-_MARK_LOAD_ERROR_TITLE = "学習マークを読み込めません"
-_MARK_LOAD_ERROR = (
-    "この PDF の学習マークを読み込めなかったため、開くのを中止しました。\n"
-    "記録は削除されていません。ログを確認してください。"
-)
 
 # 一覧から移動できなかったときの知らせ方。読み進めるのを妨げないよう、
 # ダイアログではなくステータスバーへ一時的に出す。
@@ -180,6 +178,19 @@ class MainWindow(QMainWindow):
         self._create_study_mark_sidebar()
         self._create_toc_sidebar()
         self._create_search_dock()
+
+        # PDF の差し替えと後始末の手順はここには書かない。ウィンドウの他の
+        # 関心（メニュー・履歴・ダイアログ・タイトル）と混ざると、順序の
+        # 正しさが読み取れなくなる。
+        self._open = DocumentOpenCoordinator(
+            document=self._controller,
+            view=self._view,
+            study_marks=self._study_marks,
+            toc=self._toc_sidebar,
+            search=self._search,
+            search_dock=self._search_dock,
+            settings=self._settings,
+        )
 
         self.setWindowTitle("anp")
         # 履歴のサブメニューはここが所有する。`addMenu(title)` の戻り値だけを
@@ -567,68 +578,23 @@ class MainWindow(QMainWindow):
     def _open_document(self, path: Path, *, notify: bool) -> bool:
         """PDF を開く。開けたかを返す。失敗したら表示を空にする。
 
+        差し替えの手順と後始末は `DocumentOpenCoordinator` にある。ここが
+        受け持つのは「知らせるかどうか」と、タイトル・ツールバー・
+        ステータスバーの追随だけ。
+
         `notify` は失敗を利用者に知らせるかどうか。利用者が明示的に開いた
         ときは知らせるが、起動時の自動復元では出さない（起動した瞬間に
         ダイアログが積み上がるのを避ける。ログには必ず残る）。
-
-        `DocumentController.open()` は失敗時に前のドキュメントも閉じるので、
-        表示だけ古い PDF のまま残すと、見えている内容と実体がずれる。
-        学習マークも同じ理由で、失敗時は表示対象ごと解除する。
-
-        学習マークを読み込むのは **表示が新しい PDF に確定した後**。
-        `set_document()` より前に読み込むと、ドキュメントの差し替えで
-        そのまま捨てられる。
-
-        学習マークを読み込めなかった場合は、その PDF を開いた状態にも
-        しない（fail-closed）。読み込めていないまま読み進められると、
-        利用者からは「マークが消えた」ようにしか見えず、そのうえ
-        P3-3B 以降の追加・更新が実体の分からない PDF に対して行われる。
-        後始末は開くのに失敗したときと同じ「PDF なし」の状態まで戻す。
-
-        知らせ方も PDF を開けなかったときと揃える。**これは想定された失敗
-        経路** なので、アプリケーション境界の「予期しないエラー」に送らず、
-        ここで日本語の警告にする。包まれていない例外（実装の誤り）は
-        後始末だけして送出し、未捕捉例外として扱う。
-
-        **検索は読み込みを始める前に止める。** `DocumentController` は
-        `QPdfDocument` を使い回すので、検索モデルを付けたまま
-        `load()` を呼ぶと、`QPdfSearchModel` がページを走査している最中に
-        対象のページが消える（走査はタイマーで少しずつ進む）。
-        `_clear_document()` の後始末では遅い。
         """
-        self._search_dock.clear_query()
-        self._search.detach_document()
-        try:
-            self._controller.open(path)
-        except DocumentError as error:
-            self._clear_document()
+        failure = self._open.open(path)
+        if failure is not None:
+            # **これは想定された失敗経路**なので、アプリケーション境界の
+            # 「予期しないエラー」に送らず、ここで日本語の警告にする。
+            self._sync_document_ui()
             self._report_open_failure(
-                notify=notify, title=_OPEN_ERROR_TITLE, path=path, body=error.message
+                notify=notify, title=failure.title, path=path, body=failure.body
             )
             return False
-
-        self._settings.last_directory = str(path.parent)
-        self._view.set_document(self._controller.document, self._controller.page_sizes())
-        try:
-            self._study_marks.activate_document(path)
-        except StudyMarkLoadError:
-            self._abort_open()
-            self._report_open_failure(
-                notify=notify, title=_MARK_LOAD_ERROR_TITLE, path=path, body=_MARK_LOAD_ERROR
-            )
-            return False
-        except Exception:
-            self._abort_open()
-            raise
-
-        # 目次を載せるのは **開く操作が最後まで成功した後**。途中で中止する
-        # 経路（PDF が読めない・学習マークが読めない）はすべて
-        # `_clear_document()` を通るので、古い PDF の目次が残ることはない。
-        self._toc_sidebar.set_document(self._controller.document)
-        # 検索も目次と同じ扱い。**開く操作が最後まで成功した後**に載せる。
-        # 検索語と入力欄は読み込みの前に空にしてあるので、A の検索語のまま
-        # B の件数が出ることはない。
-        self._search.attach_document(self._controller.document)
 
         self.setWindowTitle(f"{path.name} - anp")
         self._sync_document_ui()
@@ -645,30 +611,9 @@ class MainWindow(QMainWindow):
         else:
             logger.warning("automatic restore failed for %s: %s", path, title)
 
-    def _abort_open(self) -> None:
-        """開きかけた PDF を手放し、「PDF なし」の状態へ戻す。
-
-        `_clear_document()` との違いはドキュメント自体も閉じること。
-        順序は解放時と同じ「表示 → ドキュメント」で、閉じた後の
-        ドキュメントに対するレンダリング要求を残さない。
-        """
-        self._clear_document()
-        self._controller.close()
-
     def _clear_document(self) -> None:
-        """表示を「PDF なし」の状態へ戻す。
-
-        開くのに失敗したときと、学習マークを読み込めなかったときの後始末は
-        同じ。学習マークだけ別の後始末を作らない。
-
-        目次と検索も一緒に手放す。「PDF なし」なのに前の PDF の目次や
-        検索結果が残っている状態を作らないため。
-        """
-        self._view.clear_document()
-        self._study_marks.clear_document()
-        self._toc_sidebar.clear_document()
-        self._search_dock.clear_query()
-        self._search.detach_document()
+        """表示を「PDF なし」の状態へ戻し、操作の可否を揃える。"""
+        self._open.clear()
         self._sync_document_ui()
 
     # -------------------------------------------------- 表示の同期
@@ -930,13 +875,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 (Qt の命名規則)
         """終了時にウィンドウの位置と状態、倍率、セッションを保存し、PDF を解放する。
 
-        解放の順序は「表示 → ドキュメント」。`clear_document()` が世代を
-        進めてキャッシュと要求を捨ててから、ドキュメントを閉じる。逆に
-        すると、閉じた後のドキュメントに対する要求が残る。
-
-        ここで閉じるのは、閉じたウィンドウがレンダリング結果とキャッシュを
-        抱えたままにならないようにするため。なお `QPdfDocument.close()` は
-        ファイルハンドルまでは手放さない（それは破棄時）。
+        解放の順序（表示 → ドキュメント）は `DocumentOpenCoordinator` が
+        持つ。ここで閉じるのは、閉じたウィンドウがレンダリング結果と
+        キャッシュを抱えたままにならないようにするため。なお
+        `QPdfDocument.close()` はファイルハンドルまでは手放さない
+        （それは破棄時）。
         """
         # 表示を捨てる前に読書位置を取る。`clear_document()` の後では
         # 現在ページもスクロール位置も失われている。
@@ -954,12 +897,8 @@ class MainWindow(QMainWindow):
         self._settings.ui_theme = self._ui_theme.value
         self._settings.sync()
 
-        self._view.clear_document()
-        self._study_marks.clear_document()
         # 目次と検索のモデルは `QPdfDocument` を指しているので、閉じる前に外す。
-        self._toc_sidebar.clear_document()
-        self._search.detach_document()
-        self._controller.close()
+        self._open.close()
         logger.info("main window closed")
         super().closeEvent(event)
 
