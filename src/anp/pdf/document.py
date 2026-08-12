@@ -116,18 +116,29 @@ class DocumentController:
             # 読み込みは通ったのに指紋を取れない（読み込みの最中に消された
             # など）。同一性の分からない PDF を開いた状態にはしない。
             logger.warning("failed to fingerprint %s", path, exc_info=True)
-            self._document.close()
+            self.close()
             raise DocumentError(_UNREADABLE_MESSAGE) from None
+        except BaseException:
+            # 想定していない失敗。**包まないが、開きかけは残さない。**
+            # ここで抜けると `QPdfDocument` だけ開いた状態になる。
+            self.close()
+            raise
 
         self._path = path
         self._content_fingerprint = fingerprint
         logger.info("opened document with %d pages", self._document.pageCount())
 
     def close(self) -> None:
-        """開いている PDF を閉じる。開いていなければ何もしない。"""
-        if self._path is None:
-            return
+        """開いている PDF を閉じる。開いていなければ何もしない。
+
+        **`QPdfDocument` は無条件に閉じる。** `_path` を「開いているか」の
+        代わりに使って早期に返すと、`open()` の途中（`load()` は成功したが
+        `_path` を入れる前）で抜けたときに、閉じられない `QPdfDocument` が
+        残ってしまう。
+        """
+        was_open = self._path is not None
         self._document.close()
         self._path = None
         self._content_fingerprint = None
-        logger.info("closed document")
+        if was_open:
+            logger.info("closed document")

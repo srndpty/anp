@@ -184,7 +184,8 @@ class StudyMarkController(QObject):
         **同一性は呼び出し側が作って渡す。** ここでパスから作り直さない。
         `DocumentController.open()` が読み込みの直後に取った指紋を使うので、
         「表示している PDF」と「持ち主として記録する PDF」の間に差し替えの
-        入り込む隙間が残らない。以後の追加・更新もこの値を使う。
+        入り込む隙間がほとんど無くなる（`load()` の直後まで縮む。ゼロには
+        ならない）。以後の追加・更新もこの値を使う。
         """
         self._active_path = None
         self._identity = None

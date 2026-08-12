@@ -16,6 +16,7 @@ from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
 from anp.pdf.color import PageColorMode
+from anp.pdf.document import DocumentController
 from anp.pdf.layout import InvalidPageGeometryError
 from anp.pdf.render import PageRenderService, PageRequest
 from anp.storage.study_mark_repository import StudyMarkRepository
@@ -307,6 +308,28 @@ def test_a_broken_page_geometry_leaves_no_document(
     monkeypatch.undo()
     opened.open_path(sample_pdf)
     assert opened.view.page_count == 3
+
+
+def test_an_invariant_violation_while_opening_leaves_no_document(
+    opened: MainWindow,
+    two_page_pdf: Path,
+    warnings: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """想定外の失敗でも、開きかけの PDF と前の表示を混ぜたまま残さない。
+
+    実装の誤りは包まずに送出するが、後始末はしてから送る（AGENTS の
+    エラー処理方針）。ここでは指紋が入っていないという不変条件違反で
+    抜ける経路を作る。
+    """
+    monkeypatch.setattr(DocumentController, "content_fingerprint", property(lambda _self: None))
+
+    with pytest.raises(RuntimeError, match="fingerprint"):
+        opened.open_path(two_page_pdf)
+
+    assert not opened.view.has_document
+    assert opened.study_marks.active_document_path is None
+    assert warnings == []
 
 
 def test_a_broken_page_geometry_does_not_keep_the_old_marks(

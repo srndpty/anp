@@ -122,17 +122,19 @@ class DocumentOpenCoordinator:
         # `DocumentController` の `QPdfDocument` は新しい PDF に切り替わって
         # いるので、途中で抜けると「ドキュメントは B、表示は A」という
         # 混ざった状態が残る。例えばページ寸法が壊れた PDF では
-        # `set_document()` がレイアウトの構築で失敗する。
-        # 学習マークの持ち主は、**いま読み込んだ内容**で決める。ここで
-        # パスから指紋を取り直すと、その隙に同じパスが別の内容へ置き換わって
-        # いた場合に、表示している PDF と持ち主がずれる。
-        fingerprint = self._document.content_fingerprint
-        if fingerprint is None:
-            # `open()` が成功していれば必ず入っている。ここへ来るのは実装の誤り。
-            msg = "the document was opened without a content fingerprint"
-            raise RuntimeError(msg)
-        identity = DocumentIdentity.for_content(path, fingerprint)
+        # `set_document()` がレイアウトの構築で失敗する。不変条件の確認
+        # （指紋があること）も、抜ける経路である以上この内側に置く。
         try:
+            # 学習マークの持ち主は、**いま読み込んだ内容**で決める。ここで
+            # パスから指紋を取り直すと、その隙に同じパスが別の内容へ
+            # 置き換わっていた場合に、表示している PDF と持ち主がずれる。
+            fingerprint = self._document.content_fingerprint
+            if fingerprint is None:
+                # `open()` が成功していれば必ず入っている。ここへ来るのは実装の誤り。
+                msg = "the document was opened without a content fingerprint"
+                raise RuntimeError(msg)
+            identity = DocumentIdentity.for_content(path, fingerprint)
+
             self._view.set_document(self._document.document, self._document.page_sizes())
             self._study_marks.activate_document(identity)
             # 目次と検索を載せるのは **他がすべて成功した後**。中止する経路は
