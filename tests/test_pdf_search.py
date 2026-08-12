@@ -31,7 +31,7 @@ import pytest
 from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtPdf import QPdfDocument, QPdfLink, QPdfSearchModel
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QWidget
 from pytestqt.qtbot import QtBot
 
 from anp.core.settings import Settings
@@ -44,7 +44,7 @@ from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_search_controller import NO_RESULT, PdfSearchController, SearchState
 from anp.ui.pdf_view import MIN_ZOOM, PdfView, ZoomMode
-from anp.ui.search_dock import DOCK_OBJECT_NAME, NO_MATCH_TEXT, SearchDock, result_label
+from anp.ui.search_dock import DOCK_OBJECT_NAME, SearchDock, result_label
 from conftest import (
     SEARCH_QUERY,
     SEARCH_QUERY_HITS,
@@ -63,6 +63,14 @@ from helpers import (
 )
 
 _SEARCH_TIMEOUT_MS = 5000
+
+# 検索中のドキュメント切り替えを繰り返す回数。寿命の誤りは1回で必ず出る
+# とは限らないので、同じプロセスで何度も踏む。
+_MID_SEARCH_SWITCHES = 40
+
+# 両方の PDF で必ず一致する検索語。どのページにも一致があるほど走査が
+# 長く続き、「まだ走っている最中」に切り替えやすい。
+_COMMON_QUERY = "e"
 
 
 def wait_for_count(qtbot: QtBot, controller: PdfSearchController, expected: int) -> None:
@@ -431,6 +439,35 @@ def test_attaching_another_document_clears_the_search(
     other.close()
 
 
+def test_attaching_a_document_replaces_the_search_model(
+    qtbot: QtBot, search: PdfSearchController, other_searchable_pdf: Path
+) -> None:
+    """PDF を載せるたびに検索モデルを作り直し、新しいモデルを知らせる。
+
+    `DocumentController` は `QPdfDocument` を使い回すので、同じ
+    `QPdfSearchModel` を開き直しを跨いで生かしておくと、Windows で
+    access violation としてプロセスごと落ちる（**検索語を一度も入れて
+    いなくても落ちる**）。
+    """
+    search.set_query(SEARCH_QUERY)
+    wait_for_count(qtbot, search, SEARCH_QUERY_HITS)
+    before = search.model
+    announced: list[QPdfSearchModel] = []
+    search.model_changed.connect(announced.append)
+
+    other = QPdfDocument()
+    assert other.load(str(other_searchable_pdf)) == QPdfDocument.Error.None_
+    search.attach_document(other)
+
+    assert search.model is not before
+    assert announced == [search.model]
+    # 古いモデルはドキュメントを指していない（消えるまでの間も安全）。
+    assert before.document() is None
+    assert before.searchString() == ""
+    search.detach_document()
+    other.close()
+
+
 def test_the_state_snapshot_follows_the_controller(
     qtbot: QtBot, search: PdfSearchController
 ) -> None:
@@ -478,7 +515,6 @@ def test_the_dock_starts_empty_and_disabled(dock: SearchDock) -> None:
     assert not dock.next_button.isEnabled()
     assert not dock.previous_button.isEnabled()
     assert dock.count_text == "0 / 0"
-    assert dock.message_text == ""
 
 
 def test_the_dock_enables_navigation_only_with_results(dock: SearchDock) -> None:
@@ -494,14 +530,18 @@ def test_the_dock_enables_navigation_only_with_results(dock: SearchDock) -> None
     assert dock.count_text == "2 / 3"
 
 
-def test_no_match_is_reported_without_a_dialog(dock: SearchDock) -> None:
-    """一致が無いことはドックの中で知らせる。ダイアログにはしない。"""
-    dock.set_state(SearchState("x", 0, NO_RESULT, has_document=True))
-    assert dock.message_text == NO_MATCH_TEXT
+def test_zero_hits_are_never_reported_as_a_definitive_no_match(dock: SearchDock) -> None:
+    """0 件を「一致しません」と断定しない。
 
-    # 検索していないときは何も言わない。
-    dock.set_state(SearchState("", 0, NO_RESULT, has_document=True))
-    assert dock.message_text == ""
+    検索は非同期で、`QPdfSearchModel` には走査の完了を知らせるシグナルが
+    無い。「まだ最初の一致が届いていない」と「本当に 0 件」を区別できない
+    ので、件数だけを見せる（ダイアログも出さない）。
+    """
+    dock.set_state(SearchState("x", 0, NO_RESULT, has_document=True))
+
+    assert dock.count_text == "0 / 0"
+    labels = [child.text() for child in dock.findChildren(QLabel)]
+    assert all("一致" not in label for label in labels)
 
 
 def test_typing_in_the_field_reports_the_query(qtbot: QtBot, dock: SearchDock) -> None:
@@ -1223,6 +1263,91 @@ def test_opening_another_document_resets_the_search(
     assert searching.search.has_document
 
 
+def test_opening_another_document_repoints_the_view_to_the_new_model(
+    qtbot: QtBot, searching: MainWindow, other_searchable_pdf: Path
+) -> None:
+    """モデルを作り直したら、ハイライトを描く側の参照も張り替わる。
+
+    古いモデルは `deleteLater()` で消えるので、ビューが指したままだと
+    描画のたびに解放済みのオブジェクトを引くことになる。
+    """
+    searching.reader_actions.find.trigger()
+    type_query(qtbot, searching, SEARCH_QUERY)
+    wait_for_hits(qtbot, searching, SEARCH_QUERY_HITS)
+    before = searching.view.search_model
+
+    searching.open_path(other_searchable_pdf)
+
+    assert searching.view.search_model is searching.search.model
+    assert searching.view.search_model is not before
+
+
+def test_the_search_is_detached_before_the_document_is_loaded(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    searching: MainWindow,
+    other_searchable_pdf: Path,
+) -> None:
+    """B の読み込みに入る時点で、検索は完全に外れている。
+
+    `DocumentController` は `QPdfDocument` を使い回すので、検索モデルを
+    付けたまま `load()` を呼ぶと、`QPdfSearchModel` が走査している最中に
+    対象のページが消える。最終状態（検索語も件数も空）だけでは
+    **順序そのもの**を固定できないので、`open()` に入った瞬間を直接見る。
+    """
+    searching.reader_actions.find.trigger()
+    type_query(qtbot, searching, SEARCH_QUERY)
+    wait_for_hits(qtbot, searching, SEARCH_QUERY_HITS)
+
+    observed: list[tuple[str, str, QPdfDocument | None, int]] = []
+    original_open = DocumentController.open
+
+    def checked_open(controller: DocumentController, path: Path) -> None:
+        search = searching.search
+        observed.append(
+            (search.query, search.model.searchString(), search.model.document(), search.count)
+        )
+        original_open(controller, path)
+
+    monkeypatch.setattr(DocumentController, "open", checked_open)
+
+    searching.open_path(other_searchable_pdf)
+
+    # 検索語・モデルの検索文字列・モデルのドキュメント・件数のすべてが、
+    # 読み込みを始める前に空へ戻っている。
+    assert observed == [("", "", None, 0)]
+
+
+def test_switching_documents_while_a_search_is_running(
+    qtbot: QtBot, window: MainWindow, searchable_pdf: Path, other_searchable_pdf: Path
+) -> None:
+    """検索が **走っている最中** の切り替えを繰り返しても壊れない。
+
+    `QPdfSearchModel` の走査はイベントループ上で少しずつ進む。検索が
+    終わってから切り替えるのでは危ない瞬間を踏めないので、最初の一致が
+    届いた直後（＝まだ後ろのページを走査している）に次の PDF を開く。
+
+    `QPdfDocument` を使い回す設計そのものへの回帰テストなので、同じ
+    プロセスで何度も繰り返す（native の Qt プラットフォームで動かすと、
+    寿命の誤りは access violation として出る）。
+    """
+    window.reader_actions.find.trigger()
+    paths = (searchable_pdf, other_searchable_pdf)
+
+    for index in range(_MID_SEARCH_SWITCHES):
+        window.open_path(paths[index % len(paths)])
+        # 打鍵と同じ経路（`textChanged` → `query_changed`）で検索を始める。
+        window.search_dock.query_edit.setText(_COMMON_QUERY)
+        qtbot.waitUntil(lambda: window.search.count > 0, timeout=_SEARCH_TIMEOUT_MS)
+
+    # 最後まで生きていて、通常の検索がそのまま続けられる。
+    window.open_path(searchable_pdf)
+    window.search_dock.query_edit.setText(SEARCH_QUERY)
+    wait_for_hits(qtbot, window, SEARCH_QUERY_HITS)
+    assert window.search.current_index == 0
+    assert window.view.has_document
+
+
 def test_a_failed_open_detaches_the_search(
     qtbot: QtBot, searching: MainWindow, broken_pdf: Path, warnings: list[str]
 ) -> None:
@@ -1322,10 +1447,10 @@ def test_the_query_is_not_persisted(
     second.close()
 
 
-def test_an_image_only_document_reports_no_match_without_a_dialog(
+def test_an_image_only_document_finds_nothing_without_a_dialog(
     qtbot: QtBot, window: MainWindow, image_only_pdf: Path, warnings: list[str]
 ) -> None:
-    """スキャン画像だけの PDF は 0 件。警告ダイアログは出さない。"""
+    """スキャン画像だけの PDF は 0 件。`0 / 0` だけで、断定も警告もしない。"""
     window.open_path(image_only_pdf)
     window.reader_actions.find.trigger()
 
@@ -1333,7 +1458,8 @@ def test_an_image_only_document_reports_no_match_without_a_dialog(
 
     assert window.search.count == 0
     assert window.search_dock.count_text == "0 / 0"
-    assert window.search_dock.message_text == NO_MATCH_TEXT
+    labels = [child.text() for child in window.search_dock.findChildren(QLabel)]
+    assert all("一致" not in label for label in labels)
     assert warnings == []
 
 

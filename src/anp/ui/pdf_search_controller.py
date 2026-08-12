@@ -21,6 +21,11 @@ SearchDock       PdfView
 `QPdfSearchModel` の行で、ここは番号だけを持つ。`resultAtIndex()` は
 呼ばれたときに引く。
 
+**検索モデルはドキュメント1つにつき1つ。** `DocumentController` は
+`QPdfDocument` を使い回すので、同じ `QPdfSearchModel` を開き直しを跨いで
+生かしておくと Windows でプロセスごと落ちる。開くたびに作り直し、古い
+モデルは `deleteLater()` で消す（`model_changed` で見る側に知らせる）。
+
 **独自の検索意味論を作らない。** 大文字小文字の扱い・Unicode 正規化・
 合字・ハイフネーション・語境界は `QPdfSearchModel` が返したとおり。
 検索文字列も `strip()` しない（前後の空白も検索語の一部）。空文字だけを
@@ -76,21 +81,34 @@ class PdfSearchController(QObject):
     このコントローラはビューを持たない。
     """
 
+    model_changed = Signal(object)
+    """検索モデルを作り直した（新しい `QPdfSearchModel`）。
+
+    ハイライトを描く側は、これを受けて参照を張り替える。**古いモデルを
+    指したままにしない**（`deleteLater()` で消える）。
+    """
+
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
 
         # モデルはこのコントローラが所有する（Qt の親子関係で寿命を持つ）。
-        self._model = QPdfSearchModel(self)
+        self._model = self._new_model()
         self._query = ""
         self._current = NO_RESULT
 
         # 最後に知らせた状態。同じ状態を繰り返し流さないためだけに持つ。
         self._published = self.state
 
-        # 検索は非同期に進む（`setSearchString()` の直後に全件が揃っている
-        # とは限らない）。結果数が後から増減しても現在位置がずれないよう、
-        # モデルの通知から取り直す。固定時間の待ちは入れない。
-        self._model.countChanged.connect(self._refresh)
+    def _new_model(self) -> QPdfSearchModel:
+        """検索モデルを1つ作り、件数の通知だけつなぐ。
+
+        検索は非同期に進む（`setSearchString()` の直後に全件が揃っている
+        とは限らない）。結果数が後から増減しても現在位置がずれないよう、
+        モデルの通知から取り直す。固定時間の待ちは入れない。
+        """
+        model = QPdfSearchModel(self)
+        model.countChanged.connect(self._refresh)
+        return model
 
     # -------------------------------------------------- ドキュメント
     def attach_document(self, document: QPdfDocument) -> None:
@@ -102,10 +120,37 @@ class PdfSearchController(QObject):
         B に対する検索が始まっていないのに件数だけ残る、という状態が
         作れてしまう。文字列を先に空にしてからドキュメントを差し替える
         ので、A の結果が B の結果として一瞬でも見えることはない。
+
+        **モデルは毎回作り直す。** 理由は `_replace_model()` を参照。
         """
-        self._reset_query()
+        self._replace_model()
         self._model.setDocument(document)
         self._refresh()
+
+    def _replace_model(self) -> None:
+        """検索モデルを新品に取り替え、古いモデルは Qt に消させる。
+
+        `DocumentController` は `QPdfDocument` を使い回すので、同じ
+        `QPdfSearchModel` を「外す → 開き直したドキュメントへ付け直す」と、
+        Windows で access violation としてプロセスごと落ちる。**検索語を
+        一度も入れていなくても落ちる**ので、走査中のキャンセルの問題では
+        なく、モデルがドキュメントの入れ替わりを跨いで生き続けること自体が
+        危ない。
+
+        `setDocument(None)` してから `deleteLater()` する。**即座に削除
+        しない**のは、モデルの中で進んでいる遅延処理がこのイベントの中から
+        呼ばれている可能性があるため。
+        """
+        self._reset_query()
+        old = self._model
+        # C++ の `setDocument(QPdfDocument *)` は nullptr を受けるが、
+        # PySide6 の型定義は None を含んでいない（目次と同じ）。
+        old.setDocument(None)  # type: ignore[arg-type]
+        old.countChanged.disconnect(self._refresh)
+        old.deleteLater()
+
+        self._model = self._new_model()
+        self.model_changed.emit(self._model)
 
     def detach_document(self) -> None:
         """ドキュメントを手放し、検索を空の状態へ戻す。
@@ -183,10 +228,13 @@ class PdfSearchController(QObject):
 
     @property
     def model(self) -> QPdfSearchModel:
-        """検索モデル。ハイライトを描く `PdfView` へ渡す。
+        """いまの検索モデル。ハイライトを描く `PdfView` へ渡す。
 
         **結果を Python のリストへ写し取らない**ので、ビューもこのモデルを
         直接引く。
+
+        **ドキュメントを開くたびに別のインスタンスになる**（`model_changed`）。
+        参照を持ち続ける側は、その通知で張り替えること。
         """
         return self._model
 

@@ -285,8 +285,10 @@ class MainWindow(QMainWindow):
         あれば `restoreState()` の値が勝つ。他の2つのドックと同じ扱いなので、
         検索専用の設定キーは作らない。
 
-        検索モデルをビューへ渡すのはここ1回だけ。モデルはコントローラと
-        同じ寿命で、ドキュメントの着脱だけがモデルの内側で起こる。
+        検索モデルは **PDF を開くたびにコントローラが作り直す**（同じ
+        `QPdfSearchModel` を、使い回しの `QPdfDocument` へ付け直すと落ちる）。
+        ビューの参照は `model_changed` で張り替える。ここで渡すのは最初の
+        1つだけ。
         """
         self._search = PdfSearchController(self)
         self._search_dock = SearchDock(self)
@@ -294,6 +296,7 @@ class MainWindow(QMainWindow):
         self._search_dock.hide()
 
         self._view.set_search_model(self._search.model)
+        self._search.model_changed.connect(self._view.set_search_model)
 
         self._search_dock.query_changed.connect(self._search.set_query)
         self._search_dock.next_requested.connect(self._search.next_result)

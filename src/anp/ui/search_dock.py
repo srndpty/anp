@@ -42,10 +42,6 @@ DOCK_OBJECT_NAME = "searchDock"
 
 _PLACEHOLDER = "PDF 内を検索"
 
-# 一致が無いときの知らせ方。**エラーではない**のでダイアログは出さない。
-# スキャンした画像だけの PDF もここに来る（OCR はしないので 0 件が正しい）。
-NO_MATCH_TEXT = "一致するテキストはありません"
-
 
 def result_label(state: SearchState) -> str:
     """件数の表示。利用者には 1 始まりで見せる。
@@ -128,9 +124,6 @@ class SearchDock(QDockWidget):
         self._count_label = QLabel(body)
         row.addWidget(self._count_label)
 
-        self._message_label = QLabel(body)
-        row.addWidget(self._message_label)
-
         return body
 
     # -------------------------------------------------- 状態
@@ -142,16 +135,17 @@ class SearchDock(QDockWidget):
 
         入力欄の文字列はここでは書き換えない。利用者が打っている最中に
         カーソルが飛ぶのを避けるためで、文字列の持ち主は入力欄のまま。
+
+        **「一致しません」とは言わない。** 検索は非同期に進み、
+        `QPdfSearchModel` には「全ページを見終わった」ことを知らせる
+        シグナルが無い。件数が 0 なのは「まだ最初の一致が届いていない」
+        場合と「本当に 0 件」の場合の区別がつかないので、断定せず
+        `0 / 0` だけを見せる（スキャン画像だけの PDF も同じ表示になる）。
         """
         self._query_edit.setEnabled(state.has_document)
         self._next_button.setEnabled(state.has_results)
         self._previous_button.setEnabled(state.has_results)
         self._count_label.setText(result_label(state))
-        # 一致が無いことを伝えるのは、実際に検索したときだけ。空の入力欄に
-        # 「一致しません」と出さない。
-        self._message_label.setText(
-            NO_MATCH_TEXT if state.has_document and state.query and state.count == 0 else ""
-        )
 
     def clear_query(self) -> None:
         """入力欄を空にする。
@@ -190,8 +184,3 @@ class SearchDock(QDockWidget):
     def count_text(self) -> str:
         """件数の表示（`3 / 17` の形）。"""
         return self._count_label.text()
-
-    @property
-    def message_text(self) -> str:
-        """一致が無いときの知らせ。無ければ空文字。"""
-        return self._message_label.text()
