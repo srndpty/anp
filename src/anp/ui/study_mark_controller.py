@@ -142,7 +142,7 @@ class StudyMarkController(QObject):
         """
         return self._marks
 
-    def activate_document(self, path: Path) -> None:
+    def activate_document(self, document: DocumentIdentity) -> None:
         """この PDF の学習マークを読み込んで表示する。
 
         **呼ぶのは `PdfView.set_document()` が成功した後**。ビューは
@@ -171,10 +171,10 @@ class StudyMarkController(QObject):
         誤りが「学習マークを読み込めませんでした」という日常的な失敗の
         見た目に化けて、fail-fast が効かなくなる。
 
-        **PDF の同一性を作るのはここだけ。** 内容の指紋はファイル全体を
-        読むので、開いたときに1回で済ませる。以後の追加・更新はこの値を
-        使うので、表示中に同じパスが別の内容へ置き換わっても、いま見えて
-        いる PDF のマークとして扱われる。
+        **同一性は呼び出し側が作って渡す。** ここでパスから作り直さない。
+        `DocumentController.open()` が読み込みの直後に取った指紋を使うので、
+        「表示している PDF」と「持ち主として記録する PDF」の間に差し替えの
+        入り込む隙間が残らない。以後の追加・更新もこの値を使う。
         """
         self._active_path = None
         self._identity = None
@@ -182,16 +182,15 @@ class StudyMarkController(QObject):
         self._publish_marks(())
 
         try:
-            identity = DocumentIdentity.of(path)
-            marks = self._repository.list_for_document(identity)
-            unverified = self._repository.unverified_count(identity)
+            marks = self._repository.list_for_document(document)
+            unverified = self._repository.unverified_count(document)
         except _LOAD_ERRORS as error:
-            logger.exception("failed to load study marks for %s", path)
-            msg = f"failed to load study marks for {path}"
+            logger.exception("failed to load study marks for %s", document.path)
+            msg = f"failed to load study marks for {document.path}"
             raise StudyMarkLoadError(msg) from error
 
-        self._active_path = Path(path)
-        self._identity = identity
+        self._active_path = document.path
+        self._identity = document
         self._unverified_count = unverified
         self._publish_marks(marks)
 

@@ -20,19 +20,12 @@ StudyMark は「この問題を間違えた」位置を記録する非破壊メ�
 
 from __future__ import annotations
 
-import hashlib
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-# 内容の指紋を読み取るときの1回分の読み込み量。
-_FINGERPRINT_CHUNK_BYTES = 1024 * 1024
-
-# SHA-256 の16進表記の長さ。スキーマの CHECK と揃える。
-FINGERPRINT_LENGTH = 64
-
-_HEX_DIGITS = frozenset("0123456789abcdef")
+from anp.core.fingerprint import file_fingerprint, validate_fingerprint
 
 
 def document_key(path: Path | str) -> str:
@@ -43,8 +36,8 @@ def document_key(path: Path | str) -> str:
     として扱われないようにするため。
 
     **パスだけでは同一性は決まらない。** 同じパスに別の内容の PDF が置かれる
-    ことがあるので、学習マークの持ち主の判定にはこれと
-    `document_fingerprint()` の2つを使う。
+    ことがあるので、学習マークの持ち主の判定にはこれと内容の指紋
+    （`anp.core.fingerprint`）の2つを使う（`DocumentIdentity`）。
 
     既知の制限: 識別子はパスなので、**PDF を別の場所へ移動・リネームすると
     以前の学習マークとは自動的に結び付かない**。内容による追跡（移動しても
@@ -54,44 +47,6 @@ def document_key(path: Path | str) -> str:
         msg = "document path must not be empty"
         raise ValueError(msg)
     return os.path.normcase(str(Path(path).resolve()))
-
-
-def document_fingerprint(path: Path | str) -> str:
-    """PDF の内容から作る指紋（SHA-256 の16進表記）。
-
-    **同じパスに別の PDF が置かれたことを見分けるために使う。** パスだけを
-    識別子にすると、`math.pdf` を別の本で上書きしたときに、古い本の学習
-    マークが新しい本のページ番号のところへ「正常なデータとして」表示される。
-    位置がそれらしく見えるぶん、単に表示が消えるより危ない。
-
-    内容の全体を読む。1 PDF につき、開いたときとマークを作ったときにしか
-    計算しないので、数十 MB の本でも体感できる待ちにはならない。先頭数 KB
-    だけの簡易な指紋にしないのは、同じテンプレートで作られた PDF が
-    区別できなくなるため。
-
-    読めなければ `OSError` がそのまま出る。呼び出し側は「学習マークを
-    読み込めなかった」として扱う。
-    """
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        while chunk := stream.read(_FINGERPRINT_CHUNK_BYTES):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def validate_fingerprint(fingerprint: str) -> None:
-    """指紋が SHA-256 の16進表記であることを確かめる。
-
-    長さだけでなく文字種まで見る。長さしか見ないと、`"x" * 64` のような
-    値が「壊れたデータ」ではなく「たまたま一致しない指紋」として通り、
-    学習マークが黙って消えたように見える。
-    """
-    if not isinstance(fingerprint, str):
-        msg = f"fingerprint must be str, got {type(fingerprint).__name__}"
-        raise TypeError(msg)
-    if len(fingerprint) != FINGERPRINT_LENGTH or not _HEX_DIGITS.issuperset(fingerprint):
-        msg = f"fingerprint must be {FINGERPRINT_LENGTH} lowercase hex digits, got {fingerprint!r}"
-        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +64,17 @@ class DocumentIdentity:
     """
 
     key: str
+    """パスの表記揺れを吸収した識別子（`document_key()`）。"""
+
     fingerprint: str
+    """開いた時点の内容の指紋。"""
+
+    path: Path = field(compare=False)
+    """開いたときのパス。**同一性の判定には使わない**（`key` が正規形）。
+
+    表示や照合のために元の表記も持ち回る。`key` は `normcase` 済みで
+    利用者に見せる形ではない。
+    """
 
     def __post_init__(self) -> None:
         validate_document_key(self.key)
@@ -117,8 +82,24 @@ class DocumentIdentity:
 
     @classmethod
     def of(cls, path: Path | str) -> DocumentIdentity:
-        """PDF を1回読んで同一性を作る。読めなければ `OSError`。"""
-        return cls(key=document_key(path), fingerprint=document_fingerprint(path))
+        """PDF を1回読んで同一性を作る。読めなければ `OSError`。
+
+        **開いた PDF に対して使うなら `for_content()` の方**。こちらは
+        ファイルを開き直して読むので、`QPdfDocument` が読んだ内容との間に
+        隙間ができる。
+        """
+        return cls.for_content(path, file_fingerprint(path))
+
+    @classmethod
+    def for_content(cls, path: Path | str, fingerprint: str) -> DocumentIdentity:
+        """既に計算してある指紋から同一性を作る。
+
+        **PDF を読み込んだその場で取った指紋を渡すための入口。**
+        `DocumentController.open()` が読み込みの直後に計算した値を使えば、
+        「表示している PDF」と「持ち主として記録する PDF」の間に、
+        差し替えの入り込む隙間がほとんど無くなる。
+        """
+        return cls(key=document_key(path), fingerprint=fingerprint, path=Path(path))
 
 
 def validate_document_key(key: str) -> None:

@@ -21,8 +21,10 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
 
 from anp import app as app_module
+from anp.core.fingerprint import file_fingerprint
 from anp.core.paths import AppPaths
 from anp.core.settings import Settings
+from anp.pdf import document as document_module
 from anp.pdf.document import DocumentController
 from anp.storage import database
 from anp.storage import study_mark as study_mark_module
@@ -95,7 +97,7 @@ def test_activating_a_document_shows_its_marks(
     mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.5)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert study_mark_controller.active_document_path == sample_pdf
     assert view.study_marks == (mark,)
@@ -118,15 +120,15 @@ def test_switching_documents_swaps_the_marks(
     b_mark = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.9, 0.9)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert view.study_marks == (a_mark,)
 
     show(view, doc, two_page_pdf)
-    study_mark_controller.activate_document(two_page_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(two_page_pdf))
     assert view.study_marks == (b_mark,)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert view.study_marks == (a_mark,)
 
 
@@ -141,10 +143,10 @@ def test_a_document_without_marks_shows_nothing(
     """マークが1件も無い PDF へ切り替えたら空になる。"""
     study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     show(view, doc, single_page_pdf)
-    study_mark_controller.activate_document(single_page_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(single_page_pdf))
 
     assert view.study_marks == ()
 
@@ -159,7 +161,7 @@ def test_clearing_the_document_releases_the_marks(
     """表示対象を解除すると、対象もマークも無くなる。"""
     study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     study_mark_controller.clear_document()
 
@@ -188,7 +190,7 @@ def test_refresh_reloads_the_active_document(
     P3-3B の更新後の反映はこの経路に載せる。
     """
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert list(view.study_marks) == []
 
     added = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
@@ -208,7 +210,7 @@ def test_only_the_active_document_is_queried(
     controller = StudyMarkController(recording, view)
 
     show(view, doc, sample_pdf)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert recording.queried == [document_key(sample_pdf)]
 
@@ -233,7 +235,7 @@ def test_the_identity_is_fixed_when_the_document_is_opened(
     repository = StudyMarkRepository(study_mark_connection)
     controller = StudyMarkController(repository, view)
     show(view, doc, path)
-    controller.activate_document(path)
+    controller.activate_document(DocumentIdentity.of(path))
 
     # 表示したまま、同じパスの中身が別の PDF に置き換わった。
     path.write_bytes(two_page_pdf.read_bytes())
@@ -244,6 +246,51 @@ def test_the_identity_is_fixed_when_the_document_is_opened(
     assert len(repository.list_for_document(original)) == 1
     assert repository.list_for_document(DocumentIdentity.of(path)) == []
     assert len(controller.study_marks) == 1
+
+
+def test_the_controller_records_the_fingerprint_of_what_it_loaded(
+    doc: DocumentController, sample_pdf: Path
+) -> None:
+    """`DocumentController` は、読み込んだ内容の指紋を持って返る。"""
+    assert doc.content_fingerprint is None
+
+    doc.open(sample_pdf)
+
+    assert doc.content_fingerprint == file_fingerprint(sample_pdf)
+
+    doc.close()
+    assert doc.content_fingerprint is None
+
+
+def test_opening_does_not_reread_the_file_for_the_identity(
+    qtbot: QtBot,
+    settings: Settings,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """持ち主の指紋は、読み込みの直後に取った値をそのまま使う。
+
+    開いた後でファイルを読み直して指紋を取ると、その隙に同じパスが別の
+    内容へ置き換わったときに「表示は A、持ち主は B」になる。読み直しの
+    経路（`DocumentIdentity.of()`）を通ったら失敗するようにして固定する。
+    """
+
+    def forbidden(_path: Path | str) -> str:
+        msg = "the identity must come from the load, not from a second read"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(study_mark_module, "file_fingerprint", forbidden)
+
+    window = MainWindow(settings, study_marks)
+    qtbot.addWidget(window)
+    try:
+        window.open_path(sample_pdf)
+
+        assert window.view.has_document
+        assert window.study_marks.active_document_path == sample_pdf
+    finally:
+        window.close()
 
 
 def test_the_fingerprint_is_read_once_per_open(
@@ -260,17 +307,21 @@ def test_the_fingerprint_is_read_once_per_open(
     Ctrl + クリックのたびに画面が固まる。
     """
     reads: list[Path] = []
-    original = study_mark_module.document_fingerprint
+    original = document_module.file_fingerprint
 
     def counting(path: Path | str) -> str:
         reads.append(Path(path))
         return original(path)
 
-    monkeypatch.setattr(study_mark_module, "document_fingerprint", counting)
+    # 指紋を取りうる2箇所（PDF を開いたとき・同一性を作るとき）を両方数える。
+    monkeypatch.setattr(document_module, "file_fingerprint", counting)
+    monkeypatch.setattr(study_mark_module, "file_fingerprint", counting)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
-    assert len(reads) == 1
+    fingerprint = doc.content_fingerprint
+    assert fingerprint is not None
+    study_mark_controller.activate_document(DocumentIdentity.for_content(sample_pdf, fingerprint))
+    assert len(reads) == 1, "開いたときの1回だけのはず"
 
     for index in range(3):
         study_mark_controller.create_mark(
@@ -278,8 +329,8 @@ def test_the_fingerprint_is_read_once_per_open(
             expected_document=sample_pdf,
         )
 
-    assert len(reads) == 1
-    assert len(study_marks.list_for_document(DocumentIdentity.of(sample_pdf))) == 3
+    assert len(reads) == 1, "マークを作るたびに読み直している"
+    assert len(study_mark_controller.study_marks) == 3
 
 
 def test_marks_are_passed_through_unchanged(
@@ -299,7 +350,7 @@ def test_marks_are_passed_through_unchanged(
         study_marks.increment_mistake_count(first.id)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     marks = view.study_marks
     assert len(marks) == 2
@@ -324,7 +375,7 @@ def test_marks_outside_the_page_range_are_still_handed_over(
     stale = study_marks.create(DocumentIdentity.of(single_page_pdf), 7, 0.5, 0.5)
 
     show(view, doc, single_page_pdf)
-    study_mark_controller.activate_document(single_page_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(single_page_pdf))
 
     assert view.study_marks == (stale,)
 
@@ -351,12 +402,12 @@ def test_a_read_failure_leaves_no_active_document(
     )
 
     show(view, doc, sample_pdf)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert view.study_marks == (a_mark,)
 
     show(view, doc, two_page_pdf)
     with pytest.raises(StudyMarkLoadError):
-        controller.activate_document(two_page_pdf)
+        controller.activate_document(DocumentIdentity.of(two_page_pdf))
 
     assert list(view.study_marks) == []
     assert controller.active_document_path is None
@@ -374,7 +425,7 @@ def test_a_read_failure_on_a_closed_connection_propagates(
     study_mark_connection.close()
 
     with pytest.raises(StudyMarkLoadError):
-        study_mark_controller.activate_document(sample_pdf)
+        study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert view.study_marks == ()
     assert study_mark_controller.active_document_path is None
@@ -396,7 +447,7 @@ def test_a_read_failure_keeps_the_original_error_as_the_cause(
     study_mark_connection.close()
 
     with pytest.raises(StudyMarkLoadError) as error:
-        study_mark_controller.activate_document(sample_pdf)
+        study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert isinstance(error.value.__cause__, sqlite3.ProgrammingError)
 
@@ -426,7 +477,7 @@ def test_a_broken_stored_row_is_a_load_failure(
     )
 
     with pytest.raises(StudyMarkLoadError):
-        study_mark_controller.activate_document(sample_pdf)
+        study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert study_mark_controller.active_document_path is None
 
@@ -451,7 +502,7 @@ def test_a_programming_error_is_not_reported_as_a_load_failure(
     show(view, doc, sample_pdf)
 
     with pytest.raises(AttributeError):
-        controller.activate_document(sample_pdf)
+        controller.activate_document(DocumentIdentity.of(sample_pdf))
 
 
 def test_loading_marks_does_not_touch_the_rendering(
@@ -476,7 +527,7 @@ def test_loading_marks_does_not_touch_the_rendering(
     page = view.current_page
     scroll = view.verticalScrollBar().value()
 
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert len(service.requests) == requests
     assert view.zoom == zoom

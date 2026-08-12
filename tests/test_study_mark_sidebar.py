@@ -165,7 +165,7 @@ def test_activating_a_document_publishes_its_marks(
     mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.5)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert study_mark_controller.study_marks == (mark,)
     assert study_mark_controller.study_marks == view.study_marks
@@ -185,7 +185,7 @@ def test_the_snapshot_is_an_immutable_tuple(
     """
     study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.5)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert isinstance(study_mark_controller.study_marks, tuple)
 
@@ -199,7 +199,7 @@ def test_refresh_publishes_the_updated_snapshot(
 ) -> None:
     """`refresh()` でスナップショットが入れ替わる。"""
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert list(study_mark_controller.study_marks) == []
 
     added = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
@@ -218,7 +218,7 @@ def test_clearing_the_document_publishes_an_empty_snapshot(
     """表示対象の解除でスナップショットも空になる。"""
     study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     study_mark_controller.clear_document()
 
@@ -236,7 +236,7 @@ def test_a_mutation_publishes_the_updated_snapshot(
     """更新が通ったらスナップショットも読み直した内容になる。"""
     mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     study_mark_controller.increment_mark(mark.id)
 
@@ -258,7 +258,7 @@ def test_a_mutation_publishes_without_rereading(
     mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     controller = StudyMarkController(repository, view)
     show(view, doc, sample_pdf)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     repository.failing = "list"
     controller.increment_mark(mark.id)
@@ -285,7 +285,7 @@ def test_every_publish_notifies_once(
 
     mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     # 読み取りの前の空と、読み取れた分の2回。
     assert published == [(), (mark,)]
@@ -309,13 +309,13 @@ def test_a_load_failure_publishes_an_empty_snapshot(
     controller = StudyMarkController(repository, view)
 
     show(view, doc, sample_pdf)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert len(controller.study_marks) == 1
 
     repository.failing = "list"
     show(view, doc, two_page_pdf)
     with pytest.raises(StudyMarkLoadError):
-        controller.activate_document(two_page_pdf)
+        controller.activate_document(DocumentIdentity.of(two_page_pdf))
 
     assert list(controller.study_marks) == []
     assert list(view.study_marks) == []

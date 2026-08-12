@@ -83,7 +83,7 @@ def study_mark_controller(
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(study_marks, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     return controller
 
 
@@ -305,7 +305,7 @@ def test_a_failed_mutation_leaves_the_previous_snapshot(
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     repository.failing = failing
 
     with pytest.raises(sqlite3.OperationalError):
@@ -326,7 +326,7 @@ def test_a_failed_create_adds_nothing(
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     repository.failing = "create"
 
     with pytest.raises(sqlite3.OperationalError):
@@ -350,7 +350,7 @@ def test_a_failed_note_update_keeps_the_old_note(
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     repository.failing = "update_note"
 
     with pytest.raises(sqlite3.OperationalError):
@@ -380,7 +380,7 @@ def test_a_successful_mutation_does_not_depend_on_a_reread(
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     repository.failing = "list"
 
     controller.increment_mark(mark.id)
@@ -405,7 +405,7 @@ def test_a_mutation_does_not_reread_the_whole_document(
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     queries = len(repository.queried)
 
     controller.increment_mark(mark.id)
