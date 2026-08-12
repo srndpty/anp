@@ -25,6 +25,7 @@ PdfView（ヒットテストと座標変換）
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,8 +33,9 @@ from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox, QWidget
 
 from anp.storage.study_mark import StudyMark
+from anp.storage.study_mark_repository import StoredStudyMarkError
 from anp.ui.pdf_view import PdfView
-from anp.ui.study_mark_controller import StudyMarkController
+from anp.ui.study_mark_controller import StudyMarkController, StudyMarkError
 from anp.ui.study_marks import PagePosition, StudyMarkTarget
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,12 @@ _NOTE_LABEL = "メモ"
 
 _DELETE_TITLE = "学習マークを削除"
 _DELETE_TEXT = "この学習マークを削除しますか？"
+
+# 更新の操作で起こりうる**想定された失敗**。表示対象の食い違い
+# （`StudyMarkError`）、DB の障害、保存データの不整合、PDF そのものを
+# 読めないこと（内容の指紋）。SQL はここに書かないが、リポジトリが
+# `sqlite3` の例外を上げてくるという事実はこの境界が引き受ける。
+_OPERATION_ERRORS = (StudyMarkError, sqlite3.Error, StoredStudyMarkError, OSError)
 
 
 class StudyMarkInteraction:
@@ -164,13 +172,17 @@ class StudyMarkInteraction:
     def _run(self, operation: Callable[[], None]) -> None:
         """操作を実行し、失敗したら記録して知らせる。
 
-        ここが利用者の操作の境界なので、例外の種類で分けない
-        （`sqlite3` でも `StudyMarkError` でも、できることは同じ）。
+        捕まえるのは **想定された失敗だけ**（`_OPERATION_ERRORS`）。どれも
+        利用者から見れば「更新できなかった」の1通りなので、種類では分けない。
         表示を成功したように見せないのは `StudyMarkController` の責任で、
         ここは「読み続けられる」状態を壊さないことだけを守る。
+
+        `AttributeError` のような実装の誤りはここで止めない。小さな警告に
+        化けさせるとバグが残り続けるので、アプリケーション境界の未捕捉例外
+        として扱う。
         """
         try:
             operation()
-        except Exception as error:
+        except _OPERATION_ERRORS as error:
             logger.exception("study mark operation failed")
             QMessageBox.warning(self._parent, _ERROR_TITLE, f"{_ERROR_TEXT}\n\n{error}")

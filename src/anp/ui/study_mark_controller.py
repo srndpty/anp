@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
@@ -53,11 +54,16 @@ from typing import NoReturn
 from PySide6.QtCore import QObject, Signal
 
 from anp.storage.study_mark import StudyMark, document_key
-from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.storage.study_mark_repository import StoredStudyMarkError, StudyMarkRepository
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_marks import PagePosition
 
 logger = logging.getLogger(__name__)
+
+# リポジトリが送出しうる**想定された失敗**。DB の障害、保存データの不整合、
+# PDF そのものを読めないこと（内容の指紋）の3つ。これ以外（`AttributeError`
+# など）は実装の誤りなので包まずに素通しする。
+_LOAD_ERRORS = (sqlite3.Error, StoredStudyMarkError, OSError)
 
 
 class StudyMarkError(RuntimeError):
@@ -140,15 +146,21 @@ class StudyMarkController(QObject):
         リポジトリの失敗を1つの型へ包むのは、呼び出し側が「想定された
         読み込み失敗」と「実装の誤り」を取り違えないようにするため。
         `sqlite3` の例外も、保存されていた行が契約を満たさなかったときの
-        `ValueError` も、UI から見れば同じ「読み込めなかった」になる。
-        原因は `__cause__` に残すので調査の情報は失われない。
+        `StoredStudyMarkError` も、内容の指紋を読めなかったときの `OSError`
+        も、UI から見れば同じ「読み込めなかった」になる。原因は `__cause__`
+        に残すので調査の情報は失われない。
+
+        **包むのは想定された失敗だけ。** `AttributeError` のような実装の
+        誤りは素通しする。ここで `except Exception` にすると、プログラムの
+        誤りが「学習マークを読み込めませんでした」という日常的な失敗の
+        見た目に化けて、fail-fast が効かなくなる。
         """
         self._active_path = None
         self._publish_marks(())
 
         try:
             marks = self._repository.list_for_document(Path(path))
-        except Exception as error:
+        except _LOAD_ERRORS as error:
             logger.exception("failed to load study marks for %s", path)
             msg = f"failed to load study marks for {path}"
             raise StudyMarkLoadError(msg) from error

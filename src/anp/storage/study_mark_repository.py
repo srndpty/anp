@@ -31,17 +31,36 @@ from anp.storage.study_mark import (
 _COLUMNS = "id, document_key, page_index, x_norm, y_norm, mistake_count, note"
 
 
+class StoredStudyMarkError(RuntimeError):
+    """保存されていた行がドメインの契約を満たしていなかった。
+
+    **想定された失敗経路**として `sqlite3.Error` と同じ扱いにするために
+    型を分ける。これが無いと、呼び出し側は行の不整合を捕まえるために
+    `ValueError` / `TypeError` を広く捕まえることになり、実装の誤りまで
+    「読み込めなかった」に化ける。原因は `__cause__` に残す。
+    """
+
+
 def _to_study_mark(row: sqlite3.Row) -> StudyMark:
-    """`study_marks` の1行をドメインオブジェクトへ写す。"""
-    return StudyMark(
-        id=row["id"],
-        document_key=row["document_key"],
-        page_index=row["page_index"],
-        x_norm=row["x_norm"],
-        y_norm=row["y_norm"],
-        mistake_count=row["mistake_count"],
-        note=row["note"],
-    )
+    """`study_marks` の1行をドメインオブジェクトへ写す。
+
+    CHECK 制約をすり抜けた行（手で書き換えられた DB など）は
+    `StudyMark` の検証で弾かれる。呼び出し側が実装の誤りと区別できるよう、
+    ここで保存データの不整合として包み直す。
+    """
+    try:
+        return StudyMark(
+            id=row["id"],
+            document_key=row["document_key"],
+            page_index=row["page_index"],
+            x_norm=row["x_norm"],
+            y_norm=row["y_norm"],
+            mistake_count=row["mistake_count"],
+            note=row["note"],
+        )
+    except (TypeError, ValueError) as error:
+        msg = f"stored study mark {row['id']!r} does not satisfy the contract"
+        raise StoredStudyMarkError(msg) from error
 
 
 def _validate_mark_id(mark_id: int) -> None:

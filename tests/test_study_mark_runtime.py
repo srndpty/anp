@@ -358,6 +358,29 @@ def test_a_broken_stored_row_is_a_load_failure(
     assert study_mark_controller.active_document_path is None
 
 
+def test_a_programming_error_is_not_reported_as_a_load_failure(
+    view: PdfView,
+    doc: DocumentController,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+) -> None:
+    """実装の誤りは「学習マークを読み込めません」に化けさせない。
+
+    広く捕まえて包むと、`AttributeError` のようなバグが想定内の失敗の
+    見た目になり、fail-fast が効かなくなる。
+    """
+
+    class BuggyRepository(StudyMarkRepository):
+        def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
+            raise AttributeError(str(document_path))
+
+    controller = StudyMarkController(BuggyRepository(study_mark_connection), view)
+    show(view, doc, sample_pdf)
+
+    with pytest.raises(AttributeError):
+        controller.activate_document(sample_pdf)
+
+
 def test_loading_marks_does_not_touch_the_rendering(
     study_mark_controller: StudyMarkController,
     study_marks: StudyMarkRepository,

@@ -1098,6 +1098,30 @@ def test_a_failed_note_update_is_reported(
     assert window.view.has_document
 
 
+def test_a_programming_error_is_not_shown_as_an_update_failure(
+    window: MainWindow,
+    errors: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """実装の誤りは小さな警告に化けさせず、そのまま送出する。
+
+    ここで広く捕まえると、バグが「学習マークを更新できませんでした」に
+    見えたまま残り続ける。**Qt のイベントループを挟まずに呼ぶ。** 挟むと
+    例外が PySide6 に拾われてしまい、素通ししたことを確かめられない。
+    """
+
+    def buggy(*_args: object, **_kwargs: object) -> None:
+        raise AttributeError("bug")
+
+    monkeypatch.setattr(window.study_marks, "create_mark", buggy)
+    target = StudyMarkTarget(position=PagePosition(page_index=0, x_norm=0.5, y_norm=0.5))
+
+    with pytest.raises(AttributeError):
+        window.study_mark_interaction._on_activated(target)  # noqa: SLF001
+
+    assert errors == []
+
+
 def test_a_broken_reread_does_not_break_a_click(
     qtbot: QtBot,
     broken_window: tuple[MainWindow, BrokenRepository],
