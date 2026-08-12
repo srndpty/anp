@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections.abc import Sequence
@@ -24,9 +25,15 @@ _KEY_FREE_ZOOM = "view/free_zoom"
 _KEY_PAGE_COLOR_MODE = "view/page_color_mode"
 _KEY_CANVAS_THEME = "view/canvas_theme"
 _KEY_UI_THEME = "ui/theme"
-_KEY_SESSION_DOCUMENT = "session/document"
-_KEY_SESSION_PAGE_INDEX = "session/page_index"
-_KEY_SESSION_Y_NORM = "session/y_norm"
+# 前回のセッションは **1つの鍵にまとめて** 持つ。パス・ページ・縦位置を
+# 別々の鍵に書くと、書き込みの途中で終了したときに「パスだけ新しくて
+# ページが古い」組み合わせが残りうる。1つの JSON にすれば、`QSettings` の
+# 1回の書き込みで丸ごと入れ替わる。
+_KEY_SESSION = "session/last"
+
+_FIELD_DOCUMENT = "document"
+_FIELD_PAGE_INDEX = "page_index"
+_FIELD_Y_NORM = "y_norm"
 
 # キーボードショートカットは `shortcuts/<command-id>` に1コマンド1件で置く。
 # コマンド ID を決めるのは UI 層で、`core` は文字列として読み書きするだけ。
@@ -107,6 +114,28 @@ class Settings:
         self._backend.setValue(_KEY_RECENT_FILES, list(value))
 
     # -------------------------------------------------- 前回のセッション
+    def _session(self) -> dict[str, object]:
+        """保存されている前回のセッション。無いか壊れていれば空の辞書。
+
+        3つの値は1つの JSON にまとめて入っている。読めない値が1つあっても
+        セッション全体を捨てはしない（各 property が既定値へ落とす）。
+        """
+        value = self._backend.value(_KEY_SESSION)
+        if value is None:
+            return {}
+        if not isinstance(value, str):
+            logger.warning("ignoring non-string session value: %r", value)
+            return {}
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            logger.warning("ignoring unreadable session value: %r", value)
+            return {}
+        if not isinstance(parsed, dict):
+            logger.warning("ignoring non-object session value: %r", parsed)
+            return {}
+        return parsed
+
     @property
     def last_document(self) -> str:
         """前回終了時に開いていた PDF のパス。無ければ空文字。
@@ -114,7 +143,7 @@ class Settings:
         **最近開いたファイルの先頭とは別物。** 「最後に読んでいた PDF」と
         「利用者が明示的に開いた履歴」は意味が違うので、同じ値から導かない。
         """
-        value = self._backend.value(_KEY_SESSION_DOCUMENT, "")
+        value = self._session().get(_FIELD_DOCUMENT, "")
         return value if isinstance(value, str) else ""
 
     @property
@@ -129,7 +158,7 @@ class Settings:
         黙って 3 に丸めるが、それは保存された位置ではなく推測でしかない。
         どちらも読めなかったものとして先頭へ戻す。
         """
-        value = self._backend.value(_KEY_SESSION_PAGE_INDEX, DEFAULT_SESSION_PAGE_INDEX)
+        value = self._session().get(_FIELD_PAGE_INDEX, DEFAULT_SESSION_PAGE_INDEX)
         if isinstance(value, bool):
             logger.warning("ignoring non-numeric session page index: %r", value)
             return DEFAULT_SESSION_PAGE_INDEX
@@ -153,7 +182,7 @@ class Settings:
         ビューポートのピクセル座標は保存しない。ウィンドウの大きさ・DPI・
         倍率が変わっても意味が変わらない値だけを持つ。
         """
-        value = self._backend.value(_KEY_SESSION_Y_NORM, DEFAULT_SESSION_Y_NORM)
+        value = self._session().get(_FIELD_Y_NORM, DEFAULT_SESSION_Y_NORM)
         try:
             y_norm = float(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
@@ -167,12 +196,22 @@ class Settings:
     def set_last_session(self, document: str, page_index: int, y_norm: float) -> None:
         """前回のセッションを丸ごと保存する。
 
-        3つの値を別々の setter にしないのは、パスだけ新しくてページが古い
-        ような中途半端な組み合わせを作れないようにするため。
+        **3つの値は1つの鍵へ1回で書く。** API をまとめただけでは、パスだけ
+        新しくてページが古いという中途半端な組み合わせを防げない
+        （`setValue()` を3回呼ぶ間に落ちれば、その状態が残る）。JSON にして
+        1回の書き込みにすることで、次に読むのは古い3つ組か新しい3つ組の
+        どちらかだけになる。
         """
-        self._backend.setValue(_KEY_SESSION_DOCUMENT, document)
-        self._backend.setValue(_KEY_SESSION_PAGE_INDEX, page_index)
-        self._backend.setValue(_KEY_SESSION_Y_NORM, y_norm)
+        self._backend.setValue(
+            _KEY_SESSION,
+            json.dumps(
+                {
+                    _FIELD_DOCUMENT: document,
+                    _FIELD_PAGE_INDEX: page_index,
+                    _FIELD_Y_NORM: y_norm,
+                }
+            ),
+        )
 
     def clear_last_session(self) -> None:
         """前回のセッションを忘れる。
@@ -180,8 +219,7 @@ class Settings:
         PDF を開いていない状態で終了したときと、復元に失敗したときに呼ぶ。
         後者で消しておかないと、起動のたびに同じ失敗を繰り返す。
         """
-        for key in (_KEY_SESSION_DOCUMENT, _KEY_SESSION_PAGE_INDEX, _KEY_SESSION_Y_NORM):
-            self._backend.remove(key)
+        self._backend.remove(_KEY_SESSION)
 
     # -------------------------------------------------- 表示
     @property

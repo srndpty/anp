@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from collections.abc import Iterator
@@ -43,6 +44,20 @@ def ini(tmp_path: Path) -> str:
 def backend(ini: str) -> QSettings:
     """テストから設定を直接仕込む/覗くための入口。"""
     return QSettings(ini, QSettings.Format.IniFormat)
+
+
+def set_session(
+    backend: QSettings, document: object, *, page: object = 0, y_norm: object = 0.0
+) -> None:
+    """前回のセッションを直接仕込む（壊れた値も含めてそのまま書く）。
+
+    3つの値は1つの鍵に JSON でまとまっているので、テストからも同じ形で
+    書き込む。書いたら `sync()` するのは呼び出し側。
+    """
+    backend.setValue(
+        "session/last",
+        json.dumps({"document": document, "page_index": page, "y_norm": y_norm}),
+    )
 
 
 def make_window(
@@ -616,7 +631,7 @@ def test_the_automatic_restore_does_not_reorder_the_history(
     other = sample_pdf.parent / "other.pdf"
     shutil.copy(sample_pdf, other)
     backend.setValue("files/recent", [str(other), str(sample_pdf)])
-    backend.setValue("session/document", str(sample_pdf))
+    set_session(backend, str(sample_pdf))
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -631,7 +646,7 @@ def test_the_automatic_restore_does_not_add_to_the_history(
     qtbot: QtBot, ini: str, backend: QSettings, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """自動復元だけでは履歴に載らない。"""
-    backend.setValue("session/document", str(sample_pdf))
+    set_session(backend, str(sample_pdf))
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -654,7 +669,7 @@ def test_a_missing_last_document_does_not_break_startup(
     """前回の PDF が消えていても起動する。復元対象は忘れ、履歴からも外す。"""
     missing = Path(shutil.copy(sample_pdf, sample_pdf.parent / "gone.pdf"))
     backend.setValue("files/recent", [str(missing), str(sample_pdf)])
-    backend.setValue("session/document", str(missing))
+    set_session(backend, str(missing))
     backend.sync()
     missing.unlink()
 
@@ -685,7 +700,7 @@ def test_a_broken_last_document_does_not_break_startup(
 ) -> None:
     """壊れた PDF でも起動する。履歴からは外さない。"""
     backend.setValue("files/recent", [str(broken_pdf)])
-    backend.setValue("session/document", str(broken_pdf))
+    set_session(backend, str(broken_pdf))
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -711,7 +726,7 @@ def test_a_study_mark_failure_during_restore_does_not_break_startup(
 
     アプリを終了させはしない。復元対象は忘れる。
     """
-    backend.setValue("session/document", str(sample_pdf))
+    set_session(backend, str(sample_pdf))
     backend.sync()
 
     window = make_window(qtbot, ini, BrokenRepository(study_mark_connection, failing="list"))
@@ -753,9 +768,7 @@ def test_broken_session_values_fall_back_safely(
     ページと縦位置は別々に検査する。片方だけ壊れていても、読める方は
     そのまま使う（読めない方だけを既定へ落とす）。
     """
-    backend.setValue("session/document", str(sample_pdf))
-    backend.setValue("session/page_index", page)
-    backend.setValue("session/y_norm", y_norm)
+    set_session(backend, str(sample_pdf), page=page, y_norm=y_norm)
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -777,9 +790,7 @@ def test_a_page_beyond_the_document_falls_back_to_the_top(
     セッションの位置は過去の読書状態のヒントでしかないので、存在しない
     位置を最終ページとして解釈しない（学習マークの移動とは扱いが違う）。
     """
-    backend.setValue("session/document", str(sample_pdf))
-    backend.setValue("session/page_index", 99)
-    backend.setValue("session/y_norm", 0.5)
+    set_session(backend, str(sample_pdf), page=99, y_norm=0.5)
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -795,7 +806,7 @@ def test_an_invalid_last_document_type_is_ignored(
     qtbot: QtBot, ini: str, backend: QSettings, study_marks: StudyMarkRepository
 ) -> None:
     """復元対象が文字列でなくても起動する。"""
-    backend.setValue("session/document", 42)
+    set_session(backend, 42)
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
