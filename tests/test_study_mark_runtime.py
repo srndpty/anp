@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QSettings, QSizeF
 from PySide6.QtPdf import QPdfDocument
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
 
 from anp import app as app_module
@@ -508,6 +508,92 @@ def warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         lambda *args: messages.append(args[2]),
     )
     return messages
+
+
+class AdoptPrompt:
+    """古い形式のマークの問いかけを捕まえて、答えをテストから決める。"""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.asked: list[str] = []
+        self.accept = False
+        monkeypatch.setattr("anp.ui.main_window.QMessageBox.question", self._question)
+
+    def _question(self, *args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        self.asked.append(str(args[2]))
+        return QMessageBox.StandardButton.Yes if self.accept else QMessageBox.StandardButton.No
+
+
+@pytest.fixture
+def adopt_prompt(monkeypatch: pytest.MonkeyPatch) -> AdoptPrompt:
+    """古い形式のマークの問いかけ。既定は「いいえ」で答える。"""
+    return AdoptPrompt(monkeypatch)
+
+
+def make_unverified(connection: sqlite3.Connection) -> None:
+    """保存済みのマークを、マイグレーション2 より前の形（指紋なし）へ戻す。"""
+    connection.execute("UPDATE study_marks SET document_fingerprint = NULL")
+
+
+def test_old_marks_without_a_fingerprint_are_not_shown_silently(
+    window: MainWindow,
+    study_marks: StudyMarkRepository,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+    adopt_prompt: AdoptPrompt,
+) -> None:
+    """指紋を持たない古いマークは、尋ねて断られたら表示しない。
+
+    どの内容の PDF に付けられたか分からないものを普通のマークと同じ顔で
+    並べると、差し替えた PDF に前の本のマークが乗る。
+    """
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.75)
+    make_unverified(study_mark_connection)
+
+    window.open_path(sample_pdf)
+
+    assert len(adopt_prompt.asked) == 1
+    assert "1 件" in adopt_prompt.asked[0]
+    assert window.view.study_marks == ()
+    assert window.study_marks.unverified_count == 1
+    # 断っても消さない。次に開けばまた尋ねる。
+    assert study_mark_connection.execute("SELECT COUNT(*) FROM study_marks").fetchone()[0] == 1
+
+
+def test_accepting_adopts_the_old_marks(
+    window: MainWindow,
+    study_marks: StudyMarkRepository,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+    adopt_prompt: AdoptPrompt,
+) -> None:
+    """「はい」と答えれば、この PDF のマークとして表示される。"""
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.75)
+    make_unverified(study_mark_connection)
+    adopt_prompt.accept = True
+
+    window.open_path(sample_pdf)
+
+    assert len(window.view.study_marks) == 1
+    assert window.study_marks.unverified_count == 0
+
+    # 引き取ったあとは、もう尋ねない。
+    window.open_path(sample_pdf)
+    assert len(adopt_prompt.asked) == 1
+
+
+def test_nothing_is_asked_without_old_marks(
+    window: MainWindow,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+    adopt_prompt: AdoptPrompt,
+) -> None:
+    """指紋のあるマークしか無ければ、問いかけは出ない。"""
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.75)
+
+    window.open_path(sample_pdf)
+
+    assert adopt_prompt.asked == []
+    assert len(window.view.study_marks) == 1
 
 
 def test_a_window_without_a_pdf_has_no_marks(window: MainWindow) -> None:

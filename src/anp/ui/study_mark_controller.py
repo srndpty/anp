@@ -115,11 +115,21 @@ class StudyMarkController(QObject):
         # （表示中に同じパスが別の内容へ置き換わった場合）。
         self._identity: DocumentIdentity | None = None
         self._marks: tuple[StudyMark, ...] = ()
+        self._unverified_count = 0
 
     @property
     def active_document_path(self) -> Path | None:
         """いま学習マークを表示している PDF のパス。無ければ None。"""
         return self._active_path
+
+    @property
+    def unverified_count(self) -> int:
+        """表示中の PDF のパスに残っている、指紋を持たない学習マークの数。
+
+        マイグレーション2 より前に作られた分。**表示はしていない**（持ち主を
+        確かめられないため）。引き取るかどうかは利用者に尋ねる。
+        """
+        return self._unverified_count
 
     @property
     def study_marks(self) -> tuple[StudyMark, ...]:
@@ -166,11 +176,13 @@ class StudyMarkController(QObject):
         """
         self._active_path = None
         self._identity = None
+        self._unverified_count = 0
         self._publish_marks(())
 
         try:
             identity = DocumentIdentity.of(path)
             marks = self._repository.list_for_document(identity)
+            unverified = self._repository.unverified_count(identity)
         except _LOAD_ERRORS as error:
             logger.exception("failed to load study marks for %s", path)
             msg = f"failed to load study marks for {path}"
@@ -178,12 +190,14 @@ class StudyMarkController(QObject):
 
         self._active_path = Path(path)
         self._identity = identity
+        self._unverified_count = unverified
         self._publish_marks(marks)
 
     def clear_document(self) -> None:
         """表示対象を解除し、表示中の学習マークを空にする。"""
         self._active_path = None
         self._identity = None
+        self._unverified_count = 0
         self._publish_marks(())
 
     def refresh(self) -> None:
@@ -263,6 +277,22 @@ class StudyMarkController(QObject):
         if updated is None:
             self._fail_missing(mark_id)
         self._apply_stored(updated)
+
+    def adopt_unverified(self) -> int:
+        """指紋を持たない学習マークを、表示中の PDF のものとして引き取る。
+
+        引き取った件数を返す。**呼ぶのは利用者が承認したときだけ**（尋ねるのは
+        UI の側）。取り消せない操作なので、黙って結び付けはしない。
+
+        引き取った分は表示に加わるので、ここだけは全件を読み直す。件数は
+        マイグレーション2 より前のマークに限られ、この操作は1つの PDF に
+        つき一度きり。
+        """
+        identity = self._require_identity()
+        adopted = self._repository.adopt_unverified(identity)
+        self._unverified_count = self._repository.unverified_count(identity)
+        self.refresh()
+        return adopted
 
     def delete_mark(self, mark_id: int) -> None:
         """学習マークを1件消す。確認を取るのは UI の側。"""

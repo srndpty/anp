@@ -382,20 +382,55 @@ def test_marks_survive_an_unchanged_reopen(repository: StudyMarkRepository, pdf_
     assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == [mark]
 
 
-def test_marks_without_a_fingerprint_are_kept(
+def test_marks_without_a_fingerprint_are_not_listed(
     repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
 ) -> None:
-    """マイグレーション2 より前に作られた行は、指紋が無くても切り離さない。
+    """マイグレーション2 より前に作られた行は、確かめずには表示しない。
 
-    学習の記録は再取得できないので、内容が分からないという理由で
-    見えなくしたり、確かめようのない指紋を埋めたりはしない。
+    どの内容の PDF に付けられたのか分からないので、普通のマークと同じ顔で
+    並べると、差し替えた PDF に前の本のマークが乗る取り違えがそのまま残る。
+    消しはせず、数えられる状態にしておく。
     """
     mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
     connection.execute(
         "UPDATE study_marks SET document_fingerprint = NULL WHERE id = ?", (mark.id,)
     )
 
-    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == [mark]
+    identity = DocumentIdentity.of(pdf_path)
+    assert repository.list_for_document(identity) == []
+    assert repository.unverified_count(identity) == 1
+    assert connection.execute("SELECT COUNT(*) FROM study_marks").fetchone()[0] == 1
+
+
+def test_adopting_makes_the_old_marks_belong_to_this_pdf(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """引き取れば、以後は普通のマークとして扱われる。"""
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute("UPDATE study_marks SET document_fingerprint = NULL")
+    identity = DocumentIdentity.of(pdf_path)
+
+    assert repository.adopt_unverified(identity) == 1
+
+    assert repository.list_for_document(identity) == [mark]
+    assert repository.unverified_count(identity) == 0
+
+
+def test_adopting_only_touches_this_path(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """引き取るのは同じパスの分だけ。別の PDF の古いマークには触らない。"""
+    mine = tmp_path / "mine.pdf"
+    mine.write_bytes(b"%PDF-mine")
+    other = tmp_path / "other.pdf"
+    other.write_bytes(b"%PDF-other")
+    repository.create(DocumentIdentity.of(mine), 0, 0.5, 0.5)
+    repository.create(DocumentIdentity.of(other), 0, 0.5, 0.5)
+    connection.execute("UPDATE study_marks SET document_fingerprint = NULL")
+
+    assert repository.adopt_unverified(DocumentIdentity.of(mine)) == 1
+
+    assert repository.unverified_count(DocumentIdentity.of(other)) == 1
 
 
 # ---------------------------------------------------------------- increment

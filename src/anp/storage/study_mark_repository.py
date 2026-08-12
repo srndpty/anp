@@ -133,16 +133,46 @@ class StudyMarkRepository:
         **パスが同じでも、内容が違えば別のドキュメント。** 指紋が食い違う行は
         返さない。消しはしないので、元の PDF を戻せばまた出てくる。
 
-        指紋が NULL の行（マイグレーション2 より前に作られた分）はそのまま
-        返す。内容が分からないものを、確かめずに切り離さないため。
+        指紋が NULL の行（マイグレーション2 より前に作られた分）も返さない。
+        持ち主を確かめようがないものを、普通のマークと同じ顔で表示すると、
+        差し替えた PDF に前の本のマークが乗るという取り違えがそのまま残る。
+        消しはせず、`unverified_count()` で数えて
+        `adopt_unverified()`（利用者の承認つき）で引き取る。
         """
         rows = self._connection.execute(
-            f"SELECT {_COLUMNS} FROM study_marks WHERE document_key = ?"
-            " AND (document_fingerprint IS NULL OR document_fingerprint = ?)"
+            f"SELECT {_COLUMNS} FROM study_marks"
+            " WHERE document_key = ? AND document_fingerprint = ?"
             " ORDER BY page_index, id",
             (document.key, document.fingerprint),
         ).fetchall()
         return [_to_study_mark(row) for row in rows]
+
+    def unverified_count(self, document: DocumentIdentity) -> int:
+        """このパスに残っている、指紋を持たない学習マークの数。
+
+        マイグレーション2 より前に作られた分。どの内容の PDF に対して
+        付けられたのかが分からないので、持ち主が確かめられない。
+        """
+        row = self._connection.execute(
+            "SELECT COUNT(*) FROM study_marks"
+            " WHERE document_key = ? AND document_fingerprint IS NULL",
+            (document.key,),
+        ).fetchone()
+        return int(row[0])
+
+    def adopt_unverified(self, document: DocumentIdentity) -> int:
+        """指紋を持たない学習マークを、この PDF のものとして引き取る。
+
+        引き取った件数を返す。**呼ぶのは利用者が承認したときだけ。**
+        「たぶんこの PDF のものだろう」と黙って結び付けると、差し替え後の
+        PDF に前の本のマークを焼き付けることになり、取り消せない。
+        """
+        cursor = self._connection.execute(
+            "UPDATE study_marks SET document_fingerprint = ?"
+            " WHERE document_key = ? AND document_fingerprint IS NULL",
+            (document.fingerprint, document.key),
+        )
+        return cursor.rowcount
 
     def increment_mistake_count(self, mark_id: int) -> StudyMark | None:
         """同じ問題をまた間違えたときに、間違えた回数を1増やす。
