@@ -89,7 +89,7 @@ def zoom_label_text(window: MainWindow) -> str:
 def test_window_has_menus_and_status_bar(window: MainWindow) -> None:
     """メニューとステータスバーが用意されている。"""
     titles = [action.text() for action in window.menuBar().actions()]
-    assert titles == ["ファイル(&F)", "表示(&V)", "移動(&G)", "ヘルプ(&H)"]
+    assert titles == ["ファイル(&F)", "表示(&V)", "移動(&G)", "設定(&S)", "ヘルプ(&H)"]
     # パスは常設ウィジェットなので、一時メッセージ（`currentMessage()`）
     # とは別に常に出ている。
     assert window.document_status_text == "PDF が開かれていません"

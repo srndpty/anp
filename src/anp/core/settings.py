@@ -28,6 +28,10 @@ _KEY_SESSION_DOCUMENT = "session/document"
 _KEY_SESSION_PAGE_INDEX = "session/page_index"
 _KEY_SESSION_Y_NORM = "session/y_norm"
 
+# キーボードショートカットは `shortcuts/<command-id>` に1コマンド1件で置く。
+# コマンド ID を決めるのは UI 層で、`core` は文字列として読み書きするだけ。
+_KEY_SHORTCUT_PREFIX = "shortcuts/"
+
 DEFAULT_ZOOM_MODE = "free"
 DEFAULT_FREE_ZOOM = 1.0
 DEFAULT_PAGE_COLOR_MODE = "original"
@@ -115,8 +119,23 @@ class Settings:
 
     @property
     def last_page_index(self) -> int:
-        """前回終了時に読んでいたページ（0 始まり）。読めなければ先頭。"""
+        """前回終了時に読んでいたページ（0 始まり）。読めなければ先頭。
+
+        `True` / `False` はページ番号として受け付けない。Python では
+        `isinstance(True, int)` が真なので、素直に `int()` へ通すと
+        `True` が 1 ページ目になってしまう。
+
+        整数でない実数（3.5・NaN・inf）も受け付けない。`int(3.5)` は
+        黙って 3 に丸めるが、それは保存された位置ではなく推測でしかない。
+        どちらも読めなかったものとして先頭へ戻す。
+        """
         value = self._backend.value(_KEY_SESSION_PAGE_INDEX, DEFAULT_SESSION_PAGE_INDEX)
+        if isinstance(value, bool):
+            logger.warning("ignoring non-numeric session page index: %r", value)
+            return DEFAULT_SESSION_PAGE_INDEX
+        if isinstance(value, float) and not (math.isfinite(value) and value.is_integer()):
+            logger.warning("ignoring non-integral session page index: %r", value)
+            return DEFAULT_SESSION_PAGE_INDEX
         try:
             page = int(value)  # type: ignore[call-overload]
         except (TypeError, ValueError, OverflowError):
@@ -230,6 +249,43 @@ class Settings:
     @ui_theme.setter
     def ui_theme(self, value: str) -> None:
         self._backend.setValue(_KEY_UI_THEME, value)
+
+    # -------------------------------------------------- ショートカット
+    def shortcut_override(self, command_id: str) -> str | None:
+        """コマンドに割り当てられたショートカット。指定が無ければ None。
+
+        **None と空文字は意味が違う。** None は「指定が無い（既定値を
+        使う）」、空文字は「割り当て無し（利用者が明示的に解除した）」。
+        呼び出し側がこの区別を保つ。
+
+        文字列の書式（`QKeySequence` の PortableText）を解釈するのは UI 層。
+        `core` はキーの有無と文字列であることだけを見る。
+
+        INI を手で書き換えて `Ctrl+K, Ctrl+C` のようにカンマを含む値を
+        引用符なしで書くと、`QSettings` は文字列の一覧として返す。書かれた
+        とおりに繋ぎ直す（anp が書いた値は引用されるのでここを通らない）。
+        """
+        key = _KEY_SHORTCUT_PREFIX + command_id
+        if not self._backend.contains(key):
+            return None
+
+        value = self._backend.value(key, "")
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            return ", ".join(value)
+
+        # 文字列として読めない値。指定が無いものとして扱い、既定値へ戻す。
+        logger.warning("ignoring non-string shortcut setting for %s: %r", command_id, value)
+        return None
+
+    def set_shortcut_override(self, command_id: str, value: str) -> None:
+        """ショートカットの指定を保存する。空文字は「割り当て無し」。"""
+        self._backend.setValue(_KEY_SHORTCUT_PREFIX + command_id, value)
+
+    def remove_shortcut_override(self, command_id: str) -> None:
+        """ショートカットの指定を消す（既定値に戻す）。"""
+        self._backend.remove(_KEY_SHORTCUT_PREFIX + command_id)
 
     # -------------------------------------------------- 内部
     def sync(self) -> None:

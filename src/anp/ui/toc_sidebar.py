@@ -12,7 +12,7 @@ QPdfDocument
         ↓
 QPdfBookmarkModel（ここが所有する）
         ↓
-QTreeView
+QTreeView（クリック / Enter）
         ↓ destination_requested
 MainWindow（配線だけ）
         ↓
@@ -33,6 +33,7 @@ PdfView.navigate_to_pdf_destination()
 from __future__ import annotations
 
 from PySide6.QtCore import QModelIndex, QPointF, Qt, Signal
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtPdf import QPdfBookmarkModel, QPdfDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -95,6 +96,27 @@ def _zoom_hint(value: object) -> float | None:
     return float(value) if value > 0 else None
 
 
+class _TocTreeView(QTreeView):
+    """Enter / Return を、現在行への移動として扱うツリー。
+
+    `activated` シグナルは使わない。プラットフォームによってはダブル
+    クリックでも出るので、`clicked` と両方つなぐと1回の操作で移動を
+    二重に要求してしまう。ここで見るのは押鍵だけ（検索欄の
+    `_SearchLineEdit` と同じ大きさの局所実装）。
+    """
+
+    key_activated = Signal(QModelIndex)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 (Qt の命名規則)
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            index = self.currentIndex()
+            if index.isValid():
+                self.key_activated.emit(index)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+
 class TocSidebar(QDockWidget):
     """PDF の目次を階層のまま見せ、選ばれた項目の移動先を要求する。"""
 
@@ -132,7 +154,7 @@ class TocSidebar(QDockWidget):
         self._empty_label.setWordWrap(True)
         layout.addWidget(self._empty_label)
 
-        self._tree = QTreeView(body)
+        self._tree = _TocTreeView(body)
         self._tree.setModel(self._model)
         # 目次は1列（`QPdfBookmarkModel.columnCount()` は 1）なので見出しは
         # 出さない。編集も並べ替えもしない。
@@ -142,7 +164,10 @@ class TocSidebar(QDockWidget):
         self._tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         # **`expandAll()` はしない。** 数千項目の PDF で開いた瞬間に全展開
         # すると読めなくなる。展開/折り畳みは Qt の通常の操作に任せる。
-        self._tree.clicked.connect(self._on_clicked)
+        # クリックと Enter は同じ移動要求へ落とす。キーボードのためだけの
+        # 別の移動経路は作らない。
+        self._tree.clicked.connect(self._request_destination)
+        self._tree.key_activated.connect(self._request_destination)
         layout.addWidget(self._tree)
 
         return body
@@ -207,10 +232,12 @@ class TocSidebar(QDockWidget):
         self._empty_label.setVisible(not has_outline)
         self._empty_label.setText(NO_OUTLINE_TEXT if self._has_document else NO_DOCUMENT_TEXT)
 
-    def _on_clicked(self, index: QModelIndex) -> None:
-        """項目のクリックは移動の要求だけ。
+    def _request_destination(self, index: QModelIndex) -> None:
+        """項目が選ばれたら移動を要求するだけ。
 
-        倍率にもレンダリングにも学習マークにも履歴にも触らない。
+        クリックでも Enter でもここを通る。倍率にもレンダリングにも
+        学習マークにも履歴にも触らない。移動先として読めない行
+        （壊れた outline）では何も要求しない。
         """
         destination = destination_for(index)
         if destination is not None:
