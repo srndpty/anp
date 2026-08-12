@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,34 @@ def connect(path: Path, *, migrations: Sequence[Migration] = _MIGRATIONS) -> sql
     return connection
 
 
+@contextmanager
+def transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    """明示的なトランザクションで囲む。
+
+    接続は `autocommit=True`（暗黙のトランザクションを作らない）で開くので、
+    「読んで、書いて、読み直す」のように1文で終わらない操作は、ここを通して
+    まとめる必要がある。
+
+    **`COMMIT` も内側。** これも失敗しうる SQL で、失敗した時点では
+    トランザクションが開いたまま残る。接続はアプリの起動から終了まで
+    使い回すので、開きっぱなしを残すと以後の更新が意図せずその中に入ったり、
+    次の `BEGIN` が失敗したりする。
+
+    巻き戻し自体の失敗で、元の失敗を覆い隠さない（記録だけ残す）。
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                logger.exception("failed to roll back the transaction")
+        raise
+
+
 def schema_version(connection: sqlite3.Connection) -> int:
     """適用済みマイグレーションの件数を返す。"""
     row = connection.execute("PRAGMA user_version").fetchone()
@@ -135,8 +164,7 @@ def apply_migrations(
     トランザクションに入れる。途中で失敗した場合はスキーマも版も適用前に
     戻るため、次回の起動で同じマイグレーションを再実行できる。
     """
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+    with transaction(connection):
         current = schema_version(connection)
         if current > len(migrations):
             msg = f"データベースのスキーマ版 {current} はこのバージョンの anp より新しいです"
@@ -149,9 +177,4 @@ def apply_migrations(
             connection.execute(f"PRAGMA user_version = {index + 1:d}")
 
         applied = schema_version(connection)
-    except BaseException:
-        connection.execute("ROLLBACK")
-        raise
-
-    connection.execute("COMMIT")
     return applied

@@ -18,18 +18,16 @@ SQL をここに閉じ込め、UI からは `StudyMarkRepository` 越しに扱�
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 
 from anp.core.fingerprint import validate_fingerprint
+from anp.storage.database import transaction
 from anp.storage.study_mark import (
     DocumentIdentity,
     StudyMark,
     validate_note,
     validate_position,
 )
-
-logger = logging.getLogger(__name__)
 
 _COLUMNS = "id, document_key, document_fingerprint, page_index, x_norm, y_norm, mistake_count, note"
 
@@ -214,13 +212,10 @@ class StudyMarkRepository:
         焼き込んだ後で読み込み失敗になり、その PDF を開けなくなる、という
         状態にはしない。
 
-        **`COMMIT` も try の中に入れる。** これも失敗しうる SQL で、失敗した
-        時点ではトランザクションが開いたまま残る。接続はアプリの起動から
-        終了まで使い回すので、開きっぱなしのトランザクションを残すと、以後の
-        更新が意図せずその中に入ったり、次の `BEGIN` が失敗したりする。
+        トランザクションの張り方（`COMMIT` も内側、巻き戻しの失敗で元の失敗を
+        覆い隠さない）は `database.transaction()` に1箇所だけ置いてある。
         """
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self._connection):
             rows = self._connection.execute(
                 "UPDATE study_marks SET document_fingerprint = ?"
                 " WHERE document_key = ? AND document_fingerprint IS NULL"
@@ -228,25 +223,8 @@ class StudyMarkRepository:
                 (document.fingerprint, document.key),
             ).fetchall()
             adopted = [_to_study_mark(row) for row in rows]
-            self._connection.execute("COMMIT")
-        except BaseException:
-            self._rollback()
-            raise
 
         return sorted(adopted, key=lambda mark: (mark.page_index, mark.id))
-
-    def _rollback(self) -> None:
-        """開いているトランザクションを巻き戻す。
-
-        巻き戻し自体の失敗で、元の失敗を覆い隠さない（記録だけ残す）。
-        `COMMIT` の後に来た場合はトランザクションが残っていないので何もしない。
-        """
-        if not self._connection.in_transaction:
-            return
-        try:
-            self._connection.execute("ROLLBACK")
-        except sqlite3.Error:
-            logger.exception("failed to roll back the study mark transaction")
 
     def increment_mistake_count(self, mark_id: int) -> StudyMark | None:
         """同じ問題をまた間違えたときに、間違えた回数を1増やす。
