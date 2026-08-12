@@ -844,7 +844,7 @@ def test_saving_the_session_does_not_touch_the_render_state(
     render = window.view._render  # noqa: SLF001
     generation = render.generation
 
-    window._save_last_session()  # noqa: SLF001
+    window._session.save(window._open.path)  # noqa: SLF001
 
     assert render.generation == generation
     assert window.view.has_document

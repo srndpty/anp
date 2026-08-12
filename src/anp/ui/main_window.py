@@ -44,6 +44,10 @@ PDF を開き、`PdfView` を中央に据えて、ズーム・ページ移動・
 その順に後始末する、という部分をここへ書くと、メニュー・履歴・ダイアログの
 配線に埋もれて順序の正しさが読み取れなくなる。ここが受け持つのは、返って
 きた失敗をどう知らせるかと、タイトル・ツールバー・ステータスバーの追随。
+
+**前回のセッションの出し入れは `ReadingSession` にある。** ここに残して
+あるのは「いつ復元するか」（`showEvent()` の1回だけ）と、失敗したときに
+履歴をどうするかだけ。
 """
 
 from __future__ import annotations
@@ -72,7 +76,6 @@ from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.destination import PdfDestination
 from anp.pdf.document import DocumentController
-from anp.pdf.reading_position import ReadingPosition
 from anp.pdf.render import PageRenderService
 from anp.storage.study_mark import StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
@@ -81,6 +84,7 @@ from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.document_open import DocumentOpenCoordinator
 from anp.ui.pdf_search_controller import PdfSearchController, SearchState
 from anp.ui.pdf_view import PdfView, ZoomMode
+from anp.ui.reading_session import ReadingSession
 from anp.ui.recent_files import add_recent, normalize_recent, recent_labels, remove_recent
 from anp.ui.search_dock import SearchDock
 from anp.ui.shortcut_dialog import ShortcutDialog
@@ -179,7 +183,11 @@ class MainWindow(QMainWindow):
         self._create_toc_sidebar()
         self._create_search_dock()
 
-        # PDF の差し替えと後始末の手順はここには書かない。ウィンドウの他の
+        # 前回のセッションの出し入れは分ける。設定の鍵も読書位置の算術も
+        # ここには持たない（`ReadingSession` と `anp.pdf.reading_position`）。
+        self._session = ReadingSession(self._settings, self._view)
+
+        # PDF の差し替えと後始末の手順もここには書かない。ウィンドウの他の
         # 関心（メニュー・履歴・ダイアログ・タイトル）と混ざると、順序の
         # 正しさが読み取れなくなる。
         self._open = DocumentOpenCoordinator(
@@ -778,47 +786,17 @@ class MainWindow(QMainWindow):
         順序は「倍率（構築時に復元済み）→ ドキュメント → 読書位置」。
         逆にすると、フィットの計算が読書位置を動かしてしまう。
         """
-        stored = self._settings.last_document
-        if not stored:
+        path = self._session.stored_document
+        if path is None:
             return
 
-        path = Path(stored)
         if not self._open_document(path, notify=False):
-            self._settings.clear_last_session()
+            self._session.forget()
             if not path.exists():
                 self._set_recent(remove_recent(self._recent, path))
             return
 
-        self._restore_reading_position()
-
-    def _restore_reading_position(self) -> None:
-        """保存された読書位置まで戻る。戻れなければ先頭のまま。
-
-        差し替えでページ数が減っていた場合は、最終ページへ丸めずに文書の
-        先頭で開く。セッションの位置は過去の読書状態のヒントでしかないので、
-        存在しない位置を無理に解釈しない（学習マークの移動とは扱いが違う）。
-        """
-        position = ReadingPosition(
-            page_index=self._settings.last_page_index,
-            y_norm=self._settings.last_y_norm,
-        )
-        if not self._view.restore_reading_position(position):
-            logger.info("saved reading position is outside the document: %s", position)
-
-    def _save_last_session(self) -> None:
-        """いま読んでいる PDF と位置を、次回の起動のために覚える。
-
-        PDF を開いていない状態で終了したときは忘れる。閉じたはずの PDF が
-        次回また勝手に開くのを避けるため。倍率は既存の設定
-        （`view/zoom_mode` と `view/free_zoom`）をそのまま使うので、
-        セッション用の倍率キーは作らない。
-        """
-        path = self._controller.path
-        position = self._view.current_reading_position()
-        if path is None or position is None:
-            self._settings.clear_last_session()
-            return
-        self._settings.set_last_session(str(path), position.page_index, position.y_norm)
+        self._session.restore_position()
 
     def _restore_zoom(self) -> None:
         """保存された倍率モードと手動倍率を復元する。
@@ -888,7 +866,7 @@ class MainWindow(QMainWindow):
         """
         # 表示を捨てる前に読書位置を取る。`clear_document()` の後では
         # 現在ページもスクロール位置も失われている。
-        self._save_last_session()
+        self._session.save(self._controller.path)
 
         self._settings.window_geometry = self.saveGeometry()
         self._settings.window_state = self.saveState()
