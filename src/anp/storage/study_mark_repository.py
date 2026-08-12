@@ -139,14 +139,22 @@ class StudyMarkRepository:
         差し替えた PDF に前の本のマークが乗るという取り違えがそのまま残る。
         消しはせず、`unverified_count()` で数えて
         `adopt_unverified()`（利用者の承認つき）で引き取る。
+
+        **指紋の照合は SQL ではなく、行を写し取ってから行う。** SQL で
+        `document_fingerprint = ?` と絞ると、壊れた指紋の行は「一致しない
+        だけの行」として素通りし、`_to_study_mark()` の検証にかからない。
+        保存データの不整合が、利用者からは「マークが黙って消えた」に
+        見えてしまう。1つの PDF あたりの行数は多くても数千件なので、
+        同じパスの行を全部写し取ってから絞る。
         """
         rows = self._connection.execute(
             f"SELECT {_COLUMNS} FROM study_marks"
-            " WHERE document_key = ? AND document_fingerprint = ?"
+            " WHERE document_key = ? AND document_fingerprint IS NOT NULL"
             " ORDER BY page_index, id",
-            (document.key, document.fingerprint),
+            (document.key,),
         ).fetchall()
-        return [_to_study_mark(row) for row in rows]
+        marks = [_to_study_mark(row) for row in rows]
+        return [mark for mark in marks if mark.document_fingerprint == document.fingerprint]
 
     def unverified_count(self, document: DocumentIdentity) -> int:
         """このパスに残っている、指紋を持たない学習マークの数。

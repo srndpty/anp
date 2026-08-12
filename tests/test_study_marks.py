@@ -136,6 +136,22 @@ def test_a_stored_fingerprint_that_is_not_a_sha256_is_a_data_error(
         repository.get(mark.id)
 
 
+def test_a_broken_stored_fingerprint_is_not_silently_skipped(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """壊れた指紋の行は、PDF を開く経路（一覧）でも見逃さない。
+
+    SQL で `document_fingerprint = ?` と絞ると、壊れた値は「一致しない
+    だけの行」として素通りし、検証にかからない。利用者からは記録が黙って
+    消えたようにしか見えない。
+    """
+    repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute("UPDATE study_marks SET document_fingerprint = ?", ("x" * 64,))
+
+    with pytest.raises(StoredStudyMarkError):
+        repository.list_for_document(DocumentIdentity.of(pdf_path))
+
+
 # ---------------------------------------------------------------- ドメインモデル
 def test_study_mark_round_trips_values() -> None:
     """与えた値がそのまま保持される。"""
