@@ -16,7 +16,10 @@
 - PDF を開いて**連続スクロール**で読む
 - 拡大・縮小、実際の大きさ、**幅に合わせる**、**ページ全体**
 - Ctrl + ホイールで、カーソル位置を動かさずに拡大・縮小
-- ページ番号を指定しての移動、前後のページへの移動
+- Shift + ホイールで左右にスクロール（横にはみ出しているときだけ）
+- ページ番号を指定しての移動、前後のページへの移動。`←` / `→` でも送れる
+- コマンドラインで PDF のパスを渡すと、それを開いて起動する
+  （PDF に関連付けたときの入口）
 - **目次**（表示メニュー → 目次）から見出しへ移動する。PDF に目次が
   無ければ空のまま
 - **本文の検索**（移動メニュー → 検索、`Ctrl+F`）。一致箇所を強調し、
@@ -99,12 +102,14 @@ HSL で言えば `L` だけを `1 - L` にする変換で、白地に黒文字�
 | `Ctrl+-` | 縮小 |
 | `Ctrl+0` | 実際の大きさ（100%） |
 | `Ctrl+PgUp` / `Ctrl+PgDown` | 前 / 次のページ |
+| `←` / `→` | 前 / 次のページ |
 | `Ctrl+F` | 検索 |
 | `F3` / `Shift+F3` | 次 / 前の一致 |
 | `F11` | 全画面表示の切り替え |
 | `Esc` | 全画面表示を抜ける |
 | `Ctrl` + 左クリック | 学習マークを作る / 間違えた回数を増やす |
 | `Ctrl` + ホイール | カーソル位置を中心に拡大・縮小 |
+| `Shift` + ホイール | 左右にスクロール |
 
 「幅に合わせる」「ページ全体」はツールバーと表示メニューから、
 「ページの色」「キャンバス」「UI テーマ」「目次」「学習マーク」は
@@ -128,6 +133,34 @@ uv run pre-commit install
 ```bash
 uv run anp
 ```
+
+## Windows へインストールする
+
+配布用の実行ファイルを作って `C:\Program Files\anp` へ入れ、PDF から開ける
+ようにする手順。開発中は `uv run anp` で足りるので、必要なときだけ行う。
+
+```bash
+# 1. アイコンと実行ファイルを作る（dist\anp\anp.exe ができる）
+uv run python packaging/make_icon.py
+uv run --group build pyinstaller packaging/anp.spec --noconfirm
+
+# 2. Program Files へ入れてスタートメニューに登録する（管理者権限が要る）
+#    → 「管理者として実行」した PowerShell から
+powershell -ExecutionPolicy Bypass -File packaging\install.ps1
+
+# 3. PDF の「プログラムから開く」候補に加える（管理者権限は不要）
+powershell -ExecutionPolicy Bypass -File packaging\register-pdf.ps1
+```
+
+`.ico` は `packaging/anp.ico` に焼いてあるので、アイコンの絵
+（`src/anp/ui/app_icon.py`）を変えたときだけ 1 を流し直す。
+
+**既定のアプリにするところは自動化できない。** Windows は利用者が選んだ
+既定を保護しているので、PDF を右クリック →「プログラムから開く」→
+「別のプログラムを選択」→ anp →「常に使う」を、一度だけ手で行うこと。
+
+学習マークと設定は `%LOCALAPPDATA%\anp` とレジストリにあるので、
+インストール先を消しても消えない。
 
 ## 開発
 

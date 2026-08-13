@@ -28,6 +28,11 @@ path = "src/anp/__init__.py"
 packages = ["src/anp"]
 
 [dependency-groups]
+# 配布用の実行ファイルを作るときだけ要る。開発と実行には要らないので
+# dev とは分ける（`uv run --group build pyinstaller packaging/anp.spec`）。
+build = [
+    "pyinstaller>=6.11",
+]
 dev = [
     "mypy>=1.14",
     "pre-commit>=4.0",
