@@ -57,7 +57,7 @@ from functools import partial
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt
-from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut, QShowEvent
+from PySide6.QtGui import QCloseEvent, QKeySequence, QPalette, QShortcut, QShowEvent
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -83,6 +83,7 @@ from anp.ui.actions import ReaderActions, create_actions, populate_menus
 from anp.ui.appearance import CanvasTheme, UiTheme, apply_ui_theme
 from anp.ui.document_open import DocumentOpenCoordinator
 from anp.ui.fatal import guard_qt_callback
+from anp.ui.icons import next_page_icon, previous_page_icon, zoom_in_icon, zoom_out_icon
 from anp.ui.pdf_search_controller import PdfSearchController, SearchState
 from anp.ui.pdf_view import PdfView, ZoomMode
 from anp.ui.reading_session import ReadingSession
@@ -389,6 +390,24 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._page_count_label)
         toolbar.addAction(self._actions.next_page)
 
+        self._apply_action_icons()
+
+    def _apply_action_icons(self) -> None:
+        """アイコンを、いまのパレットの文字色で描き直す。
+
+        アイコンは画像ファイルではなくその場で描く（`anp.ui.icons`）。
+        色を固定すると、UI テーマを暗くしたときにツールバーへ沈むので、
+        パレットが変わるたびに作り直す（`changeEvent()`）。
+
+        アイコンを持つのは拡大・縮小とページ送りだけ。他のボタンは文字の
+        まま並べる。
+        """
+        color = self.palette().color(QPalette.ColorRole.WindowText)
+        self._actions.zoom_in.setIcon(zoom_in_icon(color))
+        self._actions.zoom_out.setIcon(zoom_out_icon(color))
+        self._actions.previous_page.setIcon(previous_page_icon(color))
+        self._actions.next_page.setIcon(next_page_icon(color))
+
     def _create_status_bar(self) -> None:
         """開いている PDF のパスを常設ウィジェットとして置く。
 
@@ -612,6 +631,10 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(f"{path.name} - anp")
         self._sync_document_ui()
+        # 開いた直後からキーボードで読めるようにする。← → のページ移動は
+        # ビューが受け取るので、フォーカスがツールバーのページ番号に
+        # 残っていると効かない。
+        self._view.setFocus(Qt.FocusReason.OtherFocusReason)
         if notify:
             # 尋ねるのは利用者が自分で開いたときだけ。起動時の自動復元で
             # 出すと、立ち上がった瞬間に問いかけが出ることになる。
@@ -737,14 +760,25 @@ class MainWindow(QMainWindow):
             self._set_full_screen(enabled=False)
 
     def changeEvent(self, event: QEvent) -> None:  # noqa: N802 (Qt の命名規則)
-        """ウィンドウ状態が変わったらアクションのチェック状態を合わせる。
+        """ウィンドウ状態とパレットの変化に追随する。
 
-        F11・Esc・ウィンドウマネージャのどれで変わっても、ここを通るので
-        表示と実際の状態がずれない。
+        ウィンドウ状態は F11・Esc・ウィンドウマネージャのどれで変わっても
+        ここを通るので、アクションのチェック状態とステータスバーの表示が
+        ずれない。**`_set_full_screen()` の側では切り替えない**（そこを
+        通らない経路で出しっぱなしになるため）。
+
+        パレットは UI テーマの切り替えでも OS の明暗の切り替えでも変わる。
+        どちらでも自前で描いたアイコンを描き直す。
         """
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
-            self._actions.full_screen.setChecked(self.isFullScreen())
+            full_screen = self.isFullScreen()
+            self._actions.full_screen.setChecked(full_screen)
+            # 全画面はページを広く見るための表示なので、ステータスバーは
+            # 引っ込める。開いているパスは通常表示に戻れば出る。
+            self.statusBar().setVisible(not full_screen)
+        elif event.type() == QEvent.Type.PaletteChange:
+            self._apply_action_icons()
 
     # -------------------------------------------------- 状態の保存/復元
     def _restore_window_state(self) -> None:

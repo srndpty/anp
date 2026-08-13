@@ -461,6 +461,20 @@ def test_zoom_actions_change_the_zoom(opened: MainWindow) -> None:
     assert opened.view.zoom == pytest.approx(1.0)
 
 
+def test_toolbar_actions_carry_an_icon(window: MainWindow) -> None:
+    """拡大・縮小とページ送りには自前で描いたアイコンが載る。"""
+    actions = window.reader_actions
+    for action in (actions.zoom_in, actions.zoom_out, actions.previous_page, actions.next_page):
+        assert not action.icon().isNull()
+    # アイコンを持つのはこの4つだけ。他は文字のまま並べる。
+    assert actions.actual_size.icon().isNull()
+
+
+def test_opening_gives_the_view_focus(opened: MainWindow) -> None:
+    """開いた直後は ← → がビューに届く（フォーカスがビューにある）。"""
+    assert opened.view.hasFocus()
+
+
 def test_actual_size_returns_to_100_percent(opened: MainWindow) -> None:
     """実際の大きさで 100% の FREE に戻る。"""
     opened.reader_actions.fit_page.trigger()
@@ -619,6 +633,29 @@ def test_the_full_screen_check_state_matches_the_window(window: MainWindow) -> N
 
     window.reader_actions.full_screen.trigger()
     assert action.isChecked() == window.isFullScreen() is False
+
+
+def test_full_screen_hides_the_status_bar(window: MainWindow) -> None:
+    """全画面ではステータスバーを引っ込め、戻ると出す。"""
+    assert window.statusBar().isVisible()
+
+    window.reader_actions.full_screen.trigger()
+    assert not window.statusBar().isVisible()
+
+    window.reader_actions.full_screen.trigger()
+    assert window.statusBar().isVisible()
+
+
+def test_escape_brings_the_status_bar_back(window: MainWindow, qtbot: QtBot) -> None:
+    """Esc で抜けた場合もステータスバーが戻る。
+
+    出し入れを `changeEvent()` に置いているので、抜ける経路を問わない。
+    """
+    window.reader_actions.full_screen.trigger()
+
+    qtbot.keyClick(window, Qt.Key.Key_Escape)
+
+    assert window.statusBar().isVisible()
 
 
 def test_leaving_full_screen_restores_a_maximized_window(window: MainWindow) -> None:
