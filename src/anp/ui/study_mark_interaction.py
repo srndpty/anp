@@ -25,15 +25,17 @@ PdfView（ヒットテストと座標変換）
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Callable
-from pathlib import Path
 
 from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QInputDialog, QMenu, QMessageBox, QWidget
 
-from anp.storage.study_mark import StudyMark
+from anp.storage.study_mark import DocumentIdentity, StudyMark
+from anp.storage.study_mark_repository import StoredStudyMarkError
+from anp.ui.fatal import guard_qt_callback, report_fatal
 from anp.ui.pdf_view import PdfView
-from anp.ui.study_mark_controller import StudyMarkController
+from anp.ui.study_mark_controller import StudyMarkController, StudyMarkError
 from anp.ui.study_marks import PagePosition, StudyMarkTarget
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,22 @@ _NOTE_LABEL = "メモ"
 _DELETE_TITLE = "学習マークを削除"
 _DELETE_TEXT = "この学習マークを削除しますか？"
 
+# 指紋を持たない古い学習マーク（マイグレーション2 より前の分）の尋ね方。
+# どの PDF に付けたものか確かめようがないので、表示する前に本人へ聞く。
+_UNVERIFIED_TITLE = "古い形式の学習マーク"
+_UNVERIFIED_TEXT = (
+    "このファイルには、どの内容の PDF に付けられたか記録されていない\n"
+    "学習マークが {count} 件あります。\n\n"
+    "いま開いている PDF のものとして紐付けますか？\n"
+    "「いいえ」を選んでもマークは削除されません（次に開いたときにまた尋ねます）。"
+)
+
+# 更新の操作で起こりうる**想定された失敗**。表示対象の食い違い
+# （`StudyMarkError`）、DB の障害、保存データの不整合、PDF そのものを
+# 読めないこと（内容の指紋）。SQL はここに書かないが、リポジトリが
+# `sqlite3` の例外を上げてくるという事実はこの境界が引き受ける。
+_OPERATION_ERRORS = (StudyMarkError, sqlite3.Error, StoredStudyMarkError, OSError)
+
 
 class StudyMarkInteraction:
     """Ctrl + 左クリックと右クリックメニューを、保存の操作へつなぐ。"""
@@ -59,6 +77,7 @@ class StudyMarkInteraction:
         view.study_mark_menu_requested.connect(self._on_menu_requested)
 
     # -------------------------------------------------- Ctrl + 左クリック
+    @guard_qt_callback
     def _on_activated(self, target: StudyMarkTarget) -> None:
         """バッジの上なら回数を増やし、ページの上なら追加する。
 
@@ -70,9 +89,10 @@ class StudyMarkInteraction:
         elif target.position is not None:
             # クリックと保存の間に PDF は切り替わりようがないが、対象の
             # PDF を名乗るのは呼び出し側の責任なので、ここでも明示する。
-            self._create(target.position, self._controller.active_document_path)
+            self._create(target.position, self._controller.active_document)
 
     # -------------------------------------------------- 右クリックメニュー
+    @guard_qt_callback
     def _on_menu_requested(self, target: StudyMarkTarget, global_pos: QPoint) -> None:
         menu = self.build_menu(target)
         if menu is None:
@@ -112,9 +132,12 @@ class StudyMarkInteraction:
         位置と一緒に **メニューを開いた時点の表示対象** も捕まえる。
         `PagePosition` は正規化座標なのでどの PDF のものか名乗れず、
         これが無いと PDF を切り替えた後の発火で別の PDF にマークができる。
-        照合はコントローラ側（パスの正規化を UI に持ち込まない）。
+
+        捕まえるのはパスではなく `DocumentIdentity`。同じパスの PDF を別の
+        内容へ差し替えて開き直された場合も、別の PDF として弾ける。中身の
+        比較はコントローラ側（判定基準を UI に持ち込まない）。
         """
-        expected = self._controller.active_document_path
+        expected = self._controller.active_document
         menu = QMenu(self._parent)
         menu.addAction("学習マークを追加").triggered.connect(
             lambda: self._create(position, expected)
@@ -122,7 +145,7 @@ class StudyMarkInteraction:
         return menu
 
     # -------------------------------------------------- 操作
-    def _create(self, position: PagePosition, expected_document: Path | None) -> None:
+    def _create(self, position: PagePosition, expected_document: DocumentIdentity | None) -> None:
         self._run(
             lambda: self._controller.create_mark(position, expected_document=expected_document)
         )
@@ -161,16 +184,58 @@ class StudyMarkInteraction:
             return
         self._run(lambda: self._controller.delete_mark(mark.id))
 
-    def _run(self, operation: Callable[[], None]) -> None:
+    # -------------------------------------------------- 古い形式のマーク
+    def prompt_adopt_unverified(self) -> None:
+        """指紋を持たない古い学習マークを、この PDF に紐付けるか尋ねる。
+
+        **PDF を開いた直後に呼ぶ**（呼ぶかどうかは `MainWindow` が決める）。
+        マイグレーション2 より前に作られたマークは、どの内容の PDF に
+        付けられたのかが分からない。黙って表示すると、同じパスの PDF を
+        別の本へ差し替えていた場合に前の本のマークが正常なデータとして
+        並ぶ。かといって黙って紐付けるのは取り消せない。
+
+        **どちらの側にも倒さず、その PDF を実際に見ている利用者に尋ねる。**
+        「いいえ」を選んでもマークは消えない（次に開いたときにまた尋ねる）。
+        既定のボタンも「いいえ」にしておく。
+
+        ここに置くのは、学習マークの操作の失敗を止める境界（`_run()`）が
+        ここにあるため。`MainWindow` から直に呼ぶと、DB の障害がそのまま
+        起動時の未捕捉例外になる。
+        """
+        count = self._controller.unverified_count
+        if count == 0:
+            return
+
+        answer = QMessageBox.question(
+            self._parent,
+            _UNVERIFIED_TITLE,
+            _UNVERIFIED_TEXT.format(count=count),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is not QMessageBox.StandardButton.Yes:
+            return
+        self._run(self._controller.adopt_unverified)
+
+    def _run(self, operation: Callable[[], object]) -> None:
         """操作を実行し、失敗したら記録して知らせる。
 
-        ここが利用者の操作の境界なので、例外の種類で分けない
-        （`sqlite3` でも `StudyMarkError` でも、できることは同じ）。
+        捕まえるのは **想定された失敗だけ**（`_OPERATION_ERRORS`）。どれも
+        利用者から見れば「更新できなかった」の1通りなので、種類では分けない。
         表示を成功したように見せないのは `StudyMarkController` の責任で、
         ここは「読み続けられる」状態を壊さないことだけを守る。
+
+        `AttributeError` のような実装の誤りは小さな警告に化けさせない。
+        ただし **ここは Qt が呼んだ slot の内側**（クリックもメニューの項目も
+        Qt から来る）で、そこから例外を外へ出すのは undefined behavior。
+        外へ投げる代わりに fail-stop の境界へ渡す（記録して知らせ、
+        イベントループを終わらせる。`anp.ui.fatal`）。
         """
         try:
             operation()
-        except Exception as error:
+        except _OPERATION_ERRORS as error:
             logger.exception("study mark operation failed")
             QMessageBox.warning(self._parent, _ERROR_TITLE, f"{_ERROR_TEXT}\n\n{error}")
+        except Exception as error:
+            # 想定していない失敗＝実装の誤り。読み続けさせない。
+            report_fatal(error)

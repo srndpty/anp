@@ -67,10 +67,21 @@ class DisplayKey:
     color_mode: PageColorMode
 
 
+# ARGB32 の1画素あたりのバイト数。上限の下限（1画素も入らないキャッシュを
+# 作らせない）に使う。
+BYTES_PER_PIXEL = 4
+
+
 class ImageCache[KeyT]:
     """鍵から `QImage` への、合計バイト数で上限を設けた LRU キャッシュ。"""
 
     def __init__(self, max_bytes: int) -> None:
+        # 上限は自分で確かめる。0 や負の値を受け取ると `put()` が常に失敗する
+        # 「何も入らないキャッシュ」ができ、症状は呼び出し側（真っ白なページ）
+        # にしか出ない。作れてしまう時点で誤りなので、ここで止める。
+        if max_bytes < BYTES_PER_PIXEL:
+            msg = f"max_bytes must be at least {BYTES_PER_PIXEL}, got {max_bytes}"
+            raise ValueError(msg)
         self._max_bytes = max_bytes
         self._entries: OrderedDict[KeyT, QImage] = OrderedDict()
         self._total_bytes = 0

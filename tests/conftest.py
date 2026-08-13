@@ -21,6 +21,7 @@ from anp.pdf.cache import RenderCache
 from anp.pdf.document import DocumentController
 from anp.storage import database
 from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.ui import fatal as fatal_module
 from anp.ui.pdf_view import PdfView
 from helpers import RecordingService
 
@@ -28,6 +29,35 @@ from helpers import RecordingService
 # PySide6 の import 自体はプラットフォームプラグインを読み込まないため、
 # import の後に設定しても間に合う。
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+@dataclass
+class FatalCalls:
+    """`anp.ui.fatal` が知らせた致命的エラーの記録。
+
+    本番ではダイアログを出してイベントループを終わらせるが、テストでは
+    どちらも起こさずに記録だけ残す（モーダルが出るとテストが止まる）。
+    """
+
+    dialogs: list[str]
+    exit_codes: list[int]
+
+
+@pytest.fixture(autouse=True)
+def fatal(monkeypatch: pytest.MonkeyPatch) -> FatalCalls:
+    """Qt 境界の fail-stop を捕まえる。
+
+    autouse なのは、どのテストでもモーダルを出させないため。出ないはずの
+    テストでは、空のままであること自体が「想定外の失敗が無かった」の検証になる。
+    """
+    calls = FatalCalls(dialogs=[], exit_codes=[])
+    monkeypatch.setattr(
+        fatal_module.QMessageBox, "critical", lambda *args: calls.dialogs.append(str(args[2]))
+    )
+    monkeypatch.setattr(
+        fatal_module.QCoreApplication, "exit", lambda code=0: calls.exit_codes.append(code)
+    )
+    return calls
 
 
 @pytest.fixture(autouse=True)

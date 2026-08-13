@@ -48,6 +48,15 @@ class AppPaths:
         """学習メタデータを保存する SQLite ファイルのパス。"""
         return self.data_dir / "anp.sqlite3"
 
+    @property
+    def lock_file(self) -> Path:
+        """二重起動を防ぐためのロックファイルのパス。
+
+        DB と同じ場所に置く。守りたいのは「この DB を触るのは1プロセス
+        だけ」なので、DB ごとにロックが1つある形にする。
+        """
+        return self.data_dir / "anp.lock"
+
     def ensure_directories(self) -> None:
         """必要なディレクトリを作成する。"""
         self.data_dir.mkdir(parents=True, exist_ok=True)

@@ -12,6 +12,8 @@ from pathlib import Path
 from PySide6.QtCore import QSizeF
 from PySide6.QtPdf import QPdfDocument
 
+from anp.core.fingerprint import file_fingerprint
+
 logger = logging.getLogger(__name__)
 
 _ERROR_MESSAGES: dict[QPdfDocument.Error, str] = {
@@ -24,6 +26,8 @@ _ERROR_MESSAGES: dict[QPdfDocument.Error, str] = {
 }
 
 _EMPTY_DOCUMENT_MESSAGE = "ページが1つも含まれていません。"
+
+_UNREADABLE_MESSAGE = "読み込んだ直後にファイルを読めなくなりました。"
 
 
 class DocumentError(Exception):
@@ -47,6 +51,7 @@ class DocumentController:
     def __init__(self) -> None:
         self._document = QPdfDocument()
         self._path: Path | None = None
+        self._content_fingerprint: str | None = None
 
     # -------------------------------------------------- 状態
     @property
@@ -58,6 +63,17 @@ class DocumentController:
     def path(self) -> Path | None:
         """開いているファイルのパス。開いていなければ None。"""
         return self._path
+
+    @property
+    def content_fingerprint(self) -> str | None:
+        """開いた PDF の内容の指紋。開いていなければ None。
+
+        **`load()` の直後に取った値**。学習マークの持ち主
+        （`DocumentIdentity`）はこれを使う。後から改めてファイルを読み直して
+        計算すると、その間に同じパスが別の内容へ置き換わったときに、
+        表示している PDF と持ち主として記録する PDF がずれる。
+        """
+        return self._content_fingerprint
 
     @property
     def is_open(self) -> bool:
@@ -75,7 +91,12 @@ class DocumentController:
 
     # -------------------------------------------------- 開閉
     def open(self, path: Path) -> None:
-        """PDF を開く。失敗した場合は `DocumentError` を送出する。"""
+        """PDF を開く。失敗した場合は `DocumentError` を送出する。
+
+        内容の指紋も **ここで取る**（`content_fingerprint`）。後から改めて
+        読み直すと、その間に同じパスが別の内容へ置き換わったときに、
+        表示している PDF と持ち主として記録する PDF がずれる。
+        """
         self.close()
 
         error = self._document.load(str(path))
@@ -89,13 +110,35 @@ class DocumentController:
             self._document.close()
             raise DocumentError(_EMPTY_DOCUMENT_MESSAGE)
 
+        try:
+            fingerprint = file_fingerprint(path)
+        except OSError:
+            # 読み込みは通ったのに指紋を取れない（読み込みの最中に消された
+            # など）。同一性の分からない PDF を開いた状態にはしない。
+            logger.warning("failed to fingerprint %s", path, exc_info=True)
+            self.close()
+            raise DocumentError(_UNREADABLE_MESSAGE) from None
+        except BaseException:
+            # 想定していない失敗。**包まないが、開きかけは残さない。**
+            # ここで抜けると `QPdfDocument` だけ開いた状態になる。
+            self.close()
+            raise
+
         self._path = path
+        self._content_fingerprint = fingerprint
         logger.info("opened document with %d pages", self._document.pageCount())
 
     def close(self) -> None:
-        """開いている PDF を閉じる。開いていなければ何もしない。"""
-        if self._path is None:
-            return
+        """開いている PDF を閉じる。開いていなければ何もしない。
+
+        **`QPdfDocument` は無条件に閉じる。** `_path` を「開いているか」の
+        代わりに使って早期に返すと、`open()` の途中（`load()` は成功したが
+        `_path` を入れる前）で抜けたときに、閉じられない `QPdfDocument` が
+        残ってしまう。
+        """
+        was_open = self._path is not None
         self._document.close()
         self._path = None
-        logger.info("closed document")
+        self._content_fingerprint = None
+        if was_open:
+            logger.info("closed document")

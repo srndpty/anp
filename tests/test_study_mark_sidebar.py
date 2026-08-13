@@ -26,7 +26,7 @@ from anp.core.settings import Settings
 from anp.pdf.cache import RenderCache
 from anp.pdf.color import PageColorMode
 from anp.pdf.document import DocumentController
-from anp.storage.study_mark import StudyMark
+from anp.storage.study_mark import DocumentIdentity, StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import NO_PAGE, PdfView, ZoomMode
@@ -162,10 +162,10 @@ def test_activating_a_document_publishes_its_marks(
     sample_pdf: Path,
 ) -> None:
     """読み込んだマークがスナップショットになり、ビューと一致する。"""
-    mark = study_marks.create(sample_pdf, 0, 0.25, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.5)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert study_mark_controller.study_marks == (mark,)
     assert study_mark_controller.study_marks == view.study_marks
@@ -183,9 +183,9 @@ def test_the_snapshot_is_an_immutable_tuple(
     リポジトリが返したリストをそのまま公開すると、外から継ぎ当てられて
     しまい「DB が source of truth」が崩れる。
     """
-    study_marks.create(sample_pdf, 0, 0.25, 0.5)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.5)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert isinstance(study_mark_controller.study_marks, tuple)
 
@@ -199,10 +199,10 @@ def test_refresh_publishes_the_updated_snapshot(
 ) -> None:
     """`refresh()` でスナップショットが入れ替わる。"""
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert list(study_mark_controller.study_marks) == []
 
-    added = study_marks.create(sample_pdf, 1, 0.5, 0.5)
+    added = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
     study_mark_controller.refresh()
 
     assert study_mark_controller.study_marks == (added,)
@@ -216,9 +216,9 @@ def test_clearing_the_document_publishes_an_empty_snapshot(
     sample_pdf: Path,
 ) -> None:
     """表示対象の解除でスナップショットも空になる。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     study_mark_controller.clear_document()
 
@@ -234,9 +234,9 @@ def test_a_mutation_publishes_the_updated_snapshot(
     sample_pdf: Path,
 ) -> None:
     """更新が通ったらスナップショットも読み直した内容になる。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     study_mark_controller.increment_mark(mark.id)
 
@@ -244,28 +244,27 @@ def test_a_mutation_publishes_the_updated_snapshot(
     assert study_mark_controller.study_marks == view.study_marks
 
 
-def test_a_refresh_failure_publishes_an_empty_snapshot(
+def test_a_mutation_publishes_without_rereading(
     study_mark_connection: sqlite3.Connection,
     view: PdfView,
     doc: DocumentController,
     sample_pdf: Path,
 ) -> None:
-    """更新は通ったが読み直せなかった場合、スナップショットは空になる。
+    """更新後のスナップショットは、返ってきた1件から組み立てる。
 
-    古い件数を残すと、画面の数字が保存されている値だと誤解させる。
+    全件の読み直しに失敗しても、確定済みの更新を「失敗」に見せない。
     """
     repository = BrokenRepository(study_mark_connection)
-    mark = repository.create(sample_pdf, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     controller = StudyMarkController(repository, view)
     show(view, doc, sample_pdf)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     repository.failing = "list"
-    with pytest.raises(sqlite3.OperationalError):
-        controller.increment_mark(mark.id)
+    controller.increment_mark(mark.id)
 
-    assert controller.study_marks == ()
-    assert view.study_marks == ()
+    assert [shown.mistake_count for shown in controller.study_marks] == [2]
+    assert controller.study_marks == view.study_marks
     assert controller.active_document_path == sample_pdf
 
 
@@ -284,9 +283,9 @@ def test_every_publish_notifies_once(
     published: list[tuple[StudyMark, ...]] = []
     study_mark_controller.marks_changed.connect(published.append)
 
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     # 読み取りの前の空と、読み取れた分の2回。
     assert published == [(), (mark,)]
@@ -306,17 +305,17 @@ def test_a_load_failure_publishes_an_empty_snapshot(
 ) -> None:
     """読み込みに失敗したら、前の PDF のスナップショットも残らない。"""
     repository = BrokenRepository(study_mark_connection)
-    repository.create(sample_pdf, 0, 0.1, 0.1)
+    repository.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     controller = StudyMarkController(repository, view)
 
     show(view, doc, sample_pdf)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert len(controller.study_marks) == 1
 
     repository.failing = "list"
     show(view, doc, two_page_pdf)
     with pytest.raises(StudyMarkLoadError):
-        controller.activate_document(two_page_pdf)
+        controller.activate_document(DocumentIdentity.of(two_page_pdf))
 
     assert list(controller.study_marks) == []
     assert list(view.study_marks) == []
@@ -414,7 +413,7 @@ def test_a_long_note_row_keeps_the_full_text_in_the_tooltip(
 ) -> None:
     """省略しても全文はツールチップで読める。保存値も変えない。"""
     note = "長いメモ。" * 200
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5, note=note)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note=note)
     window.open_path(sample_pdf)
 
     item = window.study_mark_sidebar.tree.topLevelItem(0)
@@ -835,8 +834,8 @@ def test_opening_a_pdf_fills_the_sidebar(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """PDF を開くと一覧にその PDF のマークが並ぶ。"""
-    first = study_marks.create(sample_pdf, 0, 0.2, 0.3, note="メモ")
-    second = study_marks.create(sample_pdf, 2, 0.4, 0.5)
+    first = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.2, 0.3, note="メモ")
+    second = study_marks.create(DocumentIdentity.of(sample_pdf), 2, 0.4, 0.5)
 
     window.open_path(sample_pdf)
 
@@ -855,9 +854,9 @@ def test_switching_pdfs_swaps_the_sidebar_rows(
     どちらも `page_index = 0` を含めておく。ページ番号だけで引いていると
     この検証が落ちる。
     """
-    a1 = study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    a2 = study_marks.create(sample_pdf, 1, 0.2, 0.2)
-    b1 = study_marks.create(two_page_pdf, 0, 0.9, 0.9)
+    a1 = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    a2 = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.2, 0.2)
+    b1 = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.9, 0.9)
 
     window.open_path(sample_pdf)
     assert list(window.study_mark_sidebar.rows) == [a1, a2]
@@ -876,7 +875,7 @@ def test_a_pdf_without_marks_empties_the_sidebar(
     single_page_pdf: Path,
 ) -> None:
     """マークの無い PDF へ切り替えたら、前の PDF の行は残らない。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.open_path(single_page_pdf)
@@ -905,7 +904,7 @@ def test_a_failed_mark_load_empties_the_sidebar(
     """学習マークを読めずに開くのを中止したら、一覧も空になる。"""
     monkeypatch.setattr("anp.ui.main_window.QMessageBox.warning", lambda *_args: None)
     repository = BrokenRepository(study_mark_connection)
-    repository.create(sample_pdf, 0, 0.1, 0.1)
+    repository.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window = MainWindow(settings, repository)
     qtbot.addWidget(window)
 
@@ -924,8 +923,8 @@ def test_the_sidebar_and_the_overlay_always_match(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """一覧とオーバーレイは同じスナップショットから作られる。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    study_marks.create(sample_pdf, 2, 0.5, 0.5)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 2, 0.5, 0.5)
 
     window.open_path(sample_pdf)
 
@@ -938,8 +937,8 @@ def test_filtering_leaves_the_overlay_complete(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """絞り込みは一覧だけ。オーバーレイは全件を出し続ける。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    marked = study_marks.create(sample_pdf, 1, 0.5, 0.5)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    marked = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
     for _ in range(3):
         study_marks.increment_mistake_count(marked.id)
     window.open_path(sample_pdf)
@@ -959,7 +958,7 @@ def test_filtering_does_not_query_the_database(
 ) -> None:
     """絞り込みで問い合わせは1回も増えない。"""
     repository = RecordingRepository(study_mark_connection)
-    repository.create(sample_pdf, 0, 0.1, 0.1)
+    repository.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window = MainWindow(settings, repository)
     qtbot.addWidget(window)
     window.open_path(sample_pdf)
@@ -981,7 +980,7 @@ def test_filtering_does_not_move_the_view(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """絞り込みは表示位置にも倍率にも触らない。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
     window.view.go_to_page(1)
     scroll = window.view.verticalScrollBar().value()
@@ -1018,7 +1017,7 @@ def test_incrementing_updates_the_row_count(
     warnings: list[str],
 ) -> None:
     """回数を増やすと、一覧の数字も 1 → 2 になる。"""
-    study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.open_path(sample_pdf)
     assert counts(window.study_mark_sidebar) == [1]
 
@@ -1037,7 +1036,7 @@ def test_a_failed_mutation_keeps_the_old_rows(
 ) -> None:
     """更新自体が失敗したら、一覧もオーバーレイも前のまま。"""
     repository = BrokenRepository(study_mark_connection)
-    repository.create(sample_pdf, 0, 0.5, 0.5)
+    repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window = MainWindow(settings, repository)
     qtbot.addWidget(window)
     with qtbot.waitExposed(window):
@@ -1053,20 +1052,20 @@ def test_a_failed_mutation_keeps_the_old_rows(
     window.close()
 
 
-def test_a_failed_refresh_empties_both_views(
+def test_a_mutation_updates_both_views_without_rereading(
     qtbot: QtBot,
     settings: Settings,
     study_mark_connection: sqlite3.Connection,
     sample_pdf: Path,
     warnings: list[str],
 ) -> None:
-    """更新は通ったが読み直せなかった場合、一覧もオーバーレイも空になる。
+    """全件を読み直せなくても、一覧とオーバーレイは同じ新しい値になる。
 
-    オーバーレイだけ空で、一覧に古い数字が残る状態を作らない。PDF を
-    読むこと自体は続けられる。
+    情報源は1つ（`_publish_marks()`）なので、片方だけ古い数字が残る状態は
+    作れない。PDF を読むこと自体も続けられる。
     """
     repository = BrokenRepository(study_mark_connection)
-    repository.create(sample_pdf, 0, 0.5, 0.5)
+    repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window = MainWindow(settings, repository)
     qtbot.addWidget(window)
     with qtbot.waitExposed(window):
@@ -1076,9 +1075,9 @@ def test_a_failed_refresh_empties_both_views(
     repository.failing = "list"
     ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.5, 0.5))
 
-    assert len(warnings) == 1
-    assert window.study_mark_sidebar.rows == ()
-    assert window.view.study_marks == ()
+    assert warnings == []
+    assert [row.mistake_count for row in window.study_mark_sidebar.rows] == [2]
+    assert [shown.mistake_count for shown in window.view.study_marks] == [2]
     assert window.study_marks.active_document_path == sample_pdf
     assert window.view.has_document
     window.close()
@@ -1089,8 +1088,8 @@ def test_clicking_a_row_jumps_to_the_mark(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """行のクリックで、そのマークの位置まで移動する。"""
-    study_marks.create(sample_pdf, 0, 0.5, 0.1)
-    far = study_marks.create(sample_pdf, 2, 0.5, 0.8)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.1)
+    far = study_marks.create(DocumentIdentity.of(sample_pdf), 2, 0.5, 0.8)
     window.open_path(sample_pdf)
 
     click_row(window.study_mark_sidebar, 1)
@@ -1103,7 +1102,7 @@ def test_clicking_a_row_does_not_change_the_records(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """行のクリックは移動だけ。回数もメモも増減しない。"""
-    mark = study_marks.create(sample_pdf, 1, 0.5, 0.5, note="メモ")
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5, note="メモ")
     window.open_path(sample_pdf)
 
     click_row(window.study_mark_sidebar, 0)
@@ -1117,7 +1116,7 @@ def test_clicking_a_stale_row_is_safe(
     window: MainWindow, study_marks: StudyMarkRepository, single_page_pdf: Path
 ) -> None:
     """現在の PDF に無いページの行を押しても、落ちず・丸めず・記録も変えない。"""
-    stale = study_marks.create(single_page_pdf, 7, 0.5, 0.5)
+    stale = study_marks.create(DocumentIdentity.of(single_page_pdf), 7, 0.5, 0.5)
     window.open_path(single_page_pdf)
     scroll = window.view.verticalScrollBar().value()
 
@@ -1137,7 +1136,7 @@ def test_a_stale_message_does_not_hide_the_document_path(
     パスを `showMessage()` で出していると、5秒後にメッセージが消えた
     ときに一緒に消えてしまう。常設ウィジェットなのでそうならない。
     """
-    study_marks.create(single_page_pdf, 7, 0.5, 0.5)
+    study_marks.create(DocumentIdentity.of(single_page_pdf), 7, 0.5, 0.5)
     window.open_path(single_page_pdf)
     assert window.document_status_text == str(single_page_pdf)
 
@@ -1160,7 +1159,7 @@ def test_clicking_a_row_does_not_discard_the_rendering_state(
     `MainWindow` がドキュメントを載せ直せば、ビューが正しくても
     キャッシュは丸ごと捨てられる。
     """
-    study_marks.create(sample_pdf, 2, 0.5, 0.8)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 2, 0.5, 0.8)
     window.open_path(sample_pdf)
     render = window.view._render  # noqa: SLF001
     generation = render.generation
@@ -1180,7 +1179,7 @@ def test_jumping_from_any_zoom_state(
     `go_to_page()` でも現在ページは動かないため（重なりが最大のページ、
     という既存の規則がそのまま効く）。
     """
-    mark = study_marks.create(sample_pdf, 2, 0.5, 0.9)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 2, 0.5, 0.9)
     window.open_path(sample_pdf)
 
     if mode == "fit_width":

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections.abc import Sequence
@@ -24,9 +25,22 @@ _KEY_FREE_ZOOM = "view/free_zoom"
 _KEY_PAGE_COLOR_MODE = "view/page_color_mode"
 _KEY_CANVAS_THEME = "view/canvas_theme"
 _KEY_UI_THEME = "ui/theme"
-_KEY_SESSION_DOCUMENT = "session/document"
-_KEY_SESSION_PAGE_INDEX = "session/page_index"
-_KEY_SESSION_Y_NORM = "session/y_norm"
+# 前回のセッションは **1つの鍵にまとめて** 持つ。パス・ページ・縦位置を
+# 別々の鍵に書くと、書き込みの途中で終了したときに「パスだけ新しくて
+# ページが古い」組み合わせが残りうる。1つの JSON にすれば、`QSettings` の
+# 1回の書き込みで丸ごと入れ替わる。
+_KEY_SESSION = "session/last"
+
+_FIELD_DOCUMENT = "document"
+_FIELD_FINGERPRINT = "fingerprint"
+_FIELD_PAGE_INDEX = "page_index"
+_FIELD_Y_NORM = "y_norm"
+
+# 1つの鍵にまとめる前の形式。**読むだけ**（書き戻すことはない）。
+# 設定は消えても再設定すれば済むが、これは「前回どこまで読んだか」なので、
+# 更新した最初の1回だけ前回位置を失うのは避ける。新しい形式で1度保存すれば
+# 消えるので、次のスキーマ変更のときに一緒に落とす。
+_LEGACY_SESSION_KEYS = ("session/document", "session/page_index", "session/y_norm")
 
 # キーボードショートカットは `shortcuts/<command-id>` に1コマンド1件で置く。
 # コマンド ID を決めるのは UI 層で、`core` は文字列として読み書きするだけ。
@@ -107,6 +121,47 @@ class Settings:
         self._backend.setValue(_KEY_RECENT_FILES, list(value))
 
     # -------------------------------------------------- 前回のセッション
+    def _session(self) -> dict[str, object]:
+        """保存されている前回のセッション。無いか壊れていれば空の辞書。
+
+        3つの値は1つの JSON にまとめて入っている。読めない値が1つあっても
+        セッション全体を捨てはしない（各 property が既定値へ落とす）。
+
+        新しい鍵が無ければ、旧形式の3つの鍵から読む（`_legacy_session()`）。
+        """
+        value = self._backend.value(_KEY_SESSION)
+        if value is None:
+            return self._legacy_session()
+        if not isinstance(value, str):
+            logger.warning("ignoring non-string session value: %r", value)
+            return {}
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            logger.warning("ignoring unreadable session value: %r", value)
+            return {}
+        if not isinstance(parsed, dict):
+            logger.warning("ignoring non-object session value: %r", parsed)
+            return {}
+        return parsed
+
+    def _legacy_session(self) -> dict[str, object]:
+        """1つの鍵にまとめる前の形式で保存されていた前回のセッション。
+
+        更新した最初の1回で前回位置を失わないためだけの経路。値の検証は
+        新しい形式と共通（各 property が既定値へ落とす）。次に保存した
+        時点で新しい鍵へ移り、旧形式の鍵は消える。
+        """
+        document, page_index, y_norm = _LEGACY_SESSION_KEYS
+        if not self._backend.contains(document):
+            return {}
+        logger.info("reading the last session from the pre-JSON keys")
+        return {
+            _FIELD_DOCUMENT: self._backend.value(document),
+            _FIELD_PAGE_INDEX: self._backend.value(page_index, DEFAULT_SESSION_PAGE_INDEX),
+            _FIELD_Y_NORM: self._backend.value(y_norm, DEFAULT_SESSION_Y_NORM),
+        }
+
     @property
     def last_document(self) -> str:
         """前回終了時に開いていた PDF のパス。無ければ空文字。
@@ -114,8 +169,20 @@ class Settings:
         **最近開いたファイルの先頭とは別物。** 「最後に読んでいた PDF」と
         「利用者が明示的に開いた履歴」は意味が違うので、同じ値から導かない。
         """
-        value = self._backend.value(_KEY_SESSION_DOCUMENT, "")
+        value = self._session().get(_FIELD_DOCUMENT, "")
         return value if isinstance(value, str) else ""
+
+    @property
+    def last_fingerprint(self) -> str | None:
+        """前回終了時に開いていた PDF の内容の指紋。無ければ None。
+
+        **同じパスでも中身が違えば、前回の位置は意味を持たない。** 復元する
+        側がこれと現在の指紋を突き合わせる。旧形式で保存されたセッションには
+        入っていないので None になる。値の書式の検証は呼び出し側
+        （`anp.core.fingerprint`）に任せ、ここは文字列かどうかだけを見る。
+        """
+        value = self._session().get(_FIELD_FINGERPRINT)
+        return value if isinstance(value, str) and value else None
 
     @property
     def last_page_index(self) -> int:
@@ -129,7 +196,7 @@ class Settings:
         黙って 3 に丸めるが、それは保存された位置ではなく推測でしかない。
         どちらも読めなかったものとして先頭へ戻す。
         """
-        value = self._backend.value(_KEY_SESSION_PAGE_INDEX, DEFAULT_SESSION_PAGE_INDEX)
+        value = self._session().get(_FIELD_PAGE_INDEX, DEFAULT_SESSION_PAGE_INDEX)
         if isinstance(value, bool):
             logger.warning("ignoring non-numeric session page index: %r", value)
             return DEFAULT_SESSION_PAGE_INDEX
@@ -153,7 +220,7 @@ class Settings:
         ビューポートのピクセル座標は保存しない。ウィンドウの大きさ・DPI・
         倍率が変わっても意味が変わらない値だけを持つ。
         """
-        value = self._backend.value(_KEY_SESSION_Y_NORM, DEFAULT_SESSION_Y_NORM)
+        value = self._session().get(_FIELD_Y_NORM, DEFAULT_SESSION_Y_NORM)
         try:
             y_norm = float(value)  # type: ignore[arg-type]
         except (TypeError, ValueError):
@@ -164,23 +231,51 @@ class Settings:
             return DEFAULT_SESSION_Y_NORM
         return y_norm
 
-    def set_last_session(self, document: str, page_index: int, y_norm: float) -> None:
+    def set_last_session(
+        self, document: str, fingerprint: str | None, page_index: int, y_norm: float
+    ) -> None:
         """前回のセッションを丸ごと保存する。
 
-        3つの値を別々の setter にしないのは、パスだけ新しくてページが古い
-        ような中途半端な組み合わせを作れないようにするため。
+        **3つの値は1つの鍵へ1回で書く。** API をまとめただけでは、パスだけ
+        新しくてページが古いという中途半端な組み合わせを防げない
+        （`setValue()` を3回呼ぶ間に落ちれば、その状態が残る）。JSON にして
+        1回の書き込みにすることで、次に読むのは古い3つ組か新しい3つ組の
+        どちらかだけになる。
+
+        旧形式の鍵は **新しい鍵を書いた後で** 消す。残しておくと、新しい鍵を
+        消したときに（`clear_last_session()`）古い位置が復活してしまう。
+        逆順にすると、間で落ちたときにセッションを丸ごと失う。
         """
-        self._backend.setValue(_KEY_SESSION_DOCUMENT, document)
-        self._backend.setValue(_KEY_SESSION_PAGE_INDEX, page_index)
-        self._backend.setValue(_KEY_SESSION_Y_NORM, y_norm)
+        self._backend.setValue(
+            _KEY_SESSION,
+            json.dumps(
+                {
+                    _FIELD_DOCUMENT: document,
+                    _FIELD_FINGERPRINT: fingerprint,
+                    _FIELD_PAGE_INDEX: page_index,
+                    _FIELD_Y_NORM: y_norm,
+                }
+            ),
+        )
+        self._remove_legacy_session()
 
     def clear_last_session(self) -> None:
         """前回のセッションを忘れる。
 
         PDF を開いていない状態で終了したときと、復元に失敗したときに呼ぶ。
         後者で消しておかないと、起動のたびに同じ失敗を繰り返す。
+
+        **消す順は「旧形式が先」。** 新しい鍵を先に消すと、その直後に落ちた
+        ときに旧形式だけが残り、次の起動で `_session()` の fallback が
+        もっと古い位置を復活させてしまう。逆順なら、途中で落ちても最悪
+        「いま消したはずのセッションがもう1回残る」で済む。
         """
-        for key in (_KEY_SESSION_DOCUMENT, _KEY_SESSION_PAGE_INDEX, _KEY_SESSION_Y_NORM):
+        self._remove_legacy_session()
+        self._backend.remove(_KEY_SESSION)
+
+    def _remove_legacy_session(self) -> None:
+        """旧形式の3つの鍵を消す。"""
+        for key in _LEGACY_SESSION_KEYS:
             self._backend.remove(key)
 
     # -------------------------------------------------- 表示

@@ -28,6 +28,43 @@ def test_empty_document_is_rejected() -> None:
         PageLayout([])
 
 
+@pytest.mark.parametrize(
+    "size",
+    [
+        QSizeF(100.0, 0.0),
+        QSizeF(0.0, 200.0),
+        QSizeF(100.0, -200.0),
+        QSizeF(float("nan"), 200.0),
+        QSizeF(100.0, float("nan")),
+        QSizeF(float("inf"), 200.0),
+    ],
+)
+def test_a_broken_page_size_is_rejected(size: QSizeF) -> None:
+    """壊れたページ寸法は入口で止める。
+
+    0 高さは `to_normalized()` のゼロ除算に、NaN は `fit_width_zoom()` の
+    `width <= 0` をすり抜けてスクロール座標・二分探索・描画矩形へそのまま
+    流れ込む。防御を下流の各メソッドへ散らさない。
+    """
+    with pytest.raises(ValueError, match="ページ 2"):
+        PageLayout([QSizeF(PAGE), size])
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        {"margin": -1.0},
+        {"page_gap": -1.0},
+        {"margin": float("nan")},
+        {"page_gap": float("inf")},
+    ],
+)
+def test_broken_metrics_are_rejected(metrics: dict[str, float]) -> None:
+    """余白と隙間も、有限で 0 以上でなければ受け付けない。"""
+    with pytest.raises(ValueError):
+        LayoutMetrics(**metrics)
+
+
 def test_content_size_at_unit_zoom() -> None:
     """等倍のときの全体サイズ。"""
     layout = make_layout(3)

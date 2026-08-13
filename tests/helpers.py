@@ -21,7 +21,6 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt
@@ -31,7 +30,7 @@ from anp.pdf import render as render_module
 from anp.pdf.cache import RenderCache, RenderKey
 from anp.pdf.color import PageColorMode
 from anp.pdf.render import PageRenderService, PageRequest, _TransformJob, _TransformResult
-from anp.storage.study_mark import StudyMark
+from anp.storage.study_mark import DocumentIdentity, StudyMark
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui import pdf_view as view_module
 from anp.ui.pdf_view import PdfView
@@ -278,9 +277,9 @@ class RecordingRepository(StudyMarkRepository):
         super().__init__(connection)
         self.queried: list[str] = []
 
-    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
-        self.queried.append(str(document_path))
-        return super().list_for_document(document_path)
+    def list_for_document(self, document: DocumentIdentity) -> list[StudyMark]:
+        self.queried.append(document.key)
+        return super().list_for_document(document)
 
 
 class BrokenRepository(StudyMarkRepository):
@@ -302,14 +301,14 @@ class BrokenRepository(StudyMarkRepository):
 
     def create(
         self,
-        document_path: Path | str,
+        document: DocumentIdentity,
         page_index: int,
         x_norm: float,
         y_norm: float,
         note: str | None = None,
     ) -> StudyMark:
         self._fail_if("create")
-        return super().create(document_path, page_index, x_norm, y_norm, note)
+        return super().create(document, page_index, x_norm, y_norm, note)
 
     def increment_mistake_count(self, mark_id: int) -> StudyMark | None:
         self._fail_if("increment")
@@ -323,9 +322,9 @@ class BrokenRepository(StudyMarkRepository):
         self._fail_if("delete")
         return super().delete(mark_id)
 
-    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
+    def list_for_document(self, document: DocumentIdentity) -> list[StudyMark]:
         self._fail_if("list")
-        return super().list_for_document(document_path)
+        return super().list_for_document(document)
 
 
 def count_transforms(monkeypatch: pytest.MonkeyPatch) -> list[PageColorMode]:

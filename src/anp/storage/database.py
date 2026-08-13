@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -61,9 +62,38 @@ def _create_study_marks(connection: sqlite3.Connection) -> None:
     )
 
 
+def _add_document_fingerprint(connection: sqlite3.Connection) -> None:
+    """マイグレーション2 `study_marks.document_fingerprint`: 内容の指紋を持たせる。
+
+    マイグレーション1 の識別子はパスだけだった。そのため、同じパスの PDF を
+    **別の内容のものへ差し替える**と、古い本の学習マークが新しい本の同じ
+    ページ番号のところに、正常なデータとして表示される。位置がそれらしく
+    見えるぶん、単に消えるより危ない。
+
+    追加する列は SHA-256 の16進表記（`anp.core.fingerprint`）。
+    **既存の行は NULL のまま残す。** 学習の記録は再取得できないので、
+    指紋を知らないという理由で消したり、確かめようのない値を埋めたりは
+    しない。
+
+    NULL は「内容が分からない ＝ 持ち主を確かめられない」として扱う。
+    読み出し側（`StudyMarkRepository`）は普通の一覧には出さず、
+    `unverified_count()` で数えて、利用者が承認したときだけ
+    `adopt_unverified()` で指紋を書き込む。黙って表示すると、同じパスの
+    PDF を差し替えていた場合に前の本のマークが乗ってしまうため。
+
+    インデックスは作り直さない。絞り込みは今までどおり `document_key` で
+    効き、指紋の比較は取り出した行に対してかかるだけで、1 PDF あたりの
+    行数はもともと数千件に収まる。
+    """
+    connection.execute(
+        "ALTER TABLE study_marks ADD COLUMN document_fingerprint TEXT NULL"
+        " CHECK (document_fingerprint IS NULL OR length(document_fingerprint) = 64)"
+    )
+
+
 # スキーマ更新の手順。先頭から順に適用し、適用済み件数を user_version に持つ。
 # 一度リリースした要素は書き換えず、末尾に追加していく。
-_MIGRATIONS: tuple[Migration, ...] = (_create_study_marks,)
+_MIGRATIONS: tuple[Migration, ...] = (_create_study_marks, _add_document_fingerprint)
 
 
 def connect(path: Path, *, migrations: Sequence[Migration] = _MIGRATIONS) -> sqlite3.Connection:
@@ -90,6 +120,34 @@ def connect(path: Path, *, migrations: Sequence[Migration] = _MIGRATIONS) -> sql
     return connection
 
 
+@contextmanager
+def transaction(connection: sqlite3.Connection) -> Iterator[None]:
+    """明示的なトランザクションで囲む。
+
+    接続は `autocommit=True`（暗黙のトランザクションを作らない）で開くので、
+    「読んで、書いて、読み直す」のように1文で終わらない操作は、ここを通して
+    まとめる必要がある。
+
+    **`COMMIT` も内側。** これも失敗しうる SQL で、失敗した時点では
+    トランザクションが開いたまま残る。接続はアプリの起動から終了まで
+    使い回すので、開きっぱなしを残すと以後の更新が意図せずその中に入ったり、
+    次の `BEGIN` が失敗したりする。
+
+    巻き戻し自体の失敗で、元の失敗を覆い隠さない（記録だけ残す）。
+    """
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                logger.exception("failed to roll back the transaction")
+        raise
+
+
 def schema_version(connection: sqlite3.Connection) -> int:
     """適用済みマイグレーションの件数を返す。"""
     row = connection.execute("PRAGMA user_version").fetchone()
@@ -106,8 +164,7 @@ def apply_migrations(
     トランザクションに入れる。途中で失敗した場合はスキーマも版も適用前に
     戻るため、次回の起動で同じマイグレーションを再実行できる。
     """
-    connection.execute("BEGIN IMMEDIATE")
-    try:
+    with transaction(connection):
         current = schema_version(connection)
         if current > len(migrations):
             msg = f"データベースのスキーマ版 {current} はこのバージョンの anp より新しいです"
@@ -120,9 +177,4 @@ def apply_migrations(
             connection.execute(f"PRAGMA user_version = {index + 1:d}")
 
         applied = schema_version(connection)
-    except BaseException:
-        connection.execute("ROLLBACK")
-        raise
-
-    connection.execute("COMMIT")
     return applied

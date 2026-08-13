@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtPdf import QPdfDocument
 
+from anp.pdf import document as document_module
 from anp.pdf.document import _ERROR_MESSAGES, DocumentController, DocumentError
 
 
@@ -208,3 +209,49 @@ def test_password_protected_message_is_defined() -> None:
     assert _ERROR_MESSAGES[QPdfDocument.Error.IncorrectPassword] == (
         "パスワードで保護されているため開けません。"
     )
+
+
+def test_an_unexpected_fingerprint_failure_leaves_nothing_open(
+    sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """指紋の計算が想定外の失敗をしても、開きかけの PDF を残さない。
+
+    `load()` は成功しているので、ここで抜けると `QPdfDocument` だけが開いた
+    状態になる。`close()` はその状態も確実に閉じられなければならない。
+    """
+
+    def buggy(_path: Path | str) -> str:
+        raise AttributeError("bug")
+
+    monkeypatch.setattr(document_module, "file_fingerprint", buggy)
+    controller = DocumentController()
+    try:
+        with pytest.raises(AttributeError):
+            controller.open(sample_pdf)
+
+        assert not controller.is_open
+        assert controller.path is None
+        assert controller.content_fingerprint is None
+        assert controller.document.status() != QPdfDocument.Status.Ready
+    finally:
+        controller.close()
+
+
+def test_a_fingerprint_that_cannot_be_read_is_an_open_failure(
+    sample_pdf: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """読み込みの直後にファイルを読めなくなった場合は、開けなかったとして扱う。"""
+
+    def unreadable(_path: Path | str) -> str:
+        raise OSError(2, "gone")
+
+    monkeypatch.setattr(document_module, "file_fingerprint", unreadable)
+    controller = DocumentController()
+    try:
+        with pytest.raises(DocumentError):
+            controller.open(sample_pdf)
+
+        assert not controller.is_open
+        assert controller.document.status() != QPdfDocument.Status.Ready
+    finally:
+        controller.close()

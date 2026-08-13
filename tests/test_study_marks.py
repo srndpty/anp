@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 from anp.storage import database
-from anp.storage.study_mark import StudyMark, document_key
-from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.storage.study_mark import DocumentIdentity, StudyMark, document_key
+from anp.storage.study_mark_repository import StoredStudyMarkError, StudyMarkRepository
 
 
 @pytest.fixture
@@ -77,6 +77,39 @@ def test_document_key_rejects_empty_path() -> None:
     """空文字はカレントディレクトリではなく誤りとして扱う。"""
     with pytest.raises(ValueError, match="empty"):
         document_key("")
+
+
+def test_a_stored_fingerprint_that_is_not_a_sha256_is_a_data_error(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """保存されていた指紋が壊れていたら、保存データの不整合として気づける。
+
+    スキーマの CHECK は長さしか見ないので、ここをすり抜ける値は入りうる。
+    黙って「一致しないマーク」として消すと、記録が失われたように見える。
+    """
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute(
+        "UPDATE study_marks SET document_fingerprint = ? WHERE id = ?", ("x" * 64, mark.id)
+    )
+
+    with pytest.raises(StoredStudyMarkError):
+        repository.get(mark.id)
+
+
+def test_a_broken_stored_fingerprint_is_not_silently_skipped(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """壊れた指紋の行は、PDF を開く経路（一覧）でも見逃さない。
+
+    SQL で `document_fingerprint = ?` と絞ると、壊れた値は「一致しない
+    だけの行」として素通りし、検証にかからない。利用者からは記録が黙って
+    消えたようにしか見えない。
+    """
+    repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute("UPDATE study_marks SET document_fingerprint = ?", ("x" * 64,))
+
+    with pytest.raises(StoredStudyMarkError):
+        repository.list_for_document(DocumentIdentity.of(pdf_path))
 
 
 # ---------------------------------------------------------------- ドメインモデル
@@ -172,7 +205,7 @@ def test_study_mark_is_immutable() -> None:
 # ---------------------------------------------------------------- create
 def test_create_starts_at_one_mistake(repository: StudyMarkRepository, pdf_path: Path) -> None:
     """マークを作った時点で「1回間違えた」。"""
-    mark = repository.create(pdf_path, 2, 0.25, 0.75)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 2, 0.25, 0.75)
 
     assert mark.mistake_count == 1
     assert mark.id > 0
@@ -183,7 +216,9 @@ def test_create_round_trips_through_database(
     pdf_path: Path,
 ) -> None:
     """作った内容が DB から取り出しても一致する。"""
-    created = repository.create(pdf_path, 2, 0.25, 0.75, note="式変形を間違えた")
+    created = repository.create(
+        DocumentIdentity.of(pdf_path), 2, 0.25, 0.75, note="式変形を間違えた"
+    )
 
     fetched = repository.get(created.id)
 
@@ -198,7 +233,7 @@ def test_create_round_trips_through_database(
 
 def test_create_accepts_page_index_zero(repository: StudyMarkRepository, pdf_path: Path) -> None:
     """ページ番号は 0 始まり（QPdfDocument と同じ）。"""
-    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
 
     assert mark.page_index == 0
 
@@ -222,7 +257,7 @@ def test_create_rejects_invalid_position(
 ) -> None:
     """範囲外の値は丸めずに失敗させる。"""
     with pytest.raises(ValueError):
-        repository.create(pdf_path, page_index, x_norm, y_norm)
+        repository.create(DocumentIdentity.of(pdf_path), page_index, x_norm, y_norm)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
@@ -234,7 +269,7 @@ def test_create_rejects_non_finite_coordinates(
 ) -> None:
     """NaN / 無限大が黙って SQLite へ入らない。"""
     with pytest.raises(ValueError):
-        repository.create(pdf_path, 0, value, 0.5)
+        repository.create(DocumentIdentity.of(pdf_path), 0, value, 0.5)
 
     assert connection.execute("SELECT COUNT(*) FROM study_marks").fetchone()[0] == 0
 
@@ -244,11 +279,11 @@ def test_create_allows_duplicate_coordinates(
     pdf_path: Path,
 ) -> None:
     """同じ位置に複数のマークを置ける。同一性は id だけ。"""
-    first = repository.create(pdf_path, 1, 0.5, 0.5)
-    second = repository.create(pdf_path, 1, 0.5, 0.5)
+    first = repository.create(DocumentIdentity.of(pdf_path), 1, 0.5, 0.5)
+    second = repository.create(DocumentIdentity.of(pdf_path), 1, 0.5, 0.5)
 
     assert first.id != second.id
-    assert len(repository.list_for_document(pdf_path)) == 2
+    assert len(repository.list_for_document(DocumentIdentity.of(pdf_path))) == 2
 
 
 def test_create_handles_special_characters(
@@ -260,10 +295,12 @@ def test_create_handles_special_characters(
     path.parent.mkdir()
     path.write_bytes(b"%PDF-1.4\n")
 
-    mark = repository.create(path, 0, 0.5, 0.5, note="'; DROP TABLE study_marks;--")
+    mark = repository.create(
+        DocumentIdentity.of(path), 0, 0.5, 0.5, note="'; DROP TABLE study_marks;--"
+    )
 
     assert repository.get(mark.id) == mark
-    assert repository.list_for_document(path) == [mark]
+    assert repository.list_for_document(DocumentIdentity.of(path)) == [mark]
 
 
 # ---------------------------------------------------------------- list
@@ -277,12 +314,12 @@ def test_list_is_isolated_per_document(
     a.write_bytes(b"%PDF-1.4\n")
     b.write_bytes(b"%PDF-1.4\n")
 
-    a1 = repository.create(a, 0, 0.1, 0.1)
-    a2 = repository.create(a, 1, 0.2, 0.2)
-    b1 = repository.create(b, 0, 0.3, 0.3)
+    a1 = repository.create(DocumentIdentity.of(a), 0, 0.1, 0.1)
+    a2 = repository.create(DocumentIdentity.of(a), 1, 0.2, 0.2)
+    b1 = repository.create(DocumentIdentity.of(b), 0, 0.3, 0.3)
 
-    assert repository.list_for_document(a) == [a1, a2]
-    assert repository.list_for_document(b) == [b1]
+    assert repository.list_for_document(DocumentIdentity.of(a)) == [a1, a2]
+    assert repository.list_for_document(DocumentIdentity.of(b)) == [b1]
 
 
 def test_list_is_ordered_by_page_then_id(
@@ -290,18 +327,19 @@ def test_list_is_ordered_by_page_then_id(
     pdf_path: Path,
 ) -> None:
     """並び順はページ順、同じページ内は作成順で決定的。"""
-    third = repository.create(pdf_path, 5, 0.1, 0.1)
-    first = repository.create(pdf_path, 0, 0.9, 0.9)
-    second = repository.create(pdf_path, 0, 0.1, 0.1)
+    third = repository.create(DocumentIdentity.of(pdf_path), 5, 0.1, 0.1)
+    first = repository.create(DocumentIdentity.of(pdf_path), 0, 0.9, 0.9)
+    second = repository.create(DocumentIdentity.of(pdf_path), 0, 0.1, 0.1)
 
-    assert repository.list_for_document(pdf_path) == [first, second, third]
+    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == [first, second, third]
 
 
 def test_list_matches_equivalent_paths(repository: StudyMarkRepository, pdf_path: Path) -> None:
     """表記の違うパスでも同じドキュメントとして引ける。"""
-    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
 
-    assert repository.list_for_document(pdf_path.parent / "." / pdf_path.name) == [mark]
+    equivalent = DocumentIdentity.of(pdf_path.parent / "." / pdf_path.name)
+    assert repository.list_for_document(equivalent) == [mark]
 
 
 def test_list_of_unknown_document_is_empty(
@@ -309,7 +347,185 @@ def test_list_of_unknown_document_is_empty(
     tmp_path: Path,
 ) -> None:
     """マークの無い PDF では空リスト。"""
-    assert repository.list_for_document(tmp_path / "unknown.pdf") == []
+    unknown = tmp_path / "unknown.pdf"
+    unknown.write_bytes(b"%PDF-unknown")
+
+    assert repository.list_for_document(DocumentIdentity.of(unknown)) == []
+
+
+def test_the_identity_of_a_missing_file_fails(tmp_path: Path) -> None:
+    """読めないファイルの同一性は作れない。
+
+    内容の指紋を計算できない以上、そのパスのどのマークが持ち主なのかを
+    決められない。黙って空のマーク一覧を返すと、記録が消えたように見える。
+    """
+    with pytest.raises(OSError):
+        DocumentIdentity.of(tmp_path / "gone.pdf")
+
+
+# ---------------------------------------------------------------- 内容の同一性
+def test_marks_do_not_follow_a_replaced_file(
+    repository: StudyMarkRepository, pdf_path: Path
+) -> None:
+    """同じパスの PDF を別の内容へ差し替えたら、古いマークは出てこない。
+
+    パスだけを識別子にすると、差し替えた本の同じページ番号のところに、
+    前の本のマークが正常なデータとして表示される。位置がそれらしく
+    見えるぶん、単に消えるより危ない。
+    """
+    original = pdf_path.read_bytes()
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    pdf_path.write_bytes(b"%PDF-1.4 another book")
+
+    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == []
+
+    # 記録は消していない。元の PDF を戻せばまた出てくる。
+    pdf_path.write_bytes(original)
+    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == [mark]
+
+
+def test_marks_survive_an_unchanged_reopen(repository: StudyMarkRepository, pdf_path: Path) -> None:
+    """内容が同じなら、開き直しても持ち主のままでいる。"""
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    pdf_path.write_bytes(pdf_path.read_bytes())
+
+    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == [mark]
+
+
+def test_marks_without_a_fingerprint_are_not_listed(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """マイグレーション2 より前に作られた行は、確かめずには表示しない。
+
+    どの内容の PDF に付けられたのか分からないので、普通のマークと同じ顔で
+    並べると、差し替えた PDF に前の本のマークが乗る取り違えがそのまま残る。
+    消しはせず、数えられる状態にしておく。
+    """
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute(
+        "UPDATE study_marks SET document_fingerprint = NULL WHERE id = ?", (mark.id,)
+    )
+
+    identity = DocumentIdentity.of(pdf_path)
+    assert repository.list_for_document(identity) == []
+    assert repository.unverified_count(identity) == 1
+    assert connection.execute("SELECT COUNT(*) FROM study_marks").fetchone()[0] == 1
+
+
+def test_adopting_makes_the_old_marks_belong_to_this_pdf(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """引き取れば、以後は普通のマークとして扱われる。"""
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute("UPDATE study_marks SET document_fingerprint = NULL")
+    identity = DocumentIdentity.of(pdf_path)
+
+    assert repository.adopt_unverified(identity) == [mark]
+
+    assert repository.list_for_document(identity) == [mark]
+    assert repository.unverified_count(identity) == 0
+
+
+def test_adopting_only_touches_this_path(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """引き取るのは同じパスの分だけ。別の PDF の古いマークには触らない。"""
+    mine = tmp_path / "mine.pdf"
+    mine.write_bytes(b"%PDF-mine")
+    other = tmp_path / "other.pdf"
+    other.write_bytes(b"%PDF-other")
+    repository.create(DocumentIdentity.of(mine), 0, 0.5, 0.5)
+    repository.create(DocumentIdentity.of(other), 0, 0.5, 0.5)
+    connection.execute("UPDATE study_marks SET document_fingerprint = NULL")
+
+    assert len(repository.adopt_unverified(DocumentIdentity.of(mine))) == 1
+
+    assert repository.unverified_count(DocumentIdentity.of(other)) == 1
+
+
+class CommitFailingConnection(sqlite3.Connection):
+    """`COMMIT` だけが失敗する接続。
+
+    `sqlite3.Connection.execute` は差し替えられないので、factory で
+    差し込む。トランザクションの後始末を確かめるためだけに使う。
+    """
+
+    fail_commit = False
+
+    def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+        if self.fail_commit and sql == "COMMIT":
+            msg = "commit failed"
+            raise sqlite3.OperationalError(msg)
+        return super().execute(sql, parameters)  # type: ignore[arg-type]
+
+
+def test_a_failed_commit_does_not_leave_a_transaction_open(
+    pdf_path: Path,
+    tmp_path: Path,
+) -> None:
+    """`COMMIT` が失敗しても、トランザクションを開いたまま残さない。
+
+    接続はアプリの起動から終了まで使い回すので、残ると以後の更新が意図せず
+    その中に入ったり、次の `BEGIN` が失敗したりする。
+    """
+    connection = sqlite3.connect(
+        tmp_path / "anp.sqlite3", autocommit=True, factory=CommitFailingConnection
+    )
+    with closing(connection) as failing:
+        failing.row_factory = sqlite3.Row
+        database.apply_migrations(failing)
+        repository = StudyMarkRepository(failing)
+        repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+        failing.execute("UPDATE study_marks SET document_fingerprint = NULL")
+        failing.fail_commit = True
+
+        with pytest.raises(sqlite3.OperationalError):
+            repository.adopt_unverified(DocumentIdentity.of(pdf_path))
+
+        assert not failing.in_transaction
+        # 引き取りは巻き戻っている。
+        failing.fail_commit = False
+        assert repository.unverified_count(DocumentIdentity.of(pdf_path)) == 1
+
+
+def test_a_broken_row_of_another_version_does_not_block_this_one(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """同じパスの別の版に壊れた行があっても、いまの版は読める。
+
+    指紋が食い違う行はそもそも別のドキュメントのものなので、その中身が
+    壊れていることを理由に、いま開いている版まで読めなくはしない。
+    """
+    other_version = "a" * 64
+    connection.execute(
+        "INSERT INTO study_marks"
+        " (document_key, document_fingerprint, page_index, x_norm, y_norm, note)"
+        " VALUES (?, ?, 0, 0.5, 0.5, x'414243')",
+        (document_key(pdf_path), other_version),
+    )
+    mine = repository.create(DocumentIdentity.of(pdf_path), 1, 0.5, 0.5)
+
+    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == [mine]
+
+
+def test_adopting_a_broken_old_row_changes_nothing(
+    repository: StudyMarkRepository, connection: sqlite3.Connection, pdf_path: Path
+) -> None:
+    """引き取ろうとした行が壊れていたら、1件も引き取らない。
+
+    更新だけ確定して読み直しが失敗すると、壊れた行に指紋が焼き込まれた
+    まま残り、以後その PDF を開くたびに読み込み失敗になる。更新と読み直しを
+    1つのトランザクションにしてあるので、巻き戻る。
+    """
+    repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
+    connection.execute("UPDATE study_marks SET document_fingerprint = NULL, note = x'414243'")
+    identity = DocumentIdentity.of(pdf_path)
+
+    with pytest.raises(StoredStudyMarkError):
+        repository.adopt_unverified(identity)
+
+    assert repository.unverified_count(identity) == 1
+    assert repository.list_for_document(identity) == []
 
 
 # ---------------------------------------------------------------- increment
@@ -318,7 +534,7 @@ def test_increment_counts_exact_integers(
     pdf_path: Path,
 ) -> None:
     """1 → 2 → 3 → 4 と整数で増える（3 以上をまとめない）。"""
-    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
     assert mark.mistake_count == 1
 
     counts = [repository.increment_mistake_count(mark.id) for _ in range(3)]
@@ -334,7 +550,7 @@ def test_increment_reaches_double_digits(
     pdf_path: Path,
 ) -> None:
     """10 回でも 10 のまま保存される。"""
-    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
     for _ in range(9):
         repository.increment_mistake_count(mark.id)
 
@@ -360,7 +576,7 @@ def test_increment_is_a_single_statement(
     SQL の全文とは比べない（文言を変えるたびに壊れるため）。固定するのは
     「文が1つ」と「読み取りが混ざっていない」の2点。
     """
-    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
     statements: list[str] = []
     connection.set_trace_callback(statements.append)
     try:
@@ -378,8 +594,8 @@ def test_increment_touches_only_target_mark(
     pdf_path: Path,
 ) -> None:
     """他のマークの回数は変わらない。"""
-    target = repository.create(pdf_path, 0, 0.1, 0.1)
-    other = repository.create(pdf_path, 0, 0.2, 0.2)
+    target = repository.create(DocumentIdentity.of(pdf_path), 0, 0.1, 0.1)
+    other = repository.create(DocumentIdentity.of(pdf_path), 0, 0.2, 0.2)
 
     repository.increment_mistake_count(target.id)
 
@@ -396,7 +612,7 @@ def test_note_round_trips(
     note: str | None,
 ) -> None:
     """メモはそのまま往復する。空文字を None に変えない。"""
-    mark = repository.create(pdf_path, 0, 0.5, 0.5, note=note)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5, note=note)
 
     fetched = repository.get(mark.id)
 
@@ -407,7 +623,7 @@ def test_note_round_trips(
 
 def test_update_note_transitions(repository: StudyMarkRepository, pdf_path: Path) -> None:
     """None → 文字列 → 空文字 → None と更新できる。"""
-    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
     assert mark.note is None
 
     assert _note_after(repository, mark.id, "覚え直す") == "覚え直す"
@@ -428,7 +644,7 @@ def _note_after(repository: StudyMarkRepository, mark_id: int, note: str | None)
 
 def test_update_note_keeps_other_fields(repository: StudyMarkRepository, pdf_path: Path) -> None:
     """メモの更新で位置や回数は変わらない。"""
-    mark = repository.create(pdf_path, 3, 0.25, 0.75)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 3, 0.25, 0.75)
     repository.increment_mistake_count(mark.id)
 
     updated = repository.update_note(mark.id, "メモ")
@@ -440,7 +656,7 @@ def test_update_note_keeps_other_fields(repository: StudyMarkRepository, pdf_pat
 
 def test_update_note_rejects_non_string(repository: StudyMarkRepository, pdf_path: Path) -> None:
     """メモに文字列以外は渡せない。"""
-    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
 
     with pytest.raises(TypeError):
         repository.update_note(mark.id, 123)  # type: ignore[arg-type]
@@ -449,23 +665,23 @@ def test_update_note_rejects_non_string(repository: StudyMarkRepository, pdf_pat
 # ---------------------------------------------------------------- delete
 def test_delete_removes_mark(repository: StudyMarkRepository, pdf_path: Path) -> None:
     """削除するとどこからも見えなくなる。"""
-    mark = repository.create(pdf_path, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(pdf_path), 0, 0.5, 0.5)
 
     assert repository.delete(mark.id) is True
     assert repository.get(mark.id) is None
-    assert repository.list_for_document(pdf_path) == []
+    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == []
     # 2回目は消す行が無い。
     assert repository.delete(mark.id) is False
 
 
 def test_delete_keeps_other_marks(repository: StudyMarkRepository, pdf_path: Path) -> None:
     """削除は指定した1件だけ。"""
-    first = repository.create(pdf_path, 0, 0.1, 0.1)
-    second = repository.create(pdf_path, 0, 0.2, 0.2)
+    first = repository.create(DocumentIdentity.of(pdf_path), 0, 0.1, 0.1)
+    second = repository.create(DocumentIdentity.of(pdf_path), 0, 0.2, 0.2)
 
     repository.delete(first.id)
 
-    assert repository.list_for_document(pdf_path) == [second]
+    assert repository.list_for_document(DocumentIdentity.of(pdf_path)) == [second]
 
 
 # ---------------------------------------------------------------- 存在しない ID
@@ -563,11 +779,11 @@ def test_marks_survive_reconnect(tmp_path: Path, pdf_path: Path) -> None:
 
     with closing(database.connect(db_path)) as conn:
         repository = StudyMarkRepository(conn)
-        mark = repository.create(pdf_path, 1, 0.25, 0.75, note="メモ")
+        mark = repository.create(DocumentIdentity.of(pdf_path), 1, 0.25, 0.75, note="メモ")
         repository.increment_mistake_count(mark.id)
 
     with closing(database.connect(db_path)) as conn:
-        reopened = StudyMarkRepository(conn).list_for_document(pdf_path)
+        reopened = StudyMarkRepository(conn).list_for_document(DocumentIdentity.of(pdf_path))
 
     assert len(reopened) == 1
     assert reopened[0].mistake_count == 2

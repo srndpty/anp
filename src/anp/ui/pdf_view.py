@@ -57,6 +57,13 @@ from PySide6.QtWidgets import QAbstractScrollArea, QWidget
 from anp.pdf.color import PageColorMode, page_background_color
 from anp.pdf.destination import PdfDestination, clamp_to_page
 from anp.pdf.layout import PageLayout
+from anp.pdf.reading_position import (
+    ReadingPosition,
+    clamp_unit,
+    page_top_offset,
+    reading_position_at,
+    scroll_top_for,
+)
 from anp.pdf.render import PageRenderService, PageRequest
 from anp.storage.study_mark import StudyMark, validate_position
 from anp.ui.appearance import CanvasTheme, canvas_color
@@ -125,24 +132,6 @@ STUDY_MARK_MODIFIER = Qt.KeyboardModifier.ControlModifier
 
 
 @dataclass(frozen=True, slots=True)
-class ReadingPosition:
-    """いま読んでいる位置（ページ番号 + ページ内の縦位置）。
-
-    ビューポート上端に来ているページ内の縦位置を 0.0〜1.0 で持つ。
-    スクロールバーのピクセル値も倍率も含まないので、ウィンドウの
-    大きさ・DPI・倍率モードが変わっても意味が変わらない。
-
-    `StudyMark` の `PagePosition` とは別の型にする。学習マークは
-    「利用者が印を付けた点」で横位置も意味を持つが、こちらは
-    「どこまで読んだか」で縦方向しか使わない（P5-1 の契約）。
-    同じ型にすると、使わない `x_norm` に意味のない値を入れることになる。
-    """
-
-    page_index: int
-    y_norm: float
-
-
-@dataclass(frozen=True, slots=True)
 class _ZoomAnchor:
     """倍率を変えても動かさない点。
 
@@ -154,10 +143,6 @@ class _ZoomAnchor:
     page: int
     normalized: QPointF
     viewport_pos: QPointF
-
-
-def _clamp_unit(value: float) -> float:
-    return min(max(value, 0.0), 1.0)
 
 
 def _anchor_ratio(
@@ -538,7 +523,7 @@ class PdfView(QAbstractScrollArea):
         normalized = self._layout.to_normalized(page, content, self._zoom)
         return _ZoomAnchor(
             page=page,
-            normalized=QPointF(_clamp_unit(normalized.x()), _clamp_unit(normalized.y())),
+            normalized=QPointF(clamp_unit(normalized.x()), clamp_unit(normalized.y())),
             viewport_pos=position,
         )
 
@@ -662,35 +647,14 @@ class PdfView(QAbstractScrollArea):
         セッションの保存に使う値なので、**スクロールバーの値も倍率も
         含めない**（ウィンドウの大きさや DPI が変わると意味を失うため）。
 
-        **基準にするのは `current_page` ではなく、上端側の最初の可視
-        ページ。** `current_page` は「ビューポートといちばん大きく重なる
-        ページ」なので、ページの継ぎ目付近では上端がまだ前のページの
-        途中なのに次のページを指す。それを基準にすると比率が負になり、
-        0.0 に丸めた結果「次のページの先頭」として保存されて、再起動の
-        たびに数百ピクセルぶん先へ進んでしまう。
-
         用途が違うだけで、`current_page` の契約（ページ入力や前/次の
-        基準）はそのまま。ここで使い分けるのは読書位置の基準だけ。
-
-        - 上端がページの途中: そのページと正確な比率
-        - 上端がページ間の隙間: 次のページの 0.0（`visible_pages()` が
-          隙間を次のページから数える）
-        - 上端が文書の上余白: 先頭ページの 0.0
+        基準）はそのまま。読書位置がどのページを基準に取るかは
+        `anp.pdf.reading_position` の契約で、ここには算術を持たない。
         """
         layout = self._layout
         if layout is None or self._current_page < 0:
             return None
-
-        viewport = self.content_viewport_rect()
-        visible = layout.visible_pages(viewport, self._zoom)
-        # 可視ページが1つも無い（末尾の余白まで送られた）場合だけ、
-        # いちばん近いページを使う。
-        page = visible.start if visible else layout.current_page(viewport, self._zoom)
-
-        rect = layout.page_rect(page, self._zoom)
-        height = rect.height()
-        y_norm = (viewport.top() - rect.top()) / height if height > 0 else 0.0
-        return ReadingPosition(page_index=page, y_norm=_clamp_unit(y_norm))
+        return reading_position_at(layout, self.content_viewport_rect(), self._zoom)
 
     def restore_reading_position(self, position: ReadingPosition) -> bool:
         """読書位置まで戻る。戻れたかを返す。
@@ -710,12 +674,13 @@ class PdfView(QAbstractScrollArea):
         """
         validate_position(position.page_index, 0.0, position.y_norm)
         layout = self._layout
-        if layout is None or position.page_index >= layout.page_count:
+        if layout is None:
             return False
 
-        top = layout.from_normalized(
-            position.page_index, QPointF(0.0, position.y_norm), self._zoom
-        ).y()
+        top = scroll_top_for(layout, position, self._zoom)
+        if top is None:
+            return False
+
         with self._quiet_scrollbars():
             self.verticalScrollBar().setValue(round(top))
 
@@ -727,10 +692,11 @@ class PdfView(QAbstractScrollArea):
     def _page_top_offset(self, layout: PageLayout, index: int) -> float:
         """そのページの上端をビューポート上端へ持ってくるスクロール量。
 
-        `go_to_page()` と `reveal_page_position()` で同じ値を使うために
-        分けてある。ページ配置の算術を2箇所に書かない。
+        `go_to_page()` と `reveal_page_position()`、そして読書位置の基準
+        （`anp.pdf.reading_position`）で同じ値を使う。ページ配置の算術を
+        2箇所に書かない。
         """
-        return layout.page_rect(index, self._zoom).top() - layout.metrics.margin
+        return page_top_offset(layout, index, self._zoom)
 
     def _refresh_current_page(self) -> None:
         """現在ページを取り直し、変わっていれば通知する。"""
@@ -781,8 +747,8 @@ class PdfView(QAbstractScrollArea):
         normalized = self._layout.to_normalized(page, content, self._zoom)
         return PagePosition(
             page_index=page,
-            x_norm=_clamp_unit(normalized.x()),
-            y_norm=_clamp_unit(normalized.y()),
+            x_norm=clamp_unit(normalized.x()),
+            y_norm=clamp_unit(normalized.y()),
         )
 
     def viewport_point_for(self, page_index: int, x_norm: float, y_norm: float) -> QPointF | None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -9,6 +10,9 @@ import pytest
 from PySide6.QtCore import QByteArray, QSettings
 
 from anp.core.settings import Settings
+
+# 内容の指紋の代わり（書式だけ満たす値）。設定は書式を検証しない。
+FINGERPRINT = "0" * 64
 
 
 def test_unset_values_return_defaults(settings: Settings) -> None:
@@ -209,7 +213,7 @@ def test_the_session_round_trips(tmp_path: Path) -> None:
     """読んでいた PDF と位置を読み戻せる。"""
     ini = str(tmp_path / "settings.ini")
     first = Settings(QSettings(ini, QSettings.Format.IniFormat))
-    first.set_last_session(r"C:\books\a.pdf", 42, 0.65)
+    first.set_last_session(r"C:\books\a.pdf", FINGERPRINT, 42, 0.65)
     first.sync()
 
     second = Settings(QSettings(ini, QSettings.Format.IniFormat))
@@ -222,7 +226,7 @@ def test_clearing_the_session_forgets_everything(tmp_path: Path) -> None:
     """セッションを忘れると、復元対象も位置も既定へ戻る。"""
     ini = str(tmp_path / "settings.ini")
     first = Settings(QSettings(ini, QSettings.Format.IniFormat))
-    first.set_last_session(r"C:\books\a.pdf", 42, 0.65)
+    first.set_last_session(r"C:\books\a.pdf", FINGERPRINT, 42, 0.65)
     first.clear_last_session()
     first.sync()
 
@@ -238,7 +242,7 @@ def test_clearing_the_session_keeps_the_other_settings(tmp_path: Path) -> None:
     settings = Settings(backend)
     settings.last_directory = r"C:\books"
     settings.recent_files = [r"C:\books\a.pdf"]
-    settings.set_last_session(r"C:\books\a.pdf", 3, 0.5)
+    settings.set_last_session(r"C:\books\a.pdf", FINGERPRINT, 3, 0.5)
 
     settings.clear_last_session()
 
@@ -246,29 +250,97 @@ def test_clearing_the_session_keeps_the_other_settings(tmp_path: Path) -> None:
     assert settings.recent_files == (r"C:\books\a.pdf",)
 
 
-def test_a_broken_last_document_falls_back(tmp_path: Path) -> None:
-    """文字列でない復元対象は「無し」として扱う。"""
+def stored_session(tmp_path: Path, **fields: object) -> Settings:
+    """セッションの鍵へ、指定した中身をそのまま書いた設定を返す。
+
+    3つの値は1つの JSON にまとまっているので、壊れた値を仕込むときも
+    まとめて書く。
+    """
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    backend.setValue("session/document", QByteArray(b"\x00\x01"))
+    backend.setValue("session/last", json.dumps(fields))
+    return Settings(backend)
+
+
+def test_the_session_is_stored_under_a_single_key(tmp_path: Path) -> None:
+    """3つの値は1回の書き込みで入れ替わる。
+
+    別々の鍵に書くと、途中で終了したときに「パスだけ新しくてページが古い」
+    組み合わせが残りうる。API がまとまっているだけでは防げない。
+    """
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    Settings(backend).set_last_session(r"C:\books\a.pdf", FINGERPRINT, 42, 0.65)
+
+    assert [key for key in backend.allKeys() if key.startswith("session/")] == ["session/last"]
+
+
+@pytest.mark.parametrize("stored", ["", "{", "[]", "null", '"text"'])
+def test_an_unreadable_session_falls_back(tmp_path: Path, stored: str) -> None:
+    """JSON として読めない値は「保存されていない」として扱う。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/last", stored)
+    settings = Settings(backend)
+
+    assert settings.last_document == ""
+    assert settings.last_page_index == 0
+    assert settings.last_y_norm == pytest.approx(0.0)
+
+
+def test_the_session_of_the_previous_format_is_still_read(tmp_path: Path) -> None:
+    """1つの鍵にまとめる前の形式でも、前回位置を1回は失わない。
+
+    「どこまで読んだか」は設定の中でも作り直しの効かない値なので、
+    保存形式を変えた最初の起動で捨てはしない。
+    """
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/document", r"C:\books\a.pdf")
+    backend.setValue("session/page_index", 42)
+    backend.setValue("session/y_norm", 0.65)
+    settings = Settings(backend)
+
+    assert settings.last_document == r"C:\books\a.pdf"
+    assert settings.last_page_index == 42
+    assert settings.last_y_norm == pytest.approx(0.65)
+
+
+def test_saving_moves_the_session_out_of_the_previous_format(tmp_path: Path) -> None:
+    """新しい形式で保存したら、旧形式の鍵は残さない。
+
+    残すと、新しい鍵を消したときに古い位置が復活する。
+    """
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/document", r"C:\books\old.pdf")
+    settings = Settings(backend)
+
+    settings.set_last_session(r"C:\books\new.pdf", FINGERPRINT, 1, 0.5)
+    assert settings.last_document == r"C:\books\new.pdf"
+
+    settings.clear_last_session()
+    assert settings.last_document == ""
+    assert [key for key in backend.allKeys() if key.startswith("session/")] == []
+
+
+def test_a_session_of_a_wrong_type_falls_back(tmp_path: Path) -> None:
+    """文字列ですらない値が入っていても落ちない。"""
+    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    backend.setValue("session/last", QByteArray(b"\x00\x01"))
 
     assert Settings(backend).last_document == ""
+
+
+def test_a_broken_last_document_falls_back(tmp_path: Path) -> None:
+    """文字列でない復元対象は「無し」として扱う。"""
+    assert stored_session(tmp_path, document=42).last_document == ""
 
 
 @pytest.mark.parametrize("stored", ["", "abc", "-10", "3.5abc", "nan", "inf", "1e400"])
 def test_a_broken_page_index_falls_back(tmp_path: Path, stored: str) -> None:
     """壊れたページ番号は先頭ページへ落とす。"""
-    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    backend.setValue("session/page_index", stored)
-
-    assert Settings(backend).last_page_index == 0
+    assert stored_session(tmp_path, page_index=stored).last_page_index == 0
 
 
 def test_a_page_index_of_a_wrong_type_falls_back(tmp_path: Path) -> None:
     """int にできない型が入っていても落ちない。"""
-    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    backend.setValue("session/page_index", QByteArray(b"\x00\x01"))
-
-    assert Settings(backend).last_page_index == 0
+    assert stored_session(tmp_path, page_index=[1, 2]).last_page_index == 0
 
 
 @pytest.mark.parametrize("stored", [True, False])
@@ -278,10 +350,7 @@ def test_a_boolean_page_index_falls_back(tmp_path: Path, stored: bool) -> None:
     Python では `isinstance(True, int)` が真なので、素直に `int()` へ通すと
     `True` が 2 ページ目（0 始まりの 1）になってしまう。
     """
-    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    backend.setValue("session/page_index", stored)
-
-    assert Settings(backend).last_page_index == 0
+    assert stored_session(tmp_path, page_index=stored).last_page_index == 0
 
 
 @pytest.mark.parametrize("stored", [1.5, 3.25, -1.2, float("nan"), float("inf"), float("-inf")])
@@ -290,27 +359,18 @@ def test_a_non_integral_page_index_falls_back(tmp_path: Path, stored: float) -> 
 
     `int(1.5)` は黙って 1 になるが、それは保存された位置ではなく推測。
     """
-    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    backend.setValue("session/page_index", stored)
-
-    assert Settings(backend).last_page_index == 0
+    assert stored_session(tmp_path, page_index=stored).last_page_index == 0
 
 
 def test_an_integral_float_page_index_is_accepted(tmp_path: Path) -> None:
     """整数と同じ値の実数は、これまでどおり受け付ける。"""
-    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    backend.setValue("session/page_index", 3.0)
-
-    assert Settings(backend).last_page_index == 3
+    assert stored_session(tmp_path, page_index=3.0).last_page_index == 3
 
 
 @pytest.mark.parametrize("stored", ["", "abc", "-0.5", "2", "nan", "inf", "-inf"])
 def test_a_broken_y_norm_falls_back(tmp_path: Path, stored: str) -> None:
     """壊れた縦位置はページ先頭へ落とす。"""
-    backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-    backend.setValue("session/y_norm", stored)
-
-    assert Settings(backend).last_y_norm == pytest.approx(0.0)
+    assert stored_session(tmp_path, y_norm=stored).last_y_norm == pytest.approx(0.0)
 
 
 def test_the_session_boundary_values_are_accepted(tmp_path: Path) -> None:
@@ -318,10 +378,10 @@ def test_the_session_boundary_values_are_accepted(tmp_path: Path) -> None:
     backend = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
     settings = Settings(backend)
 
-    settings.set_last_session(r"C:\a.pdf", 0, 0.0)
+    settings.set_last_session(r"C:\a.pdf", FINGERPRINT, 0, 0.0)
     assert settings.last_y_norm == pytest.approx(0.0)
 
-    settings.set_last_session(r"C:\a.pdf", 0, 1.0)
+    settings.set_last_session(r"C:\a.pdf", FINGERPRINT, 0, 1.0)
     assert settings.last_y_norm == pytest.approx(1.0)
 
 

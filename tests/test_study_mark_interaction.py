@@ -23,12 +23,15 @@ from pytestqt.qtbot import QtBot
 from anp.core.settings import Settings
 from anp.pdf.document import DocumentController
 from anp.storage import database
+from anp.storage.study_mark import DocumentIdentity
 from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.ui.fatal import EXIT_INTERNAL_ERROR
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkError
 from anp.ui.study_marks import PagePosition, StudyMarkTarget
-from helpers import BrokenRepository, RecordingService
+from conftest import FatalCalls
+from helpers import BrokenRepository, RecordingRepository, RecordingService
 
 
 # ---------------------------------------------------------------- 道具
@@ -82,7 +85,7 @@ def study_mark_controller(
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(study_marks, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     return controller
 
 
@@ -95,10 +98,11 @@ def test_creating_a_mark_starts_at_one(
 ) -> None:
     """作成した直後の間違い回数は 1。呼び出し側に初期値を選ばせない。"""
     study_mark_controller.create_mark(
-        PagePosition(page_index=1, x_norm=0.25, y_norm=0.75), expected_document=sample_pdf
+        PagePosition(page_index=1, x_norm=0.25, y_norm=0.75),
+        expected_document=DocumentIdentity.of(sample_pdf),
     )
 
-    (stored,) = study_marks.list_for_document(sample_pdf)
+    (stored,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
     assert stored.page_index == 1
     assert stored.x_norm == pytest.approx(0.25)
     assert stored.y_norm == pytest.approx(0.75)
@@ -115,10 +119,11 @@ def test_creating_without_an_active_document_is_refused(
 
     with pytest.raises(StudyMarkError):
         controller.create_mark(
-            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5),
+            expected_document=DocumentIdentity.of(sample_pdf),
         )
 
-    assert study_marks.list_for_document(sample_pdf) == []
+    assert study_marks.list_for_document(DocumentIdentity.of(sample_pdf)) == []
 
 
 @pytest.mark.parametrize("operation", ["increment_mark", "delete_mark"])
@@ -126,7 +131,7 @@ def test_mutating_without_an_active_document_is_refused(
     study_marks: StudyMarkRepository, view: PdfView, sample_pdf: Path, operation: str
 ) -> None:
     """既存マークの更新も、表示対象が無ければ行わない。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     controller = StudyMarkController(study_marks, view)
 
     with pytest.raises(StudyMarkError):
@@ -139,7 +144,7 @@ def test_updating_a_note_without_an_active_document_is_refused(
     study_marks: StudyMarkRepository, view: PdfView, sample_pdf: Path
 ) -> None:
     """メモの更新も同じ。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     controller = StudyMarkController(study_marks, view)
 
     with pytest.raises(StudyMarkError):
@@ -156,9 +161,10 @@ def test_the_count_stays_an_exact_integer(
 ) -> None:
     """1 → 2 → … → 10 と整数のまま増える。「3+」へ丸めない。"""
     study_mark_controller.create_mark(
-        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5),
+        expected_document=DocumentIdentity.of(sample_pdf),
     )
-    (mark,) = study_marks.list_for_document(sample_pdf)
+    (mark,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
 
     for expected in range(2, 11):
         study_mark_controller.increment_mark(mark.id)
@@ -174,7 +180,7 @@ def test_the_note_is_stored_verbatim(
     sample_pdf: Path,
 ) -> None:
     """改行も前後の空白も Unicode もそのまま保存する。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     study_mark_controller.refresh()
 
     study_mark_controller.update_note(mark.id, "  1行目\n2行目 √2  ")
@@ -189,7 +195,7 @@ def test_an_empty_note_is_not_turned_into_none(
     sample_pdf: Path,
 ) -> None:
     """空文字は空文字のまま。`None` へ寄せない（P3-1 では別物）。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5, note="前のメモ")
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note="前のメモ")
     study_mark_controller.refresh()
 
     study_mark_controller.update_note(mark.id, "")
@@ -206,7 +212,7 @@ def test_deleting_removes_the_row_and_the_overlay(
     sample_pdf: Path,
 ) -> None:
     """削除すると DB からも表示からも消える。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     study_mark_controller.refresh()
 
     study_mark_controller.delete_mark(mark.id)
@@ -228,11 +234,12 @@ def test_creating_for_a_different_document_is_refused(
     """
     with pytest.raises(StudyMarkError):
         study_mark_controller.create_mark(
-            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=two_page_pdf
+            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5),
+            expected_document=DocumentIdentity.of(two_page_pdf),
         )
 
-    assert study_marks.list_for_document(sample_pdf) == []
-    assert study_marks.list_for_document(two_page_pdf) == []
+    assert study_marks.list_for_document(DocumentIdentity.of(sample_pdf)) == []
+    assert study_marks.list_for_document(DocumentIdentity.of(two_page_pdf)) == []
 
 
 @pytest.mark.parametrize("operation", ["increment_mark", "delete_mark"])
@@ -243,7 +250,7 @@ def test_a_mark_of_another_document_is_not_touched(
     operation: str,
 ) -> None:
     """表示中でない PDF のマークは更新させない。"""
-    other = study_marks.create(two_page_pdf, 0, 0.5, 0.5)
+    other = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.5, 0.5)
 
     with pytest.raises(StudyMarkError):
         getattr(study_mark_controller, operation)(other.id)
@@ -257,7 +264,7 @@ def test_a_note_update_on_another_document_is_refused(
     two_page_pdf: Path,
 ) -> None:
     """メモでも持ち主を確かめる。"""
-    other = study_marks.create(two_page_pdf, 0, 0.5, 0.5, note="B のメモ")
+    other = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.5, 0.5, note="B のメモ")
 
     with pytest.raises(StudyMarkError):
         study_mark_controller.update_note(other.id, "書き換え")
@@ -274,7 +281,7 @@ def test_a_vanished_mark_is_reported_and_the_view_catches_up(
     operation: str,
 ) -> None:
     """消えていたマークへの操作は、成功として飲み込まず表示を合わせ直す。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     study_mark_controller.refresh()
     assert len(view.study_marks) == 1
     study_marks.delete(mark.id)
@@ -299,12 +306,12 @@ def test_a_failed_mutation_leaves_the_previous_snapshot(
 ) -> None:
     """更新に失敗したら、表示は前の内容のまま。成功したように見せない。"""
     repository = BrokenRepository(study_mark_connection)
-    mark = repository.create(sample_pdf, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     repository.increment_mistake_count(mark.id)
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     repository.failing = failing
 
     with pytest.raises(sqlite3.OperationalError):
@@ -325,12 +332,13 @@ def test_a_failed_create_adds_nothing(
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     repository.failing = "create"
 
     with pytest.raises(sqlite3.OperationalError):
         controller.create_mark(
-            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+            PagePosition(page_index=0, x_norm=0.5, y_norm=0.5),
+            expected_document=DocumentIdentity.of(sample_pdf),
         )
 
     assert view.study_marks == ()
@@ -345,11 +353,11 @@ def test_a_failed_note_update_keeps_the_old_note(
 ) -> None:
     """メモの更新に失敗したら、前のメモが残る。"""
     repository = BrokenRepository(study_mark_connection)
-    mark = repository.create(sample_pdf, 0, 0.5, 0.5, note="元のメモ")
+    mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note="元のメモ")
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     repository.failing = "update_note"
 
     with pytest.raises(sqlite3.OperationalError):
@@ -361,34 +369,61 @@ def test_a_failed_note_update_keeps_the_old_note(
     assert view.study_marks[0].note == "元のメモ"
 
 
-def test_a_refresh_failure_after_a_successful_mutation_empties_the_view(
+def test_a_successful_mutation_does_not_depend_on_a_reread(
     study_mark_connection: sqlite3.Connection,
     view: PdfView,
     doc: DocumentController,
     sample_pdf: Path,
 ) -> None:
-    """更新は通ったが読み直せなかった場合。
+    """更新が通ったら、全件を読み直せなくても成功として扱う。
 
-    DB は更新済みなので、取り消したふりはしない。ただし古い数字を出したまま
-    にもしない（表示を空にする）。表示対象は保ったまま失敗を伝える。
+    接続は `autocommit=True` なので UPDATE の1文で確定している。その後の
+    SELECT が失敗したことを理由に「更新できませんでした」と伝えると、
+    利用者はもう一度押し、1回のつもりが2回加算される。更新後の1件は
+    `RETURNING` で返ってきているので、そもそも読み直さない。
     """
     repository = BrokenRepository(study_mark_connection)
-    mark = repository.create(sample_pdf, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     doc.open(sample_pdf)
     view.set_document(doc.document, doc.page_sizes())
     controller = StudyMarkController(repository, view)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     repository.failing = "list"
 
-    with pytest.raises(sqlite3.OperationalError):
-        controller.increment_mark(mark.id)
+    controller.increment_mark(mark.id)
 
-    assert view.study_marks == ()
+    assert [(shown.id, shown.mistake_count) for shown in view.study_marks] == [(mark.id, 2)]
     assert controller.active_document_path == sample_pdf
     repository.failing = ""
     stored = repository.get(mark.id)
     assert stored is not None
     assert stored.mistake_count == 2
+
+
+def test_a_mutation_does_not_reread_the_whole_document(
+    study_mark_connection: sqlite3.Connection,
+    view: PdfView,
+    doc: DocumentController,
+    sample_pdf: Path,
+) -> None:
+    """更新のたびに全件を SELECT し直さない。"""
+    repository = RecordingRepository(study_mark_connection)
+    mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
+    doc.open(sample_pdf)
+    view.set_document(doc.document, doc.page_sizes())
+    controller = StudyMarkController(repository, view)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
+    queries = len(repository.queried)
+
+    controller.increment_mark(mark.id)
+    controller.update_note(mark.id, "メモ")
+    controller.create_mark(
+        PagePosition(page_index=0, x_norm=0.2, y_norm=0.2),
+        expected_document=DocumentIdentity.of(sample_pdf),
+    )
+    controller.delete_mark(mark.id)
+
+    assert len(repository.queried) == queries
 
 
 def test_a_mutation_does_not_touch_the_rendering(
@@ -399,7 +434,7 @@ def test_a_mutation_does_not_touch_the_rendering(
     sample_pdf: Path,
 ) -> None:
     """更新でレンダリング要求も倍率もスクロール位置も動かない（P3-2 の分離）。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     study_mark_controller.refresh()
     requests = len(service.requests)
     generation = service.generation
@@ -410,7 +445,8 @@ def test_a_mutation_does_not_touch_the_rendering(
     study_mark_controller.increment_mark(mark.id)
     study_mark_controller.update_note(mark.id, "メモ")
     study_mark_controller.create_mark(
-        PagePosition(page_index=0, x_norm=0.2, y_norm=0.2), expected_document=sample_pdf
+        PagePosition(page_index=0, x_norm=0.2, y_norm=0.2),
+        expected_document=DocumentIdentity.of(sample_pdf),
     )
     study_mark_controller.delete_mark(mark.id)
 
@@ -428,7 +464,8 @@ def test_a_badge_wins_over_the_page_underneath(
     """バッジの上を指したら、新規作成ではなく既存マークが対象になる。"""
     view.fit_page()
     study_mark_controller.create_mark(
-        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5), expected_document=sample_pdf
+        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5),
+        expected_document=DocumentIdentity.of(sample_pdf),
     )
     point = page_point(view, 0, 0.5, 0.5)
 
@@ -463,8 +500,8 @@ def test_only_the_topmost_of_overlapping_badges_is_the_target(
 ) -> None:
     """同じ位置に2件あっても、対象は上に描かれた1件だけ。"""
     view.fit_page()
-    study_marks.create(sample_pdf, 0, 0.5, 0.5)
-    top = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
+    top = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     study_mark_controller.refresh()
 
     target = view.study_mark_target_at(page_point(view, 0, 0.5, 0.5))
@@ -547,7 +584,7 @@ def test_ctrl_clicking_the_page_creates_a_mark(
     """ページ上の Ctrl + 左クリックで、押した位置にマークが1件できる。"""
     ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.5, 0.5))
 
-    (stored,) = study_marks.list_for_document(sample_pdf)
+    (stored,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
     assert stored.page_index == 0
     assert stored.x_norm == pytest.approx(0.5, abs=0.01)
     assert stored.y_norm == pytest.approx(0.5, abs=0.01)
@@ -563,7 +600,7 @@ def test_ctrl_clicking_the_second_page_records_that_page(
 
     ctrl_click(qtbot, window.view, page_point(window.view, 1, 0.5, 0.5))
 
-    (stored,) = study_marks.list_for_document(sample_pdf)
+    (stored,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
     assert stored.page_index == 1
 
 
@@ -576,7 +613,7 @@ def test_ctrl_clicking_a_badge_increments_it(
 
     ctrl_click(qtbot, window.view, point)
 
-    (stored,) = study_marks.list_for_document(sample_pdf)
+    (stored,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
     assert stored.mistake_count == 2
     assert window.view.study_marks[0].mistake_count == 2
 
@@ -590,7 +627,7 @@ def test_repeated_ctrl_clicks_do_not_drop_any(
     for expected in range(1, 5):
         ctrl_click(qtbot, window.view, point)
 
-        (stored,) = study_marks.list_for_document(sample_pdf)
+        (stored,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
         assert stored.mistake_count == expected
         assert window.view.study_marks[0].mistake_count == expected
 
@@ -614,7 +651,7 @@ def test_a_ctrl_double_click_counts_both_presses(
         point.toPoint(),
     )
 
-    (stored,) = study_marks.list_for_document(sample_pdf)
+    (stored,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
     assert stored.mistake_count == 2
 
 
@@ -622,8 +659,8 @@ def test_ctrl_clicking_a_duplicate_increments_only_the_topmost(
     qtbot: QtBot, window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """同じ位置に2件あっても、増えるのは上のバッジだけ。"""
-    lower = study_marks.create(sample_pdf, 0, 0.5, 0.5)
-    upper = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    lower = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
+    upper = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
 
     ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.5, 0.5))
@@ -640,7 +677,7 @@ def test_ctrl_clicking_outside_the_page_does_nothing(
     """キャンバスの余白では何も起きない（例外もダイアログも無し）。"""
     ctrl_click(qtbot, window.view, QPointF(2.0, 2.0))
 
-    assert study_marks.list_for_document(sample_pdf) == []
+    assert study_marks.list_for_document(DocumentIdentity.of(sample_pdf)) == []
 
 
 def test_ctrl_clicking_the_gap_between_pages_does_nothing(
@@ -655,14 +692,14 @@ def test_ctrl_clicking_the_gap_between_pages_does_nothing(
 
     ctrl_click(qtbot, window.view, QPointF(first.center().x(), (first.bottom() + second.top()) / 2))
 
-    assert study_marks.list_for_document(sample_pdf) == []
+    assert study_marks.list_for_document(DocumentIdentity.of(sample_pdf)) == []
 
 
 def test_a_plain_click_never_touches_the_marks(
     qtbot: QtBot, window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """修飾なしの左クリックでは、ページの上でもバッジの上でも何も変わらない。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
     point = page_point(window.view, 0, 0.5, 0.5)
 
@@ -673,7 +710,7 @@ def test_a_plain_click_never_touches_the_marks(
         pos=page_point(window.view, 0, 0.2, 0.2).toPoint(),
     )
 
-    assert study_marks.list_for_document(sample_pdf) == [mark]
+    assert study_marks.list_for_document(DocumentIdentity.of(sample_pdf)) == [mark]
 
 
 @pytest.mark.parametrize(
@@ -699,7 +736,7 @@ def test_other_modifiers_do_not_trigger_study_marks(
         page_point(window.view, 0, 0.5, 0.5).toPoint(),
     )
 
-    assert study_marks.list_for_document(sample_pdf) == []
+    assert study_marks.list_for_document(DocumentIdentity.of(sample_pdf)) == []
 
 
 def test_ctrl_clicking_without_a_pdf_does_nothing(
@@ -712,7 +749,7 @@ def test_ctrl_clicking_without_a_pdf_does_nothing(
     ctrl_click(qtbot, window.view, QPointF(50.0, 50.0))
 
     assert list(window.view.study_marks) == []
-    assert study_marks.list_for_document(sample_pdf) == []
+    assert study_marks.list_for_document(DocumentIdentity.of(sample_pdf)) == []
     window.close()
 
 
@@ -733,7 +770,7 @@ def test_ctrl_clicking_still_works_after_scrolling_and_zooming(
 ) -> None:
     """スクロールやズームの後でも、同じバッジを押せば同じマークが増える。"""
     ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.4, 0.4))
-    (mark,) = study_marks.list_for_document(sample_pdf)
+    (mark,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
 
     window.view.set_zoom(2.0)
     window.view.verticalScrollBar().setValue(window.view.verticalScrollBar().value() + 30)
@@ -742,7 +779,7 @@ def test_ctrl_clicking_still_works_after_scrolling_and_zooming(
     stored = study_marks.get(mark.id)
     assert stored is not None
     assert stored.mistake_count == 2
-    assert len(study_marks.list_for_document(sample_pdf)) == 1
+    assert len(study_marks.list_for_document(DocumentIdentity.of(sample_pdf))) == 1
 
 
 # ---------------------------------------------------------------- 右クリックメニュー
@@ -760,7 +797,7 @@ def test_right_clicking_a_badge_asks_for_a_menu(
     しまうため。メニューの中身と振る舞いは `build_menu()` 経由で確かめる。
     """
     view.fit_page()
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     study_mark_controller.refresh()
 
     with qtbot.waitSignal(view.study_mark_menu_requested) as blocker:
@@ -811,7 +848,7 @@ def test_the_menu_differs_between_a_badge_and_the_page(
     assert page_menu is not None
     assert len(menu_actions(page_menu)) == 1
 
-    study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
 
     assert len(menu_actions(badge_menu(window))) == 3
@@ -828,7 +865,7 @@ def test_the_page_menu_creates_a_mark(
 
     menu_actions(menu)[0].trigger()
 
-    (stored,) = study_marks.list_for_document(sample_pdf)
+    (stored,) = study_marks.list_for_document(DocumentIdentity.of(sample_pdf))
     assert stored.mistake_count == 1
     assert stored.x_norm == pytest.approx(0.3, abs=0.01)
 
@@ -837,7 +874,7 @@ def test_the_badge_menu_increments(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """「間違い回数を増やす」で回数が増える。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
     menu = window.study_mark_interaction.build_menu(
         window.view.study_mark_target_at(page_point(window.view, 0, 0.5, 0.5))
@@ -877,7 +914,7 @@ def test_the_note_editor_starts_with_the_stored_text(
     expected: str,
 ) -> None:
     """未設定も空文字も空欄から。保存されている文字列はそのまま初期値。"""
-    study_marks.create(sample_pdf, 0, 0.5, 0.5, note=note)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note=note)
     window.study_marks.refresh()
     initial = stub_note_dialog(monkeypatch, "変更後")
 
@@ -893,7 +930,7 @@ def test_cancelling_the_note_editor_changes_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """取り消したら DB を変えない。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5, note="元のメモ")
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note="元のメモ")
     window.study_marks.refresh()
     stub_note_dialog(monkeypatch, "捨てられる文字列", accepted=False)
 
@@ -909,7 +946,7 @@ def test_a_multiline_note_is_saved_exactly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """複数行のメモが1文字も変わらずに保存される。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
     stub_note_dialog(monkeypatch, "abc\nxyz")
 
@@ -928,7 +965,7 @@ def test_an_empty_note_is_saved_as_an_empty_string(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """空のまま OK したら空文字。`None` へは戻さない。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5, note="元のメモ")
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note="元のメモ")
     window.study_marks.refresh()
     stub_note_dialog(monkeypatch, "")
 
@@ -947,7 +984,7 @@ def test_deleting_asks_for_confirmation_first(
     confirm_delete: list[bool],
 ) -> None:
     """「はい」で消える。確認を必ず通る。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
 
     menu_actions(badge_menu(window))[DELETE].trigger()
@@ -962,7 +999,7 @@ def test_cancelling_the_delete_keeps_the_mark(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """「いいえ」なら消さない。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
 
     menu_actions(badge_menu(window))[DELETE].trigger()
@@ -1017,7 +1054,7 @@ def test_a_failed_increment_keeps_the_previous_count(
 ) -> None:
     """増やせなかったら表示も DB も前のまま（2 のまま）。"""
     window, repository = broken_window
-    mark = repository.create(sample_pdf, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     repository.increment_mistake_count(mark.id)
     window.study_marks.refresh()
     repository.failing = "increment"
@@ -1041,7 +1078,7 @@ def test_a_failed_delete_keeps_the_badge(
 ) -> None:
     """削除に失敗したらバッジは残る。"""
     window, repository = broken_window
-    mark = repository.create(sample_pdf, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
     repository.failing = "delete"
 
@@ -1060,7 +1097,7 @@ def test_a_failed_note_update_is_reported(
 ) -> None:
     """メモを保存できなかったら、前のメモが残ったまま知らせる。"""
     window, repository = broken_window
-    repository.create(sample_pdf, 0, 0.5, 0.5, note="元のメモ")
+    repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note="元のメモ")
     window.study_marks.refresh()
     repository.failing = "update_note"
     stub_note_dialog(monkeypatch, "新しいメモ")
@@ -1072,22 +1109,56 @@ def test_a_failed_note_update_is_reported(
     assert window.view.has_document
 
 
-def test_a_refresh_failure_is_reported_without_closing_the_pdf(
+def test_a_programming_error_stops_the_application(
+    qtbot: QtBot,
+    window: MainWindow,
+    sample_pdf: Path,
+    errors: list[str],
+    fatal: FatalCalls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """実装の誤りは小さな警告に化けさせず、その場で終了させる。
+
+    ここで広く捕まえると、バグが「学習マークを更新できませんでした」に
+    見えたまま残り続ける。かといって Qt の slot から例外を外へ出すのは
+    undefined behavior なので、境界で受け止めて fail-stop する。
+
+    **本番と同じ経路（Ctrl + クリック）で確かめる。** 直接メソッドを呼ぶと、
+    Qt の境界を通っていないので、この契約を検査したことにならない。
+    """
+
+    def buggy(*_args: object, **_kwargs: object) -> None:
+        raise AttributeError("bug")
+
+    monkeypatch.setattr(window.study_marks, "create_mark", buggy)
+
+    ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.5, 0.5))
+
+    assert errors == [], "実装の誤りが通常の警告に化けている"
+    assert fatal.exit_codes == [EXIT_INTERNAL_ERROR]
+    assert "AttributeError" in fatal.dialogs[0]
+
+
+def test_a_broken_reread_does_not_break_a_click(
     qtbot: QtBot,
     broken_window: tuple[MainWindow, BrokenRepository],
     sample_pdf: Path,
     errors: list[str],
 ) -> None:
-    """更新後の読み直しに失敗しても PDF は開いたまま、表示は空になる。"""
+    """全件を読み直せない状態でも、Ctrl + クリックの加算はそのまま通る。
+
+    DB では成功しているのに警告が出る、という食い違いを作らない
+    （利用者がもう一度押して二重に加算されるのを避ける）。
+    """
     window, repository = broken_window
-    mark = repository.create(sample_pdf, 0, 0.5, 0.5)
+    mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
     repository.failing = "list"
 
     ctrl_click(qtbot, window.view, page_point(window.view, 0, 0.5, 0.5))
 
-    assert len(errors) == 1
-    assert window.view.study_marks == ()
+    assert errors == []
+    assert [shown.mistake_count for shown in window.view.study_marks] == [2]
     assert window.view.has_document
     assert window.study_marks.active_document_path == sample_pdf
     repository.failing = ""
@@ -1109,8 +1180,8 @@ def test_a_stale_menu_action_does_not_touch_the_other_document(
     同期 UI なので通常は起こらないが、更新の境界が最後の防御になっている
     ことを固定する。
     """
-    a_mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
-    b_mark = study_marks.create(two_page_pdf, 0, 0.5, 0.5)
+    a_mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
+    b_mark = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.5, 0.5)
     window.study_marks.refresh()
     stale = menu_actions(badge_menu(window))[INCREMENT]
 
@@ -1135,7 +1206,7 @@ def test_a_stale_create_action_does_not_add_to_the_other_document(
     `PagePosition` だけを持ち回すと、B に A 由来の座標のマークができる。
     メニューを開いた時点の表示対象を一緒に捕まえておく理由。
     """
-    b_mark = study_marks.create(two_page_pdf, 0, 0.1, 0.1)
+    b_mark = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.1, 0.1)
     page_menu = window.study_mark_interaction.build_menu(
         window.view.study_mark_target_at(page_point(window.view, 0, 0.3, 0.7))
     )
@@ -1145,12 +1216,57 @@ def test_a_stale_create_action_does_not_add_to_the_other_document(
     window.open_path(two_page_pdf)
     stale.trigger()
 
-    assert study_marks.list_for_document(sample_pdf) == []
-    assert study_marks.list_for_document(two_page_pdf) == [b_mark]
+    assert study_marks.list_for_document(DocumentIdentity.of(sample_pdf)) == []
+    assert study_marks.list_for_document(DocumentIdentity.of(two_page_pdf)) == [b_mark]
     assert len(errors) == 1
     assert window.view.has_document
     assert window.study_marks.active_document_path == two_page_pdf
     assert window.view.study_marks == (b_mark,)
+
+
+def test_a_stale_create_action_does_not_add_to_a_replaced_pdf(
+    qtbot: QtBot,
+    settings: Settings,
+    study_marks: StudyMarkRepository,
+    tmp_path: Path,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+    errors: list[str],
+) -> None:
+    """同じパスの PDF を差し替えて開き直しても、前の内容の座標は入らない。
+
+    捕まえるのがパスだけだと、パスは一致したままなので照合を素通りする。
+    差し替え後の PDF に、見ていないページの座標が記録されてしまう。
+    """
+    path = tmp_path / "book.pdf"
+    path.write_bytes(sample_pdf.read_bytes())
+    window = MainWindow(settings, study_marks)
+    qtbot.addWidget(window)
+    with qtbot.waitExposed(window):
+        window.show()
+    window.open_path(path)
+    window.view.fit_page()
+
+    page_menu = window.study_mark_interaction.build_menu(
+        window.view.study_mark_target_at(page_point(window.view, 0, 0.3, 0.7))
+    )
+    assert page_menu is not None
+    stale = menu_actions(page_menu)[0]
+
+    # 同じパスのまま、中身が別の PDF に差し替わって開き直された。
+    path.write_bytes(two_page_pdf.read_bytes())
+    window.open_path(path)
+    replaced = DocumentIdentity.of(path)
+
+    stale.trigger()
+
+    try:
+        assert study_marks.list_for_document(replaced) == []
+        assert window.view.study_marks == ()
+        assert len(errors) == 1
+        assert window.view.has_document
+    finally:
+        window.close()
 
 
 def test_marks_created_in_one_session_come_back_in_the_next(

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from collections.abc import Iterator
@@ -24,8 +25,10 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMenu
 from pytestqt.qtbot import QtBot
 
+from anp.core.fingerprint import file_fingerprint
 from anp.core.settings import Settings
 from anp.pdf.document import DocumentController
+from anp.storage.study_mark import DocumentIdentity
 from anp.storage.study_mark_repository import StudyMarkRepository
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import ZoomMode
@@ -43,6 +46,44 @@ def ini(tmp_path: Path) -> str:
 def backend(ini: str) -> QSettings:
     """テストから設定を直接仕込む/覗くための入口。"""
     return QSettings(ini, QSettings.Format.IniFormat)
+
+
+_CURRENT_CONTENT = object()
+
+
+def set_session(
+    backend: QSettings,
+    document: object,
+    *,
+    page: object = 0,
+    y_norm: object = 0.0,
+    fingerprint: object = _CURRENT_CONTENT,
+) -> None:
+    """前回のセッションを直接仕込む（壊れた値も含めてそのまま書く）。
+
+    値は1つの鍵に JSON でまとまっているので、テストからも同じ形で書き込む。
+    書いたら `sync()` するのは呼び出し側。
+
+    `fingerprint` の既定は「いまのファイルの内容」。位置の復元は指紋が
+    一致したときだけ起きるので、指定しない限り「同じ PDF を開き直した」
+    という普通の状況になる。読めないパスなら None（指紋なし）。
+    """
+    if fingerprint is _CURRENT_CONTENT:
+        try:
+            fingerprint = file_fingerprint(str(document))
+        except OSError:
+            fingerprint = None
+    backend.setValue(
+        "session/last",
+        json.dumps(
+            {
+                "document": document,
+                "fingerprint": fingerprint,
+                "page_index": page,
+                "y_norm": y_norm,
+            }
+        ),
+    )
 
 
 def make_window(
@@ -251,7 +292,7 @@ def test_clicking_a_recent_item_opens_it(
     ドキュメント・学習マーク・一覧のどれも、専用の経路ではなく
     `open_path()` から載る。
     """
-    mark = study_marks.create(sample_pdf, 1, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
     window.open_path(sample_pdf)
     window.open_path(other_pdf)
 
@@ -350,7 +391,7 @@ def test_clearing_the_recent_files_keeps_everything_else(
     window: MainWindow, sample_pdf: Path, backend: QSettings, study_marks: StudyMarkRepository
 ) -> None:
     """クリアは履歴だけを空にする。"""
-    mark = study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     window.open_path(sample_pdf)
     last_directory = window._settings.last_directory  # noqa: SLF001
 
@@ -560,7 +601,7 @@ def test_the_study_marks_are_restored_with_the_document(
     qtbot: QtBot, ini: str, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """自動復元でも学習マークがオーバーレイと一覧に載る。"""
-    mark = study_marks.create(sample_pdf, 1, 0.5, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
     first = make_window(qtbot, ini, study_marks)
     first.open_path(sample_pdf)
     first.close()
@@ -616,7 +657,7 @@ def test_the_automatic_restore_does_not_reorder_the_history(
     other = sample_pdf.parent / "other.pdf"
     shutil.copy(sample_pdf, other)
     backend.setValue("files/recent", [str(other), str(sample_pdf)])
-    backend.setValue("session/document", str(sample_pdf))
+    set_session(backend, str(sample_pdf))
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -631,7 +672,7 @@ def test_the_automatic_restore_does_not_add_to_the_history(
     qtbot: QtBot, ini: str, backend: QSettings, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """自動復元だけでは履歴に載らない。"""
-    backend.setValue("session/document", str(sample_pdf))
+    set_session(backend, str(sample_pdf))
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -654,7 +695,7 @@ def test_a_missing_last_document_does_not_break_startup(
     """前回の PDF が消えていても起動する。復元対象は忘れ、履歴からも外す。"""
     missing = Path(shutil.copy(sample_pdf, sample_pdf.parent / "gone.pdf"))
     backend.setValue("files/recent", [str(missing), str(sample_pdf)])
-    backend.setValue("session/document", str(missing))
+    set_session(backend, str(missing))
     backend.sync()
     missing.unlink()
 
@@ -685,7 +726,7 @@ def test_a_broken_last_document_does_not_break_startup(
 ) -> None:
     """壊れた PDF でも起動する。履歴からは外さない。"""
     backend.setValue("files/recent", [str(broken_pdf)])
-    backend.setValue("session/document", str(broken_pdf))
+    set_session(backend, str(broken_pdf))
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -711,7 +752,7 @@ def test_a_study_mark_failure_during_restore_does_not_break_startup(
 
     アプリを終了させはしない。復元対象は忘れる。
     """
-    backend.setValue("session/document", str(sample_pdf))
+    set_session(backend, str(sample_pdf))
     backend.sync()
 
     window = make_window(qtbot, ini, BrokenRepository(study_mark_connection, failing="list"))
@@ -753,9 +794,7 @@ def test_broken_session_values_fall_back_safely(
     ページと縦位置は別々に検査する。片方だけ壊れていても、読める方は
     そのまま使う（読めない方だけを既定へ落とす）。
     """
-    backend.setValue("session/document", str(sample_pdf))
-    backend.setValue("session/page_index", page)
-    backend.setValue("session/y_norm", y_norm)
+    set_session(backend, str(sample_pdf), page=page, y_norm=y_norm)
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -777,9 +816,7 @@ def test_a_page_beyond_the_document_falls_back_to_the_top(
     セッションの位置は過去の読書状態のヒントでしかないので、存在しない
     位置を最終ページとして解釈しない（学習マークの移動とは扱いが違う）。
     """
-    backend.setValue("session/document", str(sample_pdf))
-    backend.setValue("session/page_index", 99)
-    backend.setValue("session/y_norm", 0.5)
+    set_session(backend, str(sample_pdf), page=99, y_norm=0.5)
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -791,11 +828,82 @@ def test_a_page_beyond_the_document_falls_back_to_the_top(
         window.close()
 
 
+def test_a_replaced_document_opens_at_the_top(
+    qtbot: QtBot,
+    ini: str,
+    backend: QSettings,
+    study_marks: StudyMarkRepository,
+    tmp_path: Path,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+) -> None:
+    """同じパスの中身が入れ替わっていたら、前回の位置へは戻さない。
+
+    パスだけで位置を戻すと、別の本の同じページ番号へ飛ぶ。ページ数が
+    足りている場合は「戻れなかった」ことにも気づけない。
+    """
+    path = tmp_path / "book.pdf"
+    path.write_bytes(sample_pdf.read_bytes())
+    set_session(backend, str(path), page=2, y_norm=0.5)
+    backend.sync()
+    # 次の起動までに、同じパスの中身が別の PDF に置き換わった。
+    path.write_bytes(two_page_pdf.read_bytes())
+
+    window = make_window(qtbot, ini, study_marks)
+    try:
+        assert window.view.has_document
+        assert window.view.current_page == 0
+        assert window.view.verticalScrollBar().value() == 0
+    finally:
+        window.close()
+
+
+def test_the_same_document_still_restores_the_position(
+    qtbot: QtBot,
+    ini: str,
+    backend: QSettings,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+) -> None:
+    """中身が同じなら、これまでどおり位置まで戻る。"""
+    set_session(backend, str(sample_pdf), page=2, y_norm=0.0)
+    backend.sync()
+
+    window = make_window(qtbot, ini, study_marks)
+    try:
+        assert window.view.current_page == 2
+    finally:
+        window.close()
+
+
+def test_a_session_without_a_fingerprint_opens_at_the_top(
+    qtbot: QtBot,
+    ini: str,
+    backend: QSettings,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+) -> None:
+    """内容を記録していないセッションでは、位置を戻さず先頭から開く。
+
+    同じ内容だと確かめられない以上、読んでいない場所へ飛ばすより、
+    先頭から読み直せる方を選ぶ（fail-closed）。PDF 自体は開く。
+    """
+    set_session(backend, str(sample_pdf), page=2, y_norm=0.5, fingerprint=None)
+    backend.sync()
+
+    window = make_window(qtbot, ini, study_marks)
+    try:
+        assert window.view.has_document
+        assert window.view.current_page == 0
+    finally:
+        window.close()
+
+
 def test_an_invalid_last_document_type_is_ignored(
     qtbot: QtBot, ini: str, backend: QSettings, study_marks: StudyMarkRepository
 ) -> None:
     """復元対象が文字列でなくても起動する。"""
-    backend.setValue("session/document", 42)
+    set_session(backend, 42)
     backend.sync()
 
     window = make_window(qtbot, ini, study_marks)
@@ -832,7 +940,7 @@ def test_saving_the_session_does_not_touch_the_render_state(
     render = window.view._render  # noqa: SLF001
     generation = render.generation
 
-    window._save_last_session()  # noqa: SLF001
+    window._session.save(window._open.path, window._open.content_fingerprint)  # noqa: SLF001
 
     assert render.generation == generation
     assert window.view.has_document

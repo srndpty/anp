@@ -47,6 +47,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtPdf import QPdfDocument, QPdfDocumentRenderOptions, QPdfPageRenderer
 
 from anp.pdf.cache import (
+    BYTES_PER_PIXEL,
     DEFAULT_DISPLAY_MAX_BYTES,
     DisplayCache,
     DisplayKey,
@@ -56,9 +57,6 @@ from anp.pdf.cache import (
 from anp.pdf.color import PageColorMode, transform_page
 
 logger = logging.getLogger(__name__)
-
-# ARGB32 の1画素あたりのバイト数。
-_BYTES_PER_PIXEL = 4
 
 # 1枚のレンダリング要求で許す最大バイト数。キャッシュ上限より十分小さくする。
 # これを超える要求は縦横比を保って縮め、表示時に拡大する。高倍率では多少
@@ -78,18 +76,38 @@ DEFAULT_MAX_INFLIGHT = 6
 # （変換中は「入力の raw」と「出力」がキャッシュ上限の外側に同時に載る）。
 DEFAULT_MAX_TRANSFORM_INFLIGHT = 2
 
+# 同じ表示用画像を作り直す回数の上限（現在の優先度の並びに対して）。
+# 変換の失敗は一時的なこともあるので1回では諦めないが、決定的に失敗する
+# 画像を無限に作り直さないよう予算を持つ。並びが変わればまた数え直す。
+_MAX_TRANSFORM_ATTEMPTS = 2
+
 
 def clamp_render_size(size: QSize, max_bytes: int = DEFAULT_MAX_RENDER_BYTES) -> QSize:
-    """要求サイズを最大バイト数に収まるよう縦横比を保って縮める。"""
+    """要求サイズを最大バイト数に収まるよう縦横比を保って縮める。
+
+    `max_bytes` は最低でも1画素分。0 や負の値では縮めようがなく、
+    `sqrt()` の定義域エラーになるだけなので呼び出し側の誤りとして弾く。
+    """
+    if max_bytes < BYTES_PER_PIXEL:
+        msg = f"max_bytes must be at least {BYTES_PER_PIXEL}, got {max_bytes}"
+        raise ValueError(msg)
+
     width = max(size.width(), 1)
     height = max(size.height(), 1)
 
-    estimated = width * height * _BYTES_PER_PIXEL
+    estimated = width * height * BYTES_PER_PIXEL
     if estimated <= max_bytes:
         return QSize(width, height)
 
     scale = math.sqrt(max_bytes / estimated)
     return QSize(max(int(width * scale), 1), max(int(height * scale), 1))
+
+
+def _require_at_least(value: int, minimum: int, name: str) -> None:
+    """設定値が下限以上であることを確かめる。"""
+    if value < minimum:
+        msg = f"{name} must be at least {minimum}, got {value}"
+        raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,9 +226,15 @@ class PageRenderService(QObject):
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        if max_transform_inflight < 1:
-            msg = f"max_transform_inflight must be at least 1, got {max_transform_inflight}"
-            raise ValueError(msg)
+        # **不変条件はここで確定させる。** どれか1つでも壊れていると、症状は
+        # 「1ページも描かれない」という遠くの静かな停止として出る。例えば
+        # `max_inflight=0` では `flush()` の枠の判定が最初から成立し、要求が
+        # 1件も発行されない。作れてしまう時点で誤りなので生成を失敗させる。
+        _require_at_least(max_inflight, 1, "max_inflight")
+        _require_at_least(max_transform_inflight, 1, "max_transform_inflight")
+        _require_at_least(max_render_bytes, BYTES_PER_PIXEL, "max_render_bytes")
+        _require_at_least(display_max_bytes, BYTES_PER_PIXEL, "display_max_bytes")
+        _require_at_least(debounce_ms, 0, "debounce_ms")
 
         self._cache = cache
         self._display_cache = DisplayCache(display_max_bytes)
@@ -247,6 +271,11 @@ class PageRenderService(QObject):
         # ずれても「完了 → 追い出し → 再投入」を繰り返さないための安全弁。
         # 必要なページの並び・モード・世代が変わった時点で忘れる。
         self._transform_attempted: set[DisplayKey] = set()
+        # 失敗した変換を、その並びに対して何回作り直したか。**キャッシュの
+        # 追い出しによる再投入の抑止（`_transform_attempted`）とは別に数える。**
+        # 一緒にすると、一時的な失敗が「作った」ものとして記録され、同じ
+        # ページが並びの変わるまで下地のままになる。
+        self._transform_failures: dict[DisplayKey, int] = {}
         # 専用のスレッドプール。`QPdfPageRenderer` が使うグローバルプールとは
         # 分ける。投入は台帳側で `max_transform_inflight` に抑えるので、
         # プールの中に待ち行列は溜まらない。
@@ -293,7 +322,7 @@ class PageRenderService(QObject):
         """
         self._generation += 1
         self._desired.clear()
-        self._transform_attempted.clear()
+        self._forget_transform_attempts()
         self._transform_admitted.clear()
         self._dispatch_timer.stop()
         self._cache.clear()
@@ -324,7 +353,7 @@ class PageRenderService(QObject):
         if mode is self._color_mode:
             return
         self._color_mode = mode
-        self._transform_attempted.clear()
+        self._forget_transform_attempts()
         self._pump_transforms()
 
     # -------------------------------------------------- 取得（描画経路）
@@ -409,7 +438,7 @@ class PageRenderService(QObject):
                 continue
 
             # 変換後は必ず ARGB32 になるので、大きさは raw の画素数から決まる。
-            budget_used += raw_key.width_px * raw_key.height_px * _BYTES_PER_PIXEL
+            budget_used += raw_key.width_px * raw_key.height_px * BYTES_PER_PIXEL
             if budget_used > self._display_cache.max_bytes:
                 continue
 
@@ -423,6 +452,10 @@ class PageRenderService(QObject):
                 # この優先度の並びに対しては一度作った。予算の勘定が合わずに
                 # 追い出されたとしても作り直さない（作り直しても同じことの
                 # 繰り返しになる）。予算での足切りが本筋で、こちらは安全弁。
+                continue
+            if self._transform_failures.get(display_key, 0) >= _MAX_TRANSFORM_ATTEMPTS:
+                # 何度作り直しても失敗する。この並びに対しては諦める
+                # （並びかモードが変われば、また機会を与える）。
                 continue
             if len(self._transform_inflight) >= self._max_transform_inflight:
                 continue
@@ -467,6 +500,9 @@ class PageRenderService(QObject):
             # 失敗した画像はキャッシュに入れない。枠は上で解放済みなので、
             # 台帳が詰まることはない。
             logger.warning("dropping failed transform for %r", job.display_key)
+            if job.generation == self._generation:
+                # 前のドキュメントの失敗で、いまの世代の予算を減らさない。
+                self._record_transform_failure(job.display_key)
         elif job.generation != self._generation:
             # 前のドキュメントの変換。**絶対にキャッシュへ入れない。**
             logger.debug("discarding stale transform for %r", job.display_key)
@@ -484,6 +520,31 @@ class PageRenderService(QObject):
 
         # 枠が空いたので、いま必要な分の続きを投入する。
         self._pump_transforms()
+
+    def _forget_transform_attempts(self) -> None:
+        """投入済みの記憶と失敗の回数を、まとめて忘れる。
+
+        どちらも「いまの優先度の並び・モード・世代に対する記憶」なので、
+        片方だけ残すと数え方が食い違う。
+        """
+        self._transform_attempted.clear()
+        self._transform_failures.clear()
+
+    def _record_transform_failure(self, display_key: DisplayKey) -> None:
+        """変換の失敗を数え、予算が残っていれば再試行できるようにする。
+
+        **失敗を「作った」と同じ扱いにしない。** `_transform_attempted` に
+        残したままにすると、ワーカーの一時的なエラー1回で、そのページは
+        スクロール等で優先度の並びが変わるまで表示できなくなる。
+
+        かといって無条件に外すと、決定的に失敗する画像で「投入 → 失敗 →
+        再投入」が即座に回り続ける。そのため回数を数え、予算
+        （`_MAX_TRANSFORM_ATTEMPTS`）を使い切ったらこの並びに対しては諦める。
+        """
+        failures = self._transform_failures.get(display_key, 0) + 1
+        self._transform_failures[display_key] = failures
+        if failures < _MAX_TRANSFORM_ATTEMPTS:
+            self._transform_attempted.discard(display_key)
 
     def _admits(self, image: QImage, display_key: DisplayKey) -> bool:
         """出来上がった表示用画像をキャッシュへ入れてよいか。
@@ -530,7 +591,7 @@ class PageRenderService(QObject):
             # 優先度の並びが変わったので、安全弁の記憶は作り直す。同じ並びを
             # 繰り返し宣言されるだけ（スクロールしない再描画）のときに忘れると、
             # 追い出された分をまた作り始めてしまう。
-            self._transform_attempted.clear()
+            self._forget_transform_attempts()
         self._desired = desired
         self._pump_transforms()
         self._schedule(scale_changed=scale_changed)

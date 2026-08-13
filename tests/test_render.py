@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import gc
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -1063,6 +1063,20 @@ def budget_service(images: int) -> tuple[PageRenderService, ManualTransforms]:
     return service, transforms
 
 
+def fail_page(transforms: ManualTransforms, page: int) -> None:
+    """そのページの変換を失敗させる。
+
+    投入順は優先度と再試行で入れ替わるので、`pending[0]` では狙った
+    ページとは限らない。
+    """
+    job = next(
+        pending
+        for pending in transforms.pending
+        if pending.display_key.render_key.page_index == page
+    )
+    transforms.fail(job)
+
+
 def test_the_display_budget_does_not_cause_endless_retransforms() -> None:
     """予算に収まらない集合を要求されても、変換を延々と繰り返さない。
 
@@ -1139,8 +1153,9 @@ def test_a_priority_only_reorder_is_treated_as_a_change() -> None:
     """
     service, transforms = budget_service(images=4)
     service.request_pages(requests_for(range(0, 2)))
-    # ページ 0 の変換が失敗した。作られていないが「試した」記録は残る。
-    transforms.fail(transforms.pending[0])
+    # ページ 0 の変換が、再試行の予算を使い切るまで失敗した。
+    fail_page(transforms, 0)
+    fail_page(transforms, 0)
     submitted = len(transforms.submitted)
 
     # 同じ並びで宣言し直しても作り直さない（安全弁が効いている）。
@@ -1739,7 +1754,11 @@ def test_a_failed_transform_is_not_cached() -> None:
 
 
 def test_a_failed_transform_frees_the_slot() -> None:
-    """変換に失敗しても台帳が詰まらず、次の分が進む。"""
+    """変換に失敗しても台帳が詰まらず、枠がすぐ埋め直される。
+
+    まず失敗したページ自身を優先度どおりにもう一度試し、それも失敗したら
+    次のページへ進む（`_MAX_TRANSFORM_ATTEMPTS`）。
+    """
     service = seeded_service(range(0, 2), max_transform_inflight=1)
     transforms = ManualTransforms(service)
     service.set_color_mode(PageColorMode.INVERT)
@@ -1750,7 +1769,46 @@ def test_a_failed_transform_frees_the_slot() -> None:
 
     assert service.transform_inflight_count == 1
     assert len(transforms.submitted) == 2
+    assert transforms.submitted[-1].display_key.render_key.page_index == 0
+
+    transforms.fail(transforms.pending[0])
+
+    assert len(transforms.submitted) == 3
     assert transforms.submitted[-1].display_key.render_key.page_index == 1
+
+
+def test_a_transient_transform_failure_is_retried() -> None:
+    """1回失敗しただけのページを、次の機会まで下地のままにしない。
+
+    失敗を「作った」と同じ扱いにすると、ワーカーの一時的なエラー1回で、
+    スクロール等で優先度の並びが変わるまでそのページを表示できなくなる。
+    """
+    service, transforms = budget_service(images=4)
+    service.request_pages(requests_for(range(0, 1)))
+
+    transforms.fail(transforms.pending[0])
+    assert len(transforms.submitted) == 2, "失敗したきり作り直していない"
+
+    transforms.complete(transforms.pending[0])
+
+    assert display_keys(service), "再試行の成功がキャッシュに入っていない"
+
+
+def test_a_transform_that_keeps_failing_is_given_up_on() -> None:
+    """決定的に失敗する変換は、予算を使い切ったところで諦める。
+
+    失敗するたびに作り直すと、その場で「投入 → 失敗 → 再投入」が回り続ける。
+    """
+    service, transforms = budget_service(images=4)
+    service.request_pages(requests_for(range(0, 1)))
+
+    for _ in range(10):
+        if not transforms.pending:
+            break
+        transforms.fail(transforms.pending[0])
+
+    assert len(transforms.submitted) == 2
+    assert not transforms.pending
 
 
 def test_an_exception_in_the_worker_does_not_escape(
@@ -1805,3 +1863,37 @@ def test_a_transform_cap_below_one_is_rejected() -> None:
     """同時変換数を 0 以下にすると、何も投入されないまま止まる。設定させない。"""
     with pytest.raises(ValueError, match="max_transform_inflight"):
         PageRenderService(RenderCache(), max_transform_inflight=0)
+
+
+@pytest.mark.parametrize(
+    ("build", "message"),
+    [
+        (lambda: PageRenderService(RenderCache(), max_inflight=0), "max_inflight"),
+        (lambda: PageRenderService(RenderCache(), max_render_bytes=0), "max_render_bytes"),
+        (lambda: PageRenderService(RenderCache(), display_max_bytes=0), "display_max_bytes"),
+        (lambda: PageRenderService(RenderCache(), debounce_ms=-1), "debounce_ms"),
+    ],
+)
+def test_a_broken_setting_is_rejected_at_construction(
+    build: Callable[[], PageRenderService], message: str
+) -> None:
+    """壊れた設定値でサービスを作れてしまわない。
+
+    どれも症状は「1ページも描かれない」という遠くの静かな停止になる。
+    例えば `max_inflight=0` では、`flush()` の枠の判定が最初から成立して
+    要求が1件も発行されない。
+    """
+    with pytest.raises(ValueError, match=message):
+        build()
+
+
+def test_a_cache_that_cannot_hold_a_pixel_is_rejected() -> None:
+    """1画素も入らない上限のキャッシュは作らせない。"""
+    with pytest.raises(ValueError, match="max_bytes"):
+        RenderCache(max_bytes=0)
+
+
+def test_clamping_to_less_than_a_pixel_is_rejected() -> None:
+    """縮めようのない上限を渡されたら、`sqrt()` の定義域へ行く前に弾く。"""
+    with pytest.raises(ValueError, match="max_bytes"):
+        clamp_render_size(QSize(100, 100), max_bytes=0)

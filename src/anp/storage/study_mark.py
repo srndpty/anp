@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from anp.core.fingerprint import file_fingerprint, validate_fingerprint
 
 
 def document_key(path: Path | str) -> str:
@@ -33,15 +35,71 @@ def document_key(path: Path | str) -> str:
     正規化する（`os.path.normcase`）。同じファイルを指す表記が別ドキュメント
     として扱われないようにするため。
 
+    **パスだけでは同一性は決まらない。** 同じパスに別の内容の PDF が置かれる
+    ことがあるので、学習マークの持ち主の判定にはこれと内容の指紋
+    （`anp.core.fingerprint`）の2つを使う（`DocumentIdentity`）。
+
     既知の制限: 識別子はパスなので、**PDF を別の場所へ移動・リネームすると
-    以前の学習マークとは自動的に結び付かない**。内容ハッシュやファイル ID に
-    よる追跡は Phase 3-1 の非目標で、必要になったら後続のマイグレーションで
-    識別子を拡張する。
+    以前の学習マークとは自動的に結び付かない**。内容による追跡（移動しても
+    見つける）は非目標のままで、ここで防ぐのは逆向きの取り違えだけ。
     """
     if isinstance(path, str) and not path:
         msg = "document path must not be empty"
         raise ValueError(msg)
     return os.path.normcase(str(Path(path).resolve()))
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentIdentity:
+    """学習マークの持ち主を決める、PDF の同一性。
+
+    パス（表記揺れを吸収した `document_key()`）と内容の指紋の組。
+
+    **PDF を読み込んだその場で1つだけ作り、以後はこれを持ち回す。** 操作の
+    たびにパスから計算し直すと、開いている PDF と保存先の PDF がずれる。例えば
+    A を表示している最中に外部で同じパスへ B が置かれると、Ctrl + クリック
+    で作ったマークは「A の座標」なのに「B のマーク」として保存される。
+    ファイル全体のハッシュを操作のたびに計算しないので、数百 MB の PDF でも
+    マークの作成が待たされない、という効果もある。
+    """
+
+    key: str
+    """パスの表記揺れを吸収した識別子（`document_key()`）。"""
+
+    fingerprint: str
+    """開いた時点の内容の指紋。"""
+
+    path: Path = field(compare=False)
+    """開いたときのパス。**同一性の判定には使わない**（`key` が正規形）。
+
+    表示や照合のために元の表記も持ち回る。`key` は `normcase` 済みで
+    利用者に見せる形ではない。
+    """
+
+    def __post_init__(self) -> None:
+        validate_document_key(self.key)
+        validate_fingerprint(self.fingerprint)
+
+    @classmethod
+    def of(cls, path: Path | str) -> DocumentIdentity:
+        """PDF を1回読んで同一性を作る。読めなければ `OSError`。
+
+        **開いた PDF に対して使うなら `for_content()` の方**。こちらは
+        ファイルを開き直して読むので、`QPdfDocument` が読んだ内容との間に
+        隙間ができる。
+        """
+        return cls.for_content(path, file_fingerprint(path))
+
+    @classmethod
+    def for_content(cls, path: Path | str, fingerprint: str) -> DocumentIdentity:
+        """既に計算してある指紋から同一性を作る。
+
+        **PDF を読み込んだその場で取った指紋を渡すための入口。**
+        `DocumentController.open()` が読み込みの直後に計算した値を使えば、
+        「表示している PDF」と「持ち主として記録する PDF」の間に、
+        差し替えの入り込む隙間がほとんど無くなる。
+        """
+        return cls(key=document_key(path), fingerprint=fingerprint, path=Path(path))
 
 
 def validate_document_key(key: str) -> None:
@@ -116,6 +174,14 @@ class StudyMark:
     y_norm: float
     mistake_count: int
     note: str | None
+    document_fingerprint: str | None = None
+    """作られた時点の内容の指紋。マイグレーション2 より前の行は None。
+
+    持ち主の判定に使うのは `list_for_document()` の絞り込みなので、ここに
+    持つのは **保存されている値を検証の対象に載せるため**。長さだけ合った
+    でたらめな文字列が入っていても、「指紋が一致しないマーク」として黙って
+    消えたように見えるのではなく、保存データの不整合として気づける。
+    """
 
     def __post_init__(self) -> None:
         _validate_index(self.id, "id")
@@ -123,6 +189,8 @@ class StudyMark:
             msg = f"id must be > 0, got {self.id}"
             raise ValueError(msg)
         validate_document_key(self.document_key)
+        if self.document_fingerprint is not None:
+            validate_fingerprint(self.document_fingerprint)
         validate_position(self.page_index, self.x_norm, self.y_norm)
         _validate_index(self.mistake_count, "mistake_count")
         if self.mistake_count < 1:

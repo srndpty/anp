@@ -15,21 +15,27 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QSettings, QSizeF
+from PySide6.QtCore import QLockFile, QSettings, QSizeF
 from PySide6.QtPdf import QPdfDocument
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 from pytestqt.qtbot import QtBot
 
 from anp import app as app_module
+from anp.core.fingerprint import file_fingerprint
 from anp.core.paths import AppPaths
 from anp.core.settings import Settings
+from anp.pdf import document as document_module
 from anp.pdf.document import DocumentController
 from anp.storage import database
-from anp.storage.study_mark import StudyMark, document_key
+from anp.storage import study_mark as study_mark_module
+from anp.storage.study_mark import DocumentIdentity, StudyMark, document_key
 from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.ui.fatal import EXIT_INTERNAL_ERROR
 from anp.ui.main_window import MainWindow
 from anp.ui.pdf_view import PdfView
 from anp.ui.study_mark_controller import StudyMarkController, StudyMarkLoadError
+from anp.ui.study_marks import PagePosition
+from conftest import FatalCalls
 from helpers import RecordingRepository, RecordingService
 
 
@@ -44,13 +50,13 @@ class FailingRepository(StudyMarkRepository):
 
     def __init__(self, connection: sqlite3.Connection, failing: Path | None = None) -> None:
         super().__init__(connection)
-        self._failing = failing
+        self._failing = None if failing is None else DocumentIdentity.of(failing)
 
-    def list_for_document(self, document_path: Path | str) -> list[StudyMark]:
-        if self._failing is None or Path(document_path) == self._failing:
+    def list_for_document(self, document: DocumentIdentity) -> list[StudyMark]:
+        if self._failing is None or document == self._failing:
             msg = "no such table: study_marks"
             raise sqlite3.OperationalError(msg)
-        return super().list_for_document(document_path)
+        return super().list_for_document(document)
 
 
 @pytest.fixture
@@ -90,10 +96,10 @@ def test_activating_a_document_shows_its_marks(
     sample_pdf: Path,
 ) -> None:
     """保存済みのマークが読み込まれてビューに載る。"""
-    mark = study_marks.create(sample_pdf, 0, 0.25, 0.5)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.5)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert study_mark_controller.active_document_path == sample_pdf
     assert view.study_marks == (mark,)
@@ -112,19 +118,19 @@ def test_switching_documents_swaps_the_marks(
     どちらのマークも `page_index = 0` に置く。ページ番号だけでマークを
     引いていると、この検証だけが落ちる。
     """
-    a_mark = study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    b_mark = study_marks.create(two_page_pdf, 0, 0.9, 0.9)
+    a_mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    b_mark = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.9, 0.9)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert view.study_marks == (a_mark,)
 
     show(view, doc, two_page_pdf)
-    study_mark_controller.activate_document(two_page_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(two_page_pdf))
     assert view.study_marks == (b_mark,)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert view.study_marks == (a_mark,)
 
 
@@ -137,12 +143,12 @@ def test_a_document_without_marks_shows_nothing(
     single_page_pdf: Path,
 ) -> None:
     """マークが1件も無い PDF へ切り替えたら空になる。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     show(view, doc, single_page_pdf)
-    study_mark_controller.activate_document(single_page_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(single_page_pdf))
 
     assert view.study_marks == ()
 
@@ -155,9 +161,9 @@ def test_clearing_the_document_releases_the_marks(
     sample_pdf: Path,
 ) -> None:
     """表示対象を解除すると、対象もマークも無くなる。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     study_mark_controller.clear_document()
 
@@ -186,10 +192,10 @@ def test_refresh_reloads_the_active_document(
     P3-3B の更新後の反映はこの経路に載せる。
     """
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert list(view.study_marks) == []
 
-    added = study_marks.create(sample_pdf, 1, 0.5, 0.5)
+    added = study_marks.create(DocumentIdentity.of(sample_pdf), 1, 0.5, 0.5)
     study_mark_controller.refresh()
 
     assert view.study_marks == (added,)
@@ -206,9 +212,128 @@ def test_only_the_active_document_is_queried(
     controller = StudyMarkController(recording, view)
 
     show(view, doc, sample_pdf)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
 
-    assert recording.queried == [str(sample_pdf)]
+    assert recording.queried == [document_key(sample_pdf)]
+
+
+def test_the_identity_is_fixed_when_the_document_is_opened(
+    study_mark_connection: sqlite3.Connection,
+    view: PdfView,
+    doc: DocumentController,
+    tmp_path: Path,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+) -> None:
+    """開いた後に同じパスの中身が入れ替わっても、保存先は開いた PDF のまま。
+
+    操作のたびにパスから指紋を計算し直すと、表示しているのは A なのに、
+    ディスク上の B のマークとして保存される（画面に見えない場所へ、
+    A の座標が記録される）。
+    """
+    path = tmp_path / "swapped.pdf"
+    path.write_bytes(sample_pdf.read_bytes())
+    original = DocumentIdentity.of(path)
+    repository = StudyMarkRepository(study_mark_connection)
+    controller = StudyMarkController(repository, view)
+    show(view, doc, path)
+    controller.activate_document(DocumentIdentity.of(path))
+
+    # 表示したまま、同じパスの中身が別の PDF に置き換わった。
+    path.write_bytes(two_page_pdf.read_bytes())
+    controller.create_mark(
+        PagePosition(page_index=0, x_norm=0.5, y_norm=0.5),
+        expected_document=controller.active_document,
+    )
+
+    assert len(repository.list_for_document(original)) == 1
+    assert repository.list_for_document(DocumentIdentity.of(path)) == []
+    assert len(controller.study_marks) == 1
+
+
+def test_the_controller_records_the_fingerprint_of_what_it_loaded(
+    doc: DocumentController, sample_pdf: Path
+) -> None:
+    """`DocumentController` は、読み込んだ内容の指紋を持って返る。"""
+    assert doc.content_fingerprint is None
+
+    doc.open(sample_pdf)
+
+    assert doc.content_fingerprint == file_fingerprint(sample_pdf)
+
+    doc.close()
+    assert doc.content_fingerprint is None
+
+
+def test_opening_does_not_reread_the_file_for_the_identity(
+    qtbot: QtBot,
+    settings: Settings,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """持ち主の指紋は、読み込みの直後に取った値をそのまま使う。
+
+    開いた後でファイルを読み直して指紋を取ると、その隙に同じパスが別の
+    内容へ置き換わったときに「表示は A、持ち主は B」になる。読み直しの
+    経路（`DocumentIdentity.of()`）を通ったら失敗するようにして固定する。
+    """
+
+    def forbidden(_path: Path | str) -> str:
+        msg = "the identity must come from the load, not from a second read"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(study_mark_module, "file_fingerprint", forbidden)
+
+    window = MainWindow(settings, study_marks)
+    qtbot.addWidget(window)
+    try:
+        window.open_path(sample_pdf)
+
+        assert window.view.has_document
+        assert window.study_marks.active_document_path == sample_pdf
+    finally:
+        window.close()
+
+
+def test_the_fingerprint_is_read_once_per_open(
+    study_mark_controller: StudyMarkController,
+    study_marks: StudyMarkRepository,
+    view: PdfView,
+    doc: DocumentController,
+    sample_pdf: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """内容の指紋を計算するのは、開いたときの1回だけ。
+
+    マークを作るたびにファイル全体を読み直すと、数百 MB の PDF では
+    Ctrl + クリックのたびに画面が固まる。
+    """
+    reads: list[Path] = []
+    original = document_module.file_fingerprint
+
+    def counting(path: Path | str) -> str:
+        reads.append(Path(path))
+        return original(path)
+
+    # 指紋を取りうる2箇所（PDF を開いたとき・同一性を作るとき）を両方数える。
+    monkeypatch.setattr(document_module, "file_fingerprint", counting)
+    monkeypatch.setattr(study_mark_module, "file_fingerprint", counting)
+
+    show(view, doc, sample_pdf)
+    fingerprint = doc.content_fingerprint
+    assert fingerprint is not None
+    study_mark_controller.activate_document(DocumentIdentity.for_content(sample_pdf, fingerprint))
+    assert len(reads) == 1, "開いたときの1回だけのはず"
+
+    for index in range(3):
+        study_mark_controller.create_mark(
+            PagePosition(page_index=0, x_norm=0.1 * (index + 1), y_norm=0.5),
+            expected_document=study_mark_controller.active_document,
+        )
+
+    assert len(reads) == 1, "マークを作るたびに読み直している"
+    assert len(study_mark_controller.study_marks) == 3
 
 
 def test_marks_are_passed_through_unchanged(
@@ -222,13 +347,13 @@ def test_marks_are_passed_through_unchanged(
 
     同じ位置のマークをまとめたり、回数を「3回以上」へ丸めたりしない。
     """
-    first = study_marks.create(sample_pdf, 0, 0.5, 0.5, note="メモ")
-    study_marks.create(sample_pdf, 0, 0.5, 0.5)
+    first = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5, note="メモ")
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.5, 0.5)
     for _ in range(9):
         study_marks.increment_mistake_count(first.id)
 
     show(view, doc, sample_pdf)
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     marks = view.study_marks
     assert len(marks) == 2
@@ -250,10 +375,10 @@ def test_marks_outside_the_page_range_are_still_handed_over(
     描画とヒットテストから外すのは `PdfView` の契約。同じ判断をここでも
     行うと、方針が2箇所に分かれる。
     """
-    stale = study_marks.create(single_page_pdf, 7, 0.5, 0.5)
+    stale = study_marks.create(DocumentIdentity.of(single_page_pdf), 7, 0.5, 0.5)
 
     show(view, doc, single_page_pdf)
-    study_mark_controller.activate_document(single_page_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(single_page_pdf))
 
     assert view.study_marks == (stale,)
 
@@ -274,18 +399,18 @@ def test_a_read_failure_leaves_no_active_document(
     という状態を作らせない。失敗を「マーク0件」として黙って飲み込まない
     ことも同時に確かめる。
     """
-    a_mark = study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    a_mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     controller = StudyMarkController(
         FailingRepository(study_mark_connection, failing=two_page_pdf), view
     )
 
     show(view, doc, sample_pdf)
-    controller.activate_document(sample_pdf)
+    controller.activate_document(DocumentIdentity.of(sample_pdf))
     assert view.study_marks == (a_mark,)
 
     show(view, doc, two_page_pdf)
     with pytest.raises(StudyMarkLoadError):
-        controller.activate_document(two_page_pdf)
+        controller.activate_document(DocumentIdentity.of(two_page_pdf))
 
     assert list(view.study_marks) == []
     assert controller.active_document_path is None
@@ -303,7 +428,7 @@ def test_a_read_failure_on_a_closed_connection_propagates(
     study_mark_connection.close()
 
     with pytest.raises(StudyMarkLoadError):
-        study_mark_controller.activate_document(sample_pdf)
+        study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert view.study_marks == ()
     assert study_mark_controller.active_document_path is None
@@ -325,7 +450,7 @@ def test_a_read_failure_keeps_the_original_error_as_the_cause(
     study_mark_connection.close()
 
     with pytest.raises(StudyMarkLoadError) as error:
-        study_mark_controller.activate_document(sample_pdf)
+        study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert isinstance(error.value.__cause__, sqlite3.ProgrammingError)
 
@@ -346,16 +471,41 @@ def test_a_broken_stored_row_is_a_load_failure(
     show(view, doc, sample_pdf)
     # CHECK 制約を通る値だけで、ドメインが受け付けない行を作る。TEXT 列でも
     # BLOB はそのまま入るので、note が文字列でない行になる。
+    identity = DocumentIdentity.of(sample_pdf)
     study_mark_connection.execute(
-        "INSERT INTO study_marks (document_key, page_index, x_norm, y_norm, note)"
-        " VALUES (?, 0, 0.5, 0.5, x'414243')",
-        (document_key(sample_pdf),),
+        "INSERT INTO study_marks"
+        " (document_key, document_fingerprint, page_index, x_norm, y_norm, note)"
+        " VALUES (?, ?, 0, 0.5, 0.5, x'414243')",
+        (identity.key, identity.fingerprint),
     )
 
     with pytest.raises(StudyMarkLoadError):
-        study_mark_controller.activate_document(sample_pdf)
+        study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert study_mark_controller.active_document_path is None
+
+
+def test_a_programming_error_is_not_reported_as_a_load_failure(
+    view: PdfView,
+    doc: DocumentController,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+) -> None:
+    """実装の誤りは「学習マークを読み込めません」に化けさせない。
+
+    広く捕まえて包むと、`AttributeError` のようなバグが想定内の失敗の
+    見た目になり、fail-fast が効かなくなる。
+    """
+
+    class BuggyRepository(StudyMarkRepository):
+        def list_for_document(self, document: DocumentIdentity) -> list[StudyMark]:
+            raise AttributeError(document.key)
+
+    controller = StudyMarkController(BuggyRepository(study_mark_connection), view)
+    show(view, doc, sample_pdf)
+
+    with pytest.raises(AttributeError):
+        controller.activate_document(DocumentIdentity.of(sample_pdf))
 
 
 def test_loading_marks_does_not_touch_the_rendering(
@@ -370,7 +520,7 @@ def test_loading_marks_does_not_touch_the_rendering(
 
     P2-2 / P3-2 の分離を統合後も守る。
     """
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     show(view, doc, sample_pdf)
     view.go_to_page(1)
 
@@ -380,7 +530,7 @@ def test_loading_marks_does_not_touch_the_rendering(
     page = view.current_page
     scroll = view.verticalScrollBar().value()
 
-    study_mark_controller.activate_document(sample_pdf)
+    study_mark_controller.activate_document(DocumentIdentity.of(sample_pdf))
 
     assert len(service.requests) == requests
     assert view.zoom == zoom
@@ -414,6 +564,92 @@ def warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return messages
 
 
+class AdoptPrompt:
+    """古い形式のマークの問いかけを捕まえて、答えをテストから決める。"""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.asked: list[str] = []
+        self.accept = False
+        monkeypatch.setattr("anp.ui.study_mark_interaction.QMessageBox.question", self._question)
+
+    def _question(self, *args: object, **_kwargs: object) -> QMessageBox.StandardButton:
+        self.asked.append(str(args[2]))
+        return QMessageBox.StandardButton.Yes if self.accept else QMessageBox.StandardButton.No
+
+
+@pytest.fixture
+def adopt_prompt(monkeypatch: pytest.MonkeyPatch) -> AdoptPrompt:
+    """古い形式のマークの問いかけ。既定は「いいえ」で答える。"""
+    return AdoptPrompt(monkeypatch)
+
+
+def make_unverified(connection: sqlite3.Connection) -> None:
+    """保存済みのマークを、マイグレーション2 より前の形（指紋なし）へ戻す。"""
+    connection.execute("UPDATE study_marks SET document_fingerprint = NULL")
+
+
+def test_old_marks_without_a_fingerprint_are_not_shown_silently(
+    window: MainWindow,
+    study_marks: StudyMarkRepository,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+    adopt_prompt: AdoptPrompt,
+) -> None:
+    """指紋を持たない古いマークは、尋ねて断られたら表示しない。
+
+    どの内容の PDF に付けられたか分からないものを普通のマークと同じ顔で
+    並べると、差し替えた PDF に前の本のマークが乗る。
+    """
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.75)
+    make_unverified(study_mark_connection)
+
+    window.open_path(sample_pdf)
+
+    assert len(adopt_prompt.asked) == 1
+    assert "1 件" in adopt_prompt.asked[0]
+    assert window.view.study_marks == ()
+    assert window.study_marks.unverified_count == 1
+    # 断っても消さない。次に開けばまた尋ねる。
+    assert study_mark_connection.execute("SELECT COUNT(*) FROM study_marks").fetchone()[0] == 1
+
+
+def test_accepting_adopts_the_old_marks(
+    window: MainWindow,
+    study_marks: StudyMarkRepository,
+    study_mark_connection: sqlite3.Connection,
+    sample_pdf: Path,
+    adopt_prompt: AdoptPrompt,
+) -> None:
+    """「はい」と答えれば、この PDF のマークとして表示される。"""
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.75)
+    make_unverified(study_mark_connection)
+    adopt_prompt.accept = True
+
+    window.open_path(sample_pdf)
+
+    assert len(window.view.study_marks) == 1
+    assert window.study_marks.unverified_count == 0
+
+    # 引き取ったあとは、もう尋ねない。
+    window.open_path(sample_pdf)
+    assert len(adopt_prompt.asked) == 1
+
+
+def test_nothing_is_asked_without_old_marks(
+    window: MainWindow,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+    adopt_prompt: AdoptPrompt,
+) -> None:
+    """指紋のあるマークしか無ければ、問いかけは出ない。"""
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.75)
+
+    window.open_path(sample_pdf)
+
+    assert adopt_prompt.asked == []
+    assert len(window.view.study_marks) == 1
+
+
 def test_a_window_without_a_pdf_has_no_marks(window: MainWindow) -> None:
     """PDF を開いていなければ、表示対象もマークも無い。"""
     assert window.study_marks.active_document_path is None
@@ -424,7 +660,7 @@ def test_opening_a_pdf_loads_its_marks(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """PDF を開くと、その PDF のマークが表示される。"""
-    mark = study_marks.create(sample_pdf, 0, 0.25, 0.75)
+    mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.25, 0.75)
 
     window.open_path(sample_pdf)
 
@@ -439,8 +675,8 @@ def test_switching_pdfs_never_shows_the_other_documents_marks(
     two_page_pdf: Path,
 ) -> None:
     """A → B → A の切り替えで、常に表示中の PDF のマークだけが出る。"""
-    a_mark = study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    b_mark = study_marks.create(two_page_pdf, 0, 0.9, 0.9)
+    a_mark = study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    b_mark = study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.9, 0.9)
 
     window.open_path(sample_pdf)
     assert window.view.study_marks == (a_mark,)
@@ -460,7 +696,7 @@ def test_opening_a_pdf_without_marks_clears_the_previous_ones(
     single_page_pdf: Path,
 ) -> None:
     """マークの無い PDF を開いたら、前の PDF のマークは残らない。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.open_path(single_page_pdf)
@@ -479,8 +715,8 @@ def test_marks_are_loaded_after_the_new_document_is_in_place(
     差し替えた直後の状態が空であること、つまり「新しいページ＋古い PDF の
     マーク」という中間状態が無いことを固定する。
     """
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
-    study_marks.create(two_page_pdf, 0, 0.9, 0.9)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(two_page_pdf), 0, 0.9, 0.9)
     window.open_path(sample_pdf)
 
     snapshots: list[tuple[StudyMark, ...]] = []
@@ -509,7 +745,7 @@ def test_a_failed_open_clears_the_active_document(
     既存の失敗時の振る舞い（表示を空にする）に合わせ、学習マークだけ別の
     後始末をしない。
     """
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.open_path(broken_pdf)
@@ -530,7 +766,7 @@ def test_every_kind_of_failed_open_clears_the_active_document(
     request: pytest.FixtureRequest,
 ) -> None:
     """どの失敗の仕方でも、表示対象は残らない。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.open_path(request.getfixturevalue(bad))
@@ -544,7 +780,7 @@ def test_closing_the_window_releases_the_active_document(
     window: MainWindow, study_marks: StudyMarkRepository, sample_pdf: Path
 ) -> None:
     """ウィンドウを閉じたら、表示対象もマークも手放す。"""
-    study_marks.create(sample_pdf, 0, 0.1, 0.1)
+    study_marks.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window.open_path(sample_pdf)
 
     window.close()
@@ -568,7 +804,7 @@ def test_a_repository_failure_leaves_no_document_open(
     学習マークだけ別の失敗の仕方をしない。
     """
     repository = FailingRepository(study_mark_connection, failing=two_page_pdf)
-    a_mark = repository.create(sample_pdf, 0, 0.1, 0.1)
+    a_mark = repository.create(DocumentIdentity.of(sample_pdf), 0, 0.1, 0.1)
     window = MainWindow(settings, repository)
     qtbot.addWidget(window)
 
@@ -614,33 +850,35 @@ def test_a_repository_failure_is_reported_as_a_study_mark_failure(
     window.close()
 
 
-def test_an_unexpected_failure_while_opening_is_not_swallowed(
+def test_an_unexpected_failure_while_opening_stops_the_application(
     qtbot: QtBot,
     settings: Settings,
     study_marks: StudyMarkRepository,
     sample_pdf: Path,
     warnings: list[str],
+    fatal: FatalCalls,
 ) -> None:
-    """実装の誤りは警告にすり替えず、未捕捉例外として送出する。
+    """実装の誤りは警告にすり替えず、その場で終了させる。
 
-    読み込み失敗を1つの型に包むのは、この境界を作るため。後始末だけは
+    読み込み失敗を1つの型に包むのは、この境界を作るため。`open_path()` は
+    Qt から直に呼ばれるので、例外を外へ出さずに fail-stop する。後始末だけは
     読み込み失敗と同じで、開きかけの PDF を残さない。
     """
     window = MainWindow(settings, study_marks)
     qtbot.addWidget(window)
 
-    def boom(_path: Path) -> None:
+    def boom(_document: object) -> None:
         msg = "programming error"
         raise AttributeError(msg)
 
     window.study_marks.activate_document = boom  # type: ignore[assignment]
 
-    with pytest.raises(AttributeError):
-        window.open_path(sample_pdf)
+    window.open_path(sample_pdf)
 
     assert not window.view.has_document
     assert window.study_marks.active_document_path is None
-    assert warnings == []
+    assert warnings == [], "実装の誤りが通常の警告に化けている"
+    assert fatal.exit_codes == [EXIT_INTERNAL_ERROR]
     window.close()
 
 
@@ -654,7 +892,7 @@ def test_marks_survive_a_new_session(
     db = tmp_path / "session.sqlite3"
     first = database.connect(db)
     try:
-        StudyMarkRepository(first).create(sample_pdf, 0, 0.4, 0.6)
+        StudyMarkRepository(first).create(DocumentIdentity.of(sample_pdf), 0, 0.4, 0.6)
     finally:
         first.close()
 
@@ -711,6 +949,152 @@ def test_the_application_opens_and_closes_one_connection(
     assert (tmp_path / "data" / "anp.sqlite3").is_file()
     with pytest.raises(sqlite3.ProgrammingError):
         opened[0].execute("SELECT 1")
+
+
+def test_a_second_instance_does_not_open_the_database(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """既に起動していたら、2つ目は DB もウィンドウも開かずに終わる。
+
+    `StudyMarkController` は「表示中のスナップショットと DB が一致する」を
+    前提に、更新のたびの読み直しを省いている。書き手が2つになるとその
+    前提が崩れ、片方の画面が古い件数を出したままになる。
+    """
+    data = tmp_path / "data"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(app_module, "QApplication", lambda _argv: qapp)
+    monkeypatch.setattr(app_module, "setup_logging", lambda _path: None)
+    monkeypatch.setattr(app_module, "_install_excepthook", lambda: None)
+    monkeypatch.setattr(
+        AppPaths,
+        "from_standard_paths",
+        classmethod(lambda _cls, _name: AppPaths(data_dir=data)),
+    )
+    informed: list[str] = []
+    monkeypatch.setattr(
+        app_module.QMessageBox,
+        "information",
+        lambda *args: informed.append(str(args[2])),
+    )
+
+    # 先に起動しているプロセスの代わりに、同じロックを取っておく。
+    held = QLockFile(str(AppPaths(data_dir=data).lock_file))
+    assert held.tryLock(0), "テストの前提が崩れている（ロックを取れない）"
+    try:
+        connections: list[object] = []
+        monkeypatch.setattr(app_module.database, "connect", lambda path: connections.append(path))
+
+        assert app_module.main() == app_module.EXIT_ALREADY_RUNNING
+
+        assert connections == []
+        assert len(informed) == 1
+        assert "既に起動" in informed[0]
+    finally:
+        held.unlock()
+
+
+def test_a_lock_that_cannot_be_created_is_not_reported_as_a_second_instance(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ロックを作れないのと、既に起動しているのを混同しない。
+
+    まとめて「既に起動しています」と伝えると、書き込めないディレクトリが
+    原因のときに、利用者が居もしない別のウィンドウを探すことになる。
+    """
+    data = tmp_path / "data"
+    monkeypatch.setattr(app_module, "QApplication", lambda _argv: qapp)
+    monkeypatch.setattr(app_module, "setup_logging", lambda _path: None)
+    monkeypatch.setattr(app_module, "_install_excepthook", lambda: None)
+    monkeypatch.setattr(
+        AppPaths,
+        "from_standard_paths",
+        classmethod(lambda _cls, _name: AppPaths(data_dir=data)),
+    )
+    monkeypatch.setattr(QLockFile, "tryLock", lambda _self, _timeout: False)
+    monkeypatch.setattr(QLockFile, "error", lambda _self: QLockFile.LockError.PermissionError)
+
+    informed: list[str] = []
+    critical: list[str] = []
+    monkeypatch.setattr(
+        app_module.QMessageBox, "information", lambda *args: informed.append(str(args[2]))
+    )
+    monkeypatch.setattr(
+        app_module.QMessageBox, "critical", lambda *args: critical.append(str(args[2]))
+    )
+
+    assert app_module.main() == app_module.EXIT_LOCK_FAILED
+
+    assert informed == []
+    assert len(critical) == 1
+    assert "ロックファイル" in critical[0]
+
+
+def test_the_lock_is_not_treated_as_stale_over_time(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ロックは経過時間では無効にならない（起動中ずっと持ち続けるため）。
+
+    Qt の既定（30 秒）のままだと、長く開いているだけのウィンドウが
+    「古いロック」と判断され、2つ目が起動できてしまう。
+    """
+    data = tmp_path / "data"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(app_module, "QApplication", lambda _argv: qapp)
+    monkeypatch.setattr(app_module, "setup_logging", lambda _path: None)
+    monkeypatch.setattr(app_module, "_install_excepthook", lambda: None)
+    monkeypatch.setattr(
+        AppPaths,
+        "from_standard_paths",
+        classmethod(lambda _cls, _name: AppPaths(data_dir=data)),
+    )
+
+    stale: list[int] = []
+    original = QLockFile.setStaleLockTime
+
+    def record(self: QLockFile, value: int) -> None:
+        stale.append(value)
+        original(self, value)
+
+    monkeypatch.setattr(QLockFile, "setStaleLockTime", record)
+    monkeypatch.setattr(qapp, "exec", lambda: 0)
+    monkeypatch.setattr(
+        app_module,
+        "QSettings",
+        lambda: QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+    )
+
+    assert app_module.main() == 0
+
+    assert stale == [0]
+
+
+def test_the_lock_is_released_when_the_application_exits(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """終了したら、次の起動はロックを取れる。"""
+    data = tmp_path / "data"
+    monkeypatch.setattr(app_module, "QApplication", lambda _argv: qapp)
+    monkeypatch.setattr(app_module, "setup_logging", lambda _path: None)
+    monkeypatch.setattr(app_module, "_install_excepthook", lambda: None)
+    monkeypatch.setattr(
+        app_module,
+        "QSettings",
+        lambda: QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+    )
+    monkeypatch.setattr(
+        AppPaths,
+        "from_standard_paths",
+        classmethod(lambda _cls, _name: AppPaths(data_dir=data)),
+    )
+    monkeypatch.setattr(qapp, "exec", lambda: 0)
+
+    assert app_module.main() == 0
+
+    after = QLockFile(str(AppPaths(data_dir=data).lock_file))
+    try:
+        assert after.tryLock(0)
+    finally:
+        after.unlock()
 
 
 def test_the_database_lives_next_to_the_log(tmp_path: Path) -> None:
