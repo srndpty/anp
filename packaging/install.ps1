@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     ビルド済みの anp を Program Files へ入れ、スタートメニューに登録する。
 
