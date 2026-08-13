@@ -45,6 +45,7 @@ from PySide6.QtCore import QEvent, QPointF, QRect, QRectF, QSize, QSizeF, Qt, Si
 from PySide6.QtGui import (
     QColor,
     QContextMenuEvent,
+    QKeyEvent,
     QMouseEvent,
     QPainter,
     QPaintEvent,
@@ -52,7 +53,7 @@ from PySide6.QtGui import (
     QWheelEvent,
 )
 from PySide6.QtPdf import QPdfDocument, QPdfLink, QPdfSearchModel
-from PySide6.QtWidgets import QAbstractScrollArea, QWidget
+from PySide6.QtWidgets import QAbstractScrollArea, QApplication, QWidget
 
 from anp.pdf.color import PageColorMode, page_background_color
 from anp.pdf.destination import PdfDestination, clamp_to_page
@@ -1086,22 +1087,73 @@ class PdfView(QAbstractScrollArea):
             self.zoom_changed.emit()
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 (Qt の命名規則)
-        """Ctrl + ホイールでズーム。修飾なしのホイールは通常のスクロール。
+        """Ctrl + ホイールでズーム、Shift + ホイールで左右スクロール。
 
-        カーソル直下の PDF 上の点が動かないようにする。倍率の更新経路は
-        メニューからのズームと同じ `_set_zoom_state()`。
+        修飾なしのホイールは `QAbstractScrollArea` の通常のスクロール
+        （縦）に任せる。
+
+        ズームではカーソル直下の PDF 上の点が動かないようにする。倍率の
+        更新経路はメニューからのズームと同じ `_set_zoom_state()`。
         """
+        modifiers = event.modifiers()
         delta = event.angleDelta().y()
-        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier) or delta == 0:
-            super().wheelEvent(event)
+        if modifiers & Qt.KeyboardModifier.ControlModifier and delta != 0:
+            self._set_zoom_state(
+                self._zoom * ZOOM_STEP ** (delta / _WHEEL_NOTCH),
+                ZoomMode.FREE,
+                self._pointer_anchor(event.position()),
+            )
+            event.accept()
             return
 
-        self._set_zoom_state(
-            self._zoom * ZOOM_STEP ** (delta / _WHEEL_NOTCH),
-            ZoomMode.FREE,
-            self._pointer_anchor(event.position()),
-        )
-        event.accept()
+        if modifiers & Qt.KeyboardModifier.ShiftModifier and self._scroll_horizontally(event):
+            event.accept()
+            return
+
+        super().wheelEvent(event)
+
+    def _scroll_horizontally(self, event: QWheelEvent) -> bool:
+        """ホイールの回転量だけ横へ動かす。動かせたかを返す。
+
+        横に可動域が無ければ `False` を返し、呼び出し側は通常の縦スクロール
+        へ落とす。幅が収まっている文書で Shift を押している間だけホイールが
+        効かなくなる、という状態を作らないため。
+
+        1ノッチで動く量は縦と同じ（`singleStep` × システムの行数）にする。
+        Windows は Shift を押しても回転量を y に載せて送るが、横回転を
+        送るデバイスもあるので x も見る。
+        """
+        bar = self.horizontalScrollBar()
+        angle = event.angleDelta()
+        delta = angle.y() or angle.x()
+        if delta == 0 or bar.minimum() == bar.maximum():
+            return False
+
+        lines = QApplication.wheelScrollLines()
+        bar.setValue(bar.value() - round(delta / _WHEEL_NOTCH * lines * bar.singleStep()))
+        return True
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 (Qt の命名規則)
+        """← → でページを移動する。
+
+        `QAbstractScrollArea` の既定では ← → が横スクロールになるが、読む
+        ときに欲しいのはページの送り戻しなので置き換える。**ページ内の移動は
+        ホイールに任せる**（横方向は Shift + ホイール）。
+
+        修飾キーを伴う打鍵は素通しする。ウィンドウのアクション
+        （Ctrl+PgUp/PgDown など）や将来の割り当てと取り合いにしない。
+        """
+        if event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            if event.key() == Qt.Key.Key_Left:
+                self.go_to_page(self.current_page - 1)
+                event.accept()
+                return
+            if event.key() == Qt.Key.Key_Right:
+                self.go_to_page(self.current_page + 1)
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 (Qt の命名規則)
         """Ctrl + 左クリックで学習マークを操作する。

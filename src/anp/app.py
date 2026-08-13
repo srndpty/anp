@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
 
@@ -26,6 +27,7 @@ from anp.core.paths import AppPaths
 from anp.core.settings import Settings
 from anp.storage import database
 from anp.storage.study_mark_repository import StudyMarkRepository
+from anp.ui.app_icon import app_icon
 from anp.ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
@@ -107,12 +109,30 @@ def _report_lock_failure(lock: QLockFile, path: Path) -> int:
     return EXIT_LOCK_FAILED
 
 
+def initial_document(arguments: Sequence[str]) -> Path | None:
+    """コマンドラインで渡された PDF。渡されていなければ None。
+
+    PDF に関連付けた anp をエクスプローラから起動すると、Windows は開く
+    ファイルのパスを1つだけ渡してくる。**オプションは受け取らない**ので
+    解析もしない（受け付ける予定のあるものが無い。増やすときにここへ
+    `argparse` を入れる）。
+
+    ここでは存在も拡張子も確かめない。開けるかどうかの判断と、開けな
+    かったときの知らせ方は `MainWindow` の1箇所に任せる。
+    """
+    return Path(arguments[1]) if len(arguments) > 1 else None
+
+
 def main() -> int:
     """アプリケーションを起動し、終了コードを返す。"""
     QCoreApplication.setOrganizationName(ORGANIZATION_NAME)
     QCoreApplication.setApplicationName(APPLICATION_NAME)
 
     app = QApplication(sys.argv)
+    # ウィンドウとタスクバーのアイコン。実行ファイルに埋め込む `.ico`
+    # （`packaging/anp.ico`）も同じ絵を焼いたものなので、開発中に
+    # `uv run anp` で動かしても見た目は変わらない。
+    app.setWindowIcon(app_icon())
 
     paths = AppPaths.from_standard_paths(APPLICATION_NAME)
     paths.ensure_directories()
@@ -138,7 +158,11 @@ def main() -> int:
         connection = database.connect(paths.database_file)
         try:
             settings = Settings(QSettings())
-            window = MainWindow(settings, StudyMarkRepository(connection))
+            window = MainWindow(
+                settings,
+                StudyMarkRepository(connection),
+                initial_document=initial_document(sys.argv),
+            )
             window.show()
 
             exit_code = app.exec()

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QEvent, QPoint, QPointF, QSizeF, Qt
-from PySide6.QtGui import QColor, QWheelEvent
+from PySide6.QtGui import QColor, QKeyEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication
 from pytestqt.qtbot import QtBot
 
@@ -1106,6 +1106,97 @@ def test_ctrl_wheel_requests_render_only_once(
     send_wheel(loaded_view, QPointF(200.0, 300.0), 120, Qt.KeyboardModifier.ControlModifier)
 
     assert len(service.requests) == count + 1
+
+
+# ------------------------------------------------------------------ Shift+ホイール
+def test_shift_wheel_scrolls_horizontally(loaded_view: PdfView) -> None:
+    """Shift+ホイールで横へ動く。縦は動かない。"""
+    loaded_view.set_zoom(4.0)
+    assert loaded_view.horizontalScrollBar().maximum() > 0
+    vertical_before = loaded_view.verticalScrollBar().value()
+
+    send_wheel(loaded_view, QPointF(200.0, 300.0), -120, Qt.KeyboardModifier.ShiftModifier)
+
+    assert loaded_view.horizontalScrollBar().value() > 0
+    assert loaded_view.verticalScrollBar().value() == vertical_before
+
+
+def test_shift_wheel_scrolls_back(loaded_view: PdfView) -> None:
+    """逆回転では左へ戻る。"""
+    loaded_view.set_zoom(4.0)
+    loaded_view.horizontalScrollBar().setValue(loaded_view.horizontalScrollBar().maximum())
+    before = loaded_view.horizontalScrollBar().value()
+
+    send_wheel(loaded_view, QPointF(200.0, 300.0), 120, Qt.KeyboardModifier.ShiftModifier)
+
+    assert loaded_view.horizontalScrollBar().value() < before
+
+
+def test_shift_wheel_falls_back_to_vertical_without_room(loaded_view: PdfView) -> None:
+    """横に可動域が無ければ、Shift を押していても縦に動く。"""
+    loaded_view.fit_width()
+    assert loaded_view.horizontalScrollBar().maximum() == 0
+    before = loaded_view.verticalScrollBar().value()
+
+    send_wheel(loaded_view, QPointF(200.0, 300.0), -120, Qt.KeyboardModifier.ShiftModifier)
+
+    assert loaded_view.verticalScrollBar().value() > before
+
+
+def test_shift_wheel_does_not_zoom(loaded_view: PdfView) -> None:
+    """Shift+ホイールは倍率に触らない。"""
+    loaded_view.set_zoom(4.0)
+
+    send_wheel(loaded_view, QPointF(200.0, 300.0), -120, Qt.KeyboardModifier.ShiftModifier)
+
+    assert loaded_view.zoom == pytest.approx(4.0)
+
+
+# ------------------------------------------------------------------ 矢印キー
+def send_key(view: PdfView, key: Qt.Key, modifiers: Qt.KeyboardModifier) -> None:
+    """ビューへ打鍵を送る。"""
+    event = QKeyEvent(QEvent.Type.KeyPress, key, modifiers)
+    QApplication.sendEvent(view, event)
+
+
+def test_right_arrow_moves_to_the_next_page(loaded_view: PdfView) -> None:
+    """→ で次のページへ。"""
+    send_key(loaded_view, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier)
+
+    assert loaded_view.current_page == 1
+
+
+def test_left_arrow_moves_to_the_previous_page(loaded_view: PdfView) -> None:
+    """← で前のページへ。"""
+    loaded_view.go_to_page(2)
+
+    send_key(loaded_view, Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier)
+
+    assert loaded_view.current_page == 1
+
+
+def test_arrow_keys_stop_at_the_ends(loaded_view: PdfView) -> None:
+    """先頭で ←、末尾で → を押しても行き過ぎない。"""
+    send_key(loaded_view, Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier)
+    assert loaded_view.current_page == 0
+
+    loaded_view.go_to_page(2)
+    send_key(loaded_view, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier)
+    assert loaded_view.current_page == 2
+
+
+def test_modified_arrow_keys_do_not_move_pages(loaded_view: PdfView) -> None:
+    """修飾キー付きの矢印はページ移動にしない。"""
+    send_key(loaded_view, Qt.Key.Key_Right, Qt.KeyboardModifier.ControlModifier)
+
+    assert loaded_view.current_page == 0
+
+
+def test_arrow_keys_without_a_document_are_harmless(view: PdfView) -> None:
+    """ドキュメントが無ければ何も起きない。"""
+    send_key(view, Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier)
+
+    assert view.current_page == NO_PAGE
 
 
 # ------------------------------------------------------------------ ページの色
