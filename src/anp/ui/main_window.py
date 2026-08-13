@@ -133,9 +133,15 @@ class MainWindow(QMainWindow):
         settings: Settings,
         study_marks: StudyMarkRepository,
         parent: QWidget | None = None,
+        *,
+        initial_document: Path | None = None,
     ) -> None:
         super().__init__(parent)
         self._settings = settings
+
+        # 起動時に開く PDF（PDF に関連付けられた anp をエクスプローラから
+        # 起動した場合）。指定があれば前回のセッションより優先する。
+        self._initial_document = initial_document
 
         # 全画面から戻るときに復元する状態。全画面へ入る直前に記録する。
         self._maximized_before_full_screen = False
@@ -794,7 +800,11 @@ class MainWindow(QMainWindow):
 
     @guard_qt_callback
     def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 (Qt の命名規則)
-        """最初に表示されたときだけ、前回のセッションを復元する。
+        """最初に表示されたときだけ、開くべき PDF を開く。
+
+        コマンドラインで PDF を渡されていればそれを開き、無ければ前回の
+        セッションを復元する。**両方は行わない**（関連付けから開いた PDF が
+        前回の続きに差し替わったら、押したファイルが開かないことになる）。
 
         構築中ではなくここで行うのは、**ビューポートの大きさが確定して
         から読書位置を決める**ため。先に決めると、その後のレイアウトで
@@ -807,7 +817,12 @@ class MainWindow(QMainWindow):
         if self._session_restored:
             return
         self._session_restored = True
-        self._restore_last_document()
+        if self._initial_document is None:
+            self._restore_last_document()
+        else:
+            # 利用者が明示的に選んだのと同じ扱いにする（履歴に載せ、
+            # 開けなければダイアログで知らせる）。
+            self.open_path(self._initial_document)
 
     def _restore_last_document(self) -> None:
         """前回終了時に読んでいた PDF を、その位置ごと開き直す。

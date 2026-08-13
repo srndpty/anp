@@ -59,6 +59,17 @@ class FailingRepository(StudyMarkRepository):
         return super().list_for_document(document)
 
 
+@pytest.fixture(autouse=True)
+def bare_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`main()` が読むコマンドライン引数を、引数なしの起動に見せる。
+
+    `main()` は `sys.argv[1]` を「起動時に開く PDF」として扱う
+    （PDF に関連付けたときの入口）。テストの中では pytest 自身の argv が
+    見えていて、テストファイルのパスを PDF として開こうとしてしまう。
+    """
+    monkeypatch.setattr(app_module.sys, "argv", ["anp"])
+
+
 @pytest.fixture
 def doc() -> Iterator[DocumentController]:
     """開き直しに使い回すドキュメントコントローラ。"""

@@ -87,7 +87,12 @@ def set_session(
 
 
 def make_window(
-    qtbot: QtBot, ini: str, repository: StudyMarkRepository, *, size: tuple[int, int] | None = None
+    qtbot: QtBot,
+    ini: str,
+    repository: StudyMarkRepository,
+    *,
+    size: tuple[int, int] | None = None,
+    initial_document: Path | None = None,
 ) -> MainWindow:
     """設定を読み込んで表示済みのウィンドウを作る。
 
@@ -95,7 +100,11 @@ def make_window(
     `showEvent()` で走るため。待ち合わせは `waitExposed` だけで、
     固定時間の sleep は使わない。
     """
-    window = MainWindow(Settings(QSettings(ini, QSettings.Format.IniFormat)), repository)
+    window = MainWindow(
+        Settings(QSettings(ini, QSettings.Format.IniFormat)),
+        repository,
+        initial_document=initial_document,
+    )
     qtbot.addWidget(window)
     if size is not None:
         window.resize(*size)
@@ -478,6 +487,52 @@ def test_the_last_document_is_reopened(
         assert second.document_status_text == str(sample_pdf)
     finally:
         second.close()
+
+
+def test_a_document_given_on_the_command_line_wins(
+    qtbot: QtBot,
+    ini: str,
+    study_marks: StudyMarkRepository,
+    sample_pdf: Path,
+    two_page_pdf: Path,
+) -> None:
+    """コマンドラインで渡された PDF が、前回のセッションより優先される。
+
+    PDF に関連付けた anp をエクスプローラから起動したとき、押したファイル
+    ではなく前回の続きが開いてしまわないこと。
+    """
+    first = make_window(qtbot, ini, study_marks)
+    first.open_path(sample_pdf)
+    first.close()
+
+    second = make_window(qtbot, ini, study_marks, initial_document=two_page_pdf)
+    try:
+        assert second.view.page_count == 2
+        assert two_page_pdf.name in second.windowTitle()
+        # 明示的に開いたのと同じ扱いなので、履歴の先頭にも載る。
+        assert second.recent_files[0] == two_page_pdf
+    finally:
+        second.close()
+
+
+def test_a_missing_document_on_the_command_line_is_reported(
+    qtbot: QtBot,
+    ini: str,
+    study_marks: StudyMarkRepository,
+    tmp_path: Path,
+    warnings: list[str],
+) -> None:
+    """渡されたパスが開けなければ知らせる（黙って空で立ち上がらない）。
+
+    前回のセッションの自動復元とはここが違う。利用者がそのファイルを
+    押しているので、開かなかったことを伝える必要がある。
+    """
+    window = make_window(qtbot, ini, study_marks, initial_document=tmp_path / "無い.pdf")
+    try:
+        assert not window.view.has_document
+        assert warnings
+    finally:
+        window.close()
 
 
 def test_the_reading_position_is_restored(
